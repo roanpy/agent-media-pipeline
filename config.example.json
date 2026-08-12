@@ -1,0 +1,109 @@
+{
+  "baseDir": "/path/to/media-work",
+  "stateDir": "/path/to/media-work/.media-downloader-state",
+  "timeoutHours": 24,
+  "minMediaDurationSeconds": 120,
+  "defaultProfiles": {
+    "tv": "tv1080",
+    "movie": "movie1080"
+  },
+  "defaultNaming": "plex",
+  "targets": {
+    "tv-library": {
+      "path": "/path/to/tv-library"
+    },
+    "movie-library": {
+      "path": "/path/to/movie-library"
+    }
+  },
+  "namingPresets": {
+    "plex": {
+      "tv": {
+        "showDir": "{canonical}",
+        "seasonDir": "Season {season:02d}",
+        "episodeFile": "{canonical} - S{season:02d}E{episode:02d}.{ext}"
+      },
+      "movie": {
+        "showDir": "{canonical}",
+        "movieFile": "{canonical}.{ext}"
+      }
+    }
+  },
+  "profiles": {
+    "tv720": {
+      "type": "tv",
+      "label": "TV 720p H.264",
+      "container": "mp4",
+      "resolution": 720,
+      "videoCodec": "libx264",
+      "crf": 21,
+      "audioCodec": "aac",
+      "audioBitrate": "160k",
+      "preset": "medium",
+      "target": "tv-library",
+      "naming": "plex"
+    },
+    "tv1080": {
+      "type": "tv",
+      "label": "TV 1080p H.264",
+      "container": "mp4",
+      "resolution": 1080,
+      "videoCodec": "libx264",
+      "crf": 20,
+      "audioCodec": "aac",
+      "audioBitrate": "192k",
+      "preset": "medium",
+      "target": "tv-library",
+      "naming": "plex"
+    },
+    "movie720": {
+      "type": "movie",
+      "label": "Movie 720p H.264",
+      "container": "mp4",
+      "resolution": 720,
+      "videoCodec": "libx264",
+      "crf": 20,
+      "audioCodec": "aac",
+      "audioBitrate": "192k",
+      "preset": "medium",
+      "target": "movie-library",
+      "naming": "plex"
+    },
+    "movie1080": {
+      "type": "movie",
+      "label": "Movie 1080p H.264",
+      "container": "mp4",
+      "resolution": 1080,
+      "videoCodec": "libx264",
+      "crf": 18,
+      "audioCodec": "aac",
+      "audioBitrate": "256k",
+      "preset": "medium",
+      "target": "movie-library",
+      "naming": "plex"
+    }
+  },
+  "searchSources": {
+    "jackett": {
+      "type": "jackett",
+      "enabled": false,
+      "url": "http://127.0.0.1:9117",
+      "indexer": "all",
+      "apiKeyEnv": "JACKETT_API_KEY",
+      "categories": [],
+      "timeoutSeconds": 30
+    },
+    "web": {
+      "type": "web",
+      "enabled": true,
+      "urlTemplate": "https://www.google.com/search?q={query}"
+    }
+  },
+  "metadata": {
+    "provider": "tmdb",
+    "apiKeyEnv": "TMDB_API_KEY",
+    "language": "zh-CN",
+    "tvFallback": "tvmaze",
+    "requireArtwork": true
+  }
+}

@@ -1,5 +1,7 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+.ruff_cache/
 .runtime/
 logs/
+config.json
