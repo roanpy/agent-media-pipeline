@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -1045,7 +1046,7 @@ def file_digest(path: Path) -> str:
 
 
 def existing_matches(source: Path, target: Path, minimum_duration: float) -> bool:
-    if not target.is_file() or source.stat().st_size != target.stat().st_size:
+    if target.is_symlink() or not target.is_file() or source.stat().st_size != target.stat().st_size:
         return False
     if source.suffix.lower() in VIDEO_EXTS:
         validate_video(target, minimum_duration)
@@ -1074,7 +1075,38 @@ def atomic_copy(source: Path, target: Path, minimum_duration: float) -> None:
             validate_video(temp, minimum_duration)
         if file_digest(source) != file_digest(temp):
             raise RuntimeError(f"复制哈希不一致: {source.name}")
-        os.replace(temp, target)
+        try:
+            os.link(temp, target)
+        except FileExistsError:
+            if not existing_matches(temp, target, minimum_duration):
+                raise RuntimeError(f"目标已被其他任务写入且内容不同，拒绝覆盖: {target}")
+        except OSError as exc:
+            if exc.errno not in {errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}:
+                raise
+            # ponytail: some NAS filesystems lack hard links; exclusive creation keeps no-clobber safety.
+            created_identity = None
+            try:
+                with open(temp, "rb") as src, open(target, "xb") as dst:
+                    created = os.fstat(dst.fileno())
+                    created_identity = (created.st_dev, created.st_ino)
+                    while chunk := src.read(8 * 1024 * 1024):
+                        if STOP_REQUESTED:
+                            raise InterruptedError("任务已停止")
+                        dst.write(chunk)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                if temp.stat().st_size != target.stat().st_size or file_digest(temp) != file_digest(target):
+                    raise RuntimeError(f"复制哈希不一致: {source.name}")
+                shutil.copystat(temp, target)
+            except FileExistsError:
+                if not existing_matches(temp, target, minimum_duration):
+                    raise RuntimeError(f"目标已被其他任务写入且内容不同，拒绝覆盖: {target}")
+            except Exception:
+                with contextlib.suppress(FileNotFoundError):
+                    current = target.stat(follow_symlinks=False)
+                    if created_identity == (current.st_dev, current.st_ino):
+                        target.unlink()
+                raise
     finally:
         temp.unlink(missing_ok=True)
 
@@ -1208,7 +1240,7 @@ def command_doctor(_args) -> int:
             require_target_root(path)
             status = "ok"
         except RuntimeError:
-            status = "error"
+            status = "unavailable"
         checks.append({"name": f"target:{name}", "status": status, "path": str(path)})
     for name, source in (config.get("searchSources", {}) or {}).items():
         if isinstance(source, dict) and source.get("type") == "jackett" and source.get("enabled", True):

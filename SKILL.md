@@ -20,7 +20,7 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 
 ## 固定流程
 
-1. 运行 `./run.sh doctor`，确认 FFmpeg/FFprobe、目标预设和所需下载器。
+1. 运行 `./run.sh doctor`，确认 FFmpeg/FFprobe、目标预设和所需下载器。未挂载的可选目标显示为 `unavailable`，仅在本次选用它时才需要处理。
 2. 明确类型、标题、年份、目标、压缩 profile、命名 preset 与质量要求。类型不确定时询问用户。
 3. 搜索：
    - Jackett：`./run.sh search "查询" --source jackett --type tv|movie`

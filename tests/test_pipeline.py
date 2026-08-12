@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import importlib.util
 import json
 import os
 import socketserver
@@ -122,9 +123,52 @@ def assert_xml(path: Path, expected: str):
     assert expected in text, (path, text)
 
 
+def assert_atomic_copy_never_overwrites(root: Path):
+    spec = importlib.util.spec_from_file_location("media_downloader", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source = root / "atomic-source.txt"
+    target = root / "atomic-target.txt"
+    source.write_text("source", encoding="utf-8")
+    original_link = module.os.link
+
+    def racing_link(source_path, target_path):
+        Path(target_path).write_text("other task", encoding="utf-8")
+        return original_link(source_path, target_path)
+
+    module.os.link = racing_link
+    try:
+        try:
+            module.atomic_copy(source, target, 0)
+        except RuntimeError as exc:
+            assert "拒绝覆盖" in str(exc)
+        else:
+            raise AssertionError("concurrent target creation must fail")
+    finally:
+        module.os.link = original_link
+    assert target.read_text(encoding="utf-8") == "other task"
+
+    fallback = root / "atomic-fallback.txt"
+
+    def unsupported_link(_source_path, _target_path):
+        raise OSError(module.errno.EOPNOTSUPP, "hard links unavailable")
+
+    module.os.link = unsupported_link
+    try:
+        module.atomic_copy(source, fallback, 0)
+    finally:
+        module.os.link = original_link
+    assert fallback.read_text(encoding="utf-8") == "source"
+
+    symlink_target = root / "atomic-symlink.txt"
+    symlink_target.symlink_to(source)
+    assert not module.existing_matches(source, symlink_target, 0)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
+        assert_atomic_copy_never_overwrites(root)
         for name in ("tv", "movie", "source", "http"):
             (root / name).mkdir()
         make_video(root / "source" / "Example.S02E03.mkv")
@@ -141,6 +185,13 @@ def main():
         with server(root / "http") as port:
             cfg = config(root, port)
             env = {**os.environ, "MEDIA_DOWNLOADER_CONFIG": str(cfg), "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "status.json"), "MEDIA_DOWNLOADER_CANDIDATE_FILE": str(root / "candidates.json"), "MEDIA_DOWNLOADER_OFFLINE": "1", "TEST_JACKETT_KEY": "secret-key"}
+
+            (root / "movie").rmdir()
+            doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
+            checks = {item["name"]: item["status"] for item in json.loads(doctor.stdout)["checks"]}
+            assert checks["target:tv"] == "ok"
+            assert checks["target:movie"] == "unavailable"
+            (root / "movie").mkdir()
 
             searched = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--type", "tv"], env=env)
             payload = json.loads(searched.stdout)
