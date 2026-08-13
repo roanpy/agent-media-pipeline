@@ -1,5 +1,5 @@
 ---
-name: media-downloader
+name: agent-media-pipeline
 description: Discover authorized media through Jackett, Torznab/Prowlarr, or public web sources; review candidates; acquire local files, torrents, direct links, YouTube/Bilibili videos, or playlists; transcode with TV/movie defaults or preserve the original container; generate Plex-compatible naming, NFO, and artwork; and optionally archive to a local folder, external drive, or NAS. Use for agent-guided media search, download, organization, metadata, status, resume, and safe stop workflows.
 ---
 

@@ -62,7 +62,7 @@ Download an authorized YouTube or Bilibili playlist, organize it as a TV season,
   --season 1 --episode 1 --no-transcode --no-archive
 ```
 
-Run `./run.sh --help`, `./run.sh ingest --help`, or invoke the [`media-downloader` Skill](SKILL.md) and ask the agent in natural language.
+Run `./run.sh --help`, `./run.sh ingest --help`, or invoke the [`agent-media-pipeline` Skill](SKILL.md) and ask the agent in natural language.
 
 ## Requirements
 

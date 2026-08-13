@@ -62,7 +62,7 @@ chmod 600 config.json
   --season 1 --episode 1 --no-transcode --no-archive
 ```
 
-运行 `./run.sh --help`、`./run.sh ingest --help`，或直接调用 [`media-downloader` Skill](SKILL.md) 用自然语言描述任务。
+运行 `./run.sh --help`、`./run.sh ingest --help`，或直接调用 [`agent-media-pipeline` Skill](SKILL.md) 用自然语言描述任务。
 
 ## 运行要求
 
