@@ -97,6 +97,7 @@ def config(root: Path, port: int) -> Path:
         "timeoutHours": 1,
         "minMediaDurationSeconds": 1,
         "defaultProfiles": {"tv": "tv", "movie": "movie"},
+        "defaultModes": {"tv": "transcode", "movie": "transcode"},
         "defaultNaming": "plex",
         "targets": {"tv": {"path": str(root / "tv")}, "movie": {"path": str(root / "movie")}},
         "namingPresets": {
@@ -288,6 +289,28 @@ def main():
             env_target = run([sys.executable, str(SCRIPT), "doctor"], env={**env, "MEDIA_DOWNLOADER_TARGET_DIR": str(root / "tv")})
             env_checks = {item["name"]: item["status"] for item in json.loads(env_target.stdout)["checks"]}
             assert env_checks["target:environment"] == "ok"
+
+            modes = json.loads(cfg.read_text(encoding="utf-8"))
+            modes["defaultModes"] = {"tv": "organize", "movie": "transcode"}
+            modes_cfg = root / "modes.json"
+            modes_cfg.write_text(json.dumps(modes), encoding="utf-8")
+            modes_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(modes_cfg)}
+            tv_default = run([sys.executable, str(SCRIPT), "adopt", "Mode TV", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--target", "tv", "--offline", "--dry-run"], env=modes_env)
+            assert json.loads(tv_default.stdout)["mode"] == "organize"
+            tv_override = run([sys.executable, str(SCRIPT), "adopt", "Mode TV", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--target", "tv", "--offline", "--transcode", "--dry-run"], env=modes_env)
+            assert json.loads(tv_override.stdout)["mode"] == "transcode"
+            movie_default = run([sys.executable, str(SCRIPT), "adopt", "Mode Movie", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--offline", "--dry-run"], env=modes_env)
+            assert json.loads(movie_default.stdout)["mode"] == "transcode"
+            movie_override = run([sys.executable, str(SCRIPT), "adopt", "Mode Movie", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--offline", "--no-transcode", "--dry-run"], env=modes_env)
+            assert json.loads(movie_override.stdout)["mode"] == "organize"
+            modes.pop("defaultModes")
+            legacy_cfg = root / "legacy-modes.json"
+            legacy_cfg.write_text(json.dumps(modes), encoding="utf-8")
+            legacy_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(legacy_cfg)}
+            legacy_default = run([sys.executable, str(SCRIPT), "adopt", "Legacy Mode", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--offline", "--dry-run"], env=legacy_env)
+            assert json.loads(legacy_default.stdout)["mode"] == "transcode"
+            profiles = run([sys.executable, str(SCRIPT), "profiles"], env=modes_env)
+            assert json.loads(profiles.stdout)["defaultModes"] == {"tv": "organize", "movie": "transcode"}
 
             searched = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--type", "tv"], env=env)
             payload = json.loads(searched.stdout)

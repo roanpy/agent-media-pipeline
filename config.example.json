@@ -7,6 +7,10 @@
     "tv": "tv1080",
     "movie": "movie1080"
   },
+  "defaultModes": {
+    "tv": "transcode",
+    "movie": "transcode"
+  },
   "defaultNaming": "plex",
   "targets": {
     "tv-library": {

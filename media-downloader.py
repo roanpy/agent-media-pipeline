@@ -130,6 +130,12 @@ def validate_config(data: dict) -> None:
         profile = profiles.get(profile_name)
         if not isinstance(profile, dict) or profile.get("type") != media_type:
             raise RuntimeError(f"defaultProfiles.{media_type} 未指向有效的 {media_type} 预设")
+    default_modes = data.get("defaultModes", {})
+    if not isinstance(default_modes, dict):
+        raise RuntimeError("defaultModes 必须是对象")
+    for media_type in ("tv", "movie"):
+        if default_modes.get(media_type, "transcode") not in {"transcode", "organize"}:
+            raise RuntimeError(f"defaultModes.{media_type} 必须是 transcode 或 organize")
     for name, profile in profiles.items():
         if not isinstance(profile, dict) or profile.get("type") not in {"tv", "movie"}:
             raise RuntimeError(f"profile 无效: {name}")
@@ -1437,6 +1443,8 @@ def archive(ctx: dict) -> list[str]:
 
 def pipeline(args) -> int:
     config = load_config()
+    if args.copy_original is None:
+        args.copy_original = config.get("defaultModes", {}).get(args.media_type, "transcode") == "organize"
     ctx = build_context(config, args)
     source, requested_downloader = resolve_source(args)
     plan = {
@@ -1485,7 +1493,7 @@ def pipeline(args) -> int:
 
 def command_profiles(_args) -> int:
     config = load_config()
-    print(json.dumps({"defaultProfiles": config.get("defaultProfiles", {}), "defaultNaming": config.get("defaultNaming", "plex"), "profiles": config.get("profiles", {}), "targets": config.get("targets", {}), "namingPresets": config.get("namingPresets", {})}, ensure_ascii=False, indent=2))
+    print(json.dumps({"defaultModes": config.get("defaultModes", {"tv": "transcode", "movie": "transcode"}), "defaultProfiles": config.get("defaultProfiles", {}), "defaultNaming": config.get("defaultNaming", "plex"), "profiles": config.get("profiles", {}), "targets": config.get("targets", {}), "namingPresets": config.get("namingPresets", {})}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1564,7 +1572,7 @@ def command_doctor(_args) -> int:
     return 1 if any(item["status"] == "error" for item in checks) else 0
 
 
-def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: bool = True) -> None:
+def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: bool = True, mode_override: bool = True) -> None:
     parser.add_argument("title")
     parser.add_argument("source", nargs=None if source_required else "?")
     parser.add_argument("--candidate")
@@ -1582,9 +1590,13 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--keep-work", action="store_true")
     parser.add_argument("--reset-work", action="store_true")
     parser.add_argument("--update-nfo", action="store_true", help="显式原子更新已有 NFO；不会覆盖媒体、字幕或图片")
+    if mode_override:
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument("--transcode", dest="copy_original", action="store_false", help="覆盖默认模式并转码")
+        mode.add_argument("--no-transcode", dest="copy_original", action="store_true", help="覆盖默认模式并保留原容器只整理")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--offline", action="store_true")
-    parser.set_defaults(handler=pipeline, copy_original=False)
+    parser.set_defaults(handler=pipeline, copy_original=None)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1601,7 +1613,7 @@ def parser() -> argparse.ArgumentParser:
     for name in ("adopt", "process"):
         add_pipeline_arguments(commands.add_parser(name, help="处理本地媒体并归档"), source_required=True)
     organize_parser = commands.add_parser("organize", help="不转码，按原容器整理本地媒体并归档")
-    add_pipeline_arguments(organize_parser, source_required=True)
+    add_pipeline_arguments(organize_parser, source_required=True, mode_override=False)
     organize_parser.set_defaults(copy_original=True)
     profiles = commands.add_parser("profiles", aliases=["profile"])
     profiles.set_defaults(handler=command_profiles)

@@ -22,6 +22,7 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 
 1. 运行 `./run.sh doctor`，确认 FFmpeg/FFprobe、目标预设和所需下载器。未挂载的可选目标显示为 `unavailable`，仅在本次选用它时才需要处理。
 2. 明确类型、标题、年份、目标、是否转码、profile、命名 preset 与质量要求。类型或是否转码不确定时询问用户。
+   - 先运行 `profiles` 查看 `defaultModes.tv|movie`。用户明确说“按默认”时直接使用；只给文件但未表达是否转码时，告知对应默认值并询问确认。
 3. 搜索：
    - Jackett：`./run.sh search "查询" --source jackett --type tv|movie`
    - 网页：同一命令会返回 `browseUrl`；使用浏览器查看公开页面，提取用户有权使用的最终 URL。
@@ -58,6 +59,10 @@ chmod 600 /private/tmp/source-url
 # 手动下载的单集：文件名含 SxxExx 时自动识别，也可显式传 --season/--episode
 ./run.sh adopt "剧名" "/path/to/files" --type tv --year 2026 \
   --metadata "/path/to/metadata.json"
+
+# 覆盖 TV/Movie 默认模式
+./run.sh adopt "剧名" "/path/to/files" --type tv --transcode
+./run.sh adopt "片名" "/path/to/Movie.mkv" --type movie --no-transcode
 
 # 已归档同一集但要修正剧集/单集 NFO；只允许更新 .nfo
 ./run.sh adopt "剧名" "/path/to/Show.S01E02.mkv" --type tv --year 2026 \
@@ -118,6 +123,7 @@ chmod 600 /private/tmp/source-url
 - `searchSources`：Jackett 或网页检索模板；Jackett key 由 `apiKeyEnv` 指向环境变量。
 - `profiles`：容器、分辨率、codec、CRF/码率、默认 target 和 naming。
 - `defaultProfiles.tv|movie`：TV/Movie 默认压缩 profile。
+- `defaultModes.tv|movie`：默认处理模式，填 `transcode` 或 `organize`；未配置时兼容为 `transcode`。
 - `targets`：目标预设名和路径。
 - `namingPresets`：TV/Movie 目录及文件模板；默认 `plex`。
 - `metadata`：TMDB、TVMaze 回退和图片是否必需。
