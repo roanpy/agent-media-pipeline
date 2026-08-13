@@ -97,6 +97,14 @@
       "categories": [],
       "timeoutSeconds": 30
     },
+    "prowlarr": {
+      "type": "torznab",
+      "enabled": false,
+      "url": "http://127.0.0.1:9696/1/api",
+      "apiKeyEnv": "PROWLARR_API_KEY",
+      "categories": [],
+      "timeoutSeconds": 30
+    },
     "web": {
       "type": "web",
       "enabled": true,

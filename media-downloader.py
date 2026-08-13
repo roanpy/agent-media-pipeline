@@ -107,12 +107,12 @@ def config_file() -> Path:
 
 def validate_config(data: dict) -> None:
     profiles = data.get("profiles")
-    targets = data.get("targets")
+    targets = data.get("targets", {})
     naming = data.get("namingPresets")
     if not isinstance(profiles, dict) or not profiles:
         raise RuntimeError("配置缺少 profiles")
-    if not isinstance(targets, dict) or not targets:
-        raise RuntimeError("配置缺少 targets")
+    if not isinstance(targets, dict):
+        raise RuntimeError("targets 必须是对象")
     if not isinstance(naming, dict) or not naming:
         raise RuntimeError("配置缺少 namingPresets")
     try:
@@ -139,9 +139,6 @@ def validate_config(data: dict) -> None:
     for name, profile in profiles.items():
         if not isinstance(profile, dict) or profile.get("type") not in {"tv", "movie"}:
             raise RuntimeError(f"profile 无效: {name}")
-        target = profile.get("target")
-        if not target or target not in targets:
-            raise RuntimeError(f"profile {name} 引用了未知 target: {target}")
         naming_name = profile.get("naming") or data.get("defaultNaming") or "plex"
         if naming_name not in naming:
             raise RuntimeError(f"profile {name} 引用了未知 naming: {naming_name}")
@@ -174,9 +171,11 @@ def validate_config(data: dict) -> None:
     if not isinstance(sources, dict):
         raise RuntimeError("searchSources 必须是对象")
     for name, source in sources.items():
-        if not isinstance(source, dict) or source.get("type") not in {"jackett", "web"}:
+        if not isinstance(source, dict) or source.get("type") not in {"jackett", "torznab", "web"}:
             raise RuntimeError(f"搜索源无效: {name}")
         if source["type"] == "jackett":
+            parsed = urllib.parse.urlsplit(str(source.get("url", "")))
+        elif source["type"] == "torznab":
             parsed = urllib.parse.urlsplit(str(source.get("url", "")))
         else:
             template = str(source.get("urlTemplate", ""))
@@ -451,20 +450,31 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None) -> d
     tmdb_id = item.get("id")
     detail = http_json(
         f"https://api.themoviedb.org/3/{kind}/{tmdb_id}",
-        {"api_key": api_key, "language": language, "append_to_response": "external_ids"},
+        {"api_key": api_key, "language": language, "append_to_response": "external_ids,credits"},
     )
     date_key = "first_air_date" if kind == "tv" else "release_date"
     name_key = "name" if kind == "tv" else "title"
     original_key = "original_name" if kind == "tv" else "original_title"
     date = detail.get(date_key) or item.get(date_key) or ""
     externals = detail.get("external_ids", {}) if isinstance(detail.get("external_ids"), dict) else {}
+    credits = detail.get("credits", {}) if isinstance(detail.get("credits"), dict) else {}
+    crew = credits.get("crew", []) if isinstance(credits.get("crew"), list) else []
+    countries = detail.get("production_countries", []) if isinstance(detail.get("production_countries"), list) else []
     return {
         "title": detail.get(name_key) or item.get(name_key),
         "originalTitle": detail.get(original_key) or item.get(original_key),
         "year": int(date[:4]) if str(date)[:4].isdigit() else None,
         "premiered": date,
         "plot": detail.get("overview") or item.get("overview") or "",
+        "tagline": detail.get("tagline") or "",
+        "rating": detail.get("vote_average"),
+        "runtime": detail.get("runtime") or next(iter(detail.get("episode_run_time") or []), None),
+        "status": detail.get("status") or "",
         "genres": [genre.get("name") for genre in detail.get("genres", []) if genre.get("name")],
+        "countries": [country.get("name") for country in countries if country.get("name")],
+        "directors": [person.get("name") for person in crew if person.get("job") == "Director" and person.get("name")],
+        "writers": [person.get("name") for person in crew if person.get("department") == "Writing" and person.get("name")],
+        "actors": [{"name": person.get("name"), "role": person.get("character")} for person in (credits.get("cast") or [])[:20] if person.get("name")],
         "studio": next((company.get("name") for company in detail.get("production_companies", []) if company.get("name")), ""),
         "ids": {"tmdb": tmdb_id, "imdb": externals.get("imdb_id"), "tvdb": externals.get("tvdb_id")},
         "posterUrl": f"https://image.tmdb.org/t/p/original{detail.get('poster_path')}" if detail.get("poster_path") else "",
@@ -524,6 +534,15 @@ def resolve_metadata(config: dict, args) -> dict:
         raise ValueError("metadata.genres 必须是数组")
     metadata["genres"] = genres
     metadata["studio"] = metadata.get("studio") or ""
+    for field in ("countries", "tags", "directors", "writers"):
+        values = metadata.get(field) or []
+        if not isinstance(values, list):
+            raise ValueError(f"metadata.{field} 必须是数组")
+        metadata[field] = values
+    actors = metadata.get("actors") or []
+    if not isinstance(actors, list) or any(not isinstance(item, (str, dict)) for item in actors):
+        raise ValueError("metadata.actors 必须是字符串或对象数组")
+    metadata["actors"] = actors
     ids = metadata.get("ids") or {}
     if not isinstance(ids, dict):
         raise ValueError("metadata.ids 必须是对象")
@@ -542,6 +561,9 @@ def resolve_metadata(config: dict, args) -> dict:
                 raise ValueError("metadata.episodes 每项必须包含整数 season/episode") from exc
             if season < 0 or episode < 1:
                 raise ValueError(f"metadata.episodes 季集号无效: S{season:02d}E{episode:02d}")
+            for field in ("directors", "writers"):
+                if field in item and not isinstance(item[field], list):
+                    raise ValueError(f"metadata.episodes.{field} 必须是数组")
             item["season"], item["episode"] = season, episode
         metadata["episodes"] = episodes
     return metadata
@@ -558,20 +580,21 @@ def build_context(config: dict, args) -> dict:
             metadata_config["requireArtwork"] = False
             print(f"警告: 未配置 {key_env}，requireArtwork 降级为海报可选", file=sys.stderr)
     canonical = canonical_name(metadata.get("title") or title, metadata.get("year"))
-    target_name, target_root = select_target(config, profile, args.target)
     naming_name, naming = select_naming(config, profile, args.media_type, args.naming)
     base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
     state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (base_root / ".state"))
-    require_target_root(target_root)
+    target_name, target_root = ("work", base_root) if args.no_archive else select_target(config, profile, args.target)
     forbidden_roots = {Path("/"), Path.home().resolve(), Path("/Volumes")}
     if base_root in forbidden_roots:
         raise RuntimeError(f"工作目录范围过大，拒绝使用: {base_root}")
     if state_root in forbidden_roots:
         raise RuntimeError(f"状态目录范围过大，拒绝使用: {state_root}")
-    if paths_overlap(base_root, target_root):
-        raise RuntimeError(f"工作区与目标目录不得重叠: {base_root} / {target_root}")
-    if paths_overlap(state_root, target_root):
-        raise RuntimeError(f"状态目录与目标目录不得重叠: {state_root} / {target_root}")
+    if not args.no_archive:
+        require_target_root(target_root)
+        if paths_overlap(base_root, target_root):
+            raise RuntimeError(f"工作区与目标目录不得重叠: {base_root} / {target_root}")
+        if paths_overlap(state_root, target_root):
+            raise RuntimeError(f"状态目录与目标目录不得重叠: {state_root} / {target_root}")
     require_mounted_volume(base_root, "工作目录")
     require_mounted_volume(state_root, "状态目录")
     identifier = pipeline_task_id({"mediaType": args.media_type, "canonical": canonical, "targetRoot": target_root}, resolve_source(args)[0])
@@ -585,8 +608,8 @@ def build_context(config: dict, args) -> dict:
         "year": metadata.get("year") or "",
         "ext": profile["container"],
     }
-    target_show = target_root / render_path(naming["showDir"], naming_fields)
-    if not contains_path(target_root, target_show):
+    target_show = work_root / "output" if args.no_archive else target_root / render_path(naming["showDir"], naming_fields)
+    if not args.no_archive and not contains_path(target_root, target_show):
         raise RuntimeError("目标目录逃逸")
     return {
         "id": identifier,
@@ -600,7 +623,7 @@ def build_context(config: dict, args) -> dict:
         "naming": naming,
         "namingFields": naming_fields,
         "targetRoot": target_root,
-        "targetIdentity": directory_identity(target_root),
+        "targetIdentity": None if args.no_archive else directory_identity(target_root),
         "targetShow": target_show,
         "baseRoot": base_root,
         "stateRoot": state_root,
@@ -837,7 +860,7 @@ def torznab_attr(item: ET.Element, name: str):
     return None
 
 
-def jackett_search(name: str, source: dict, query: str, media_type: str, limit: int) -> list[dict]:
+def torznab_search(name: str, source: dict, query: str, media_type: str, limit: int) -> list[dict]:
     key_env = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
     api_key = os.environ.get(key_env)
     if not api_key:
@@ -845,8 +868,11 @@ def jackett_search(name: str, source: dict, query: str, media_type: str, limit: 
     base = str(source.get("url", "")).rstrip("/")
     if not base.startswith(("http://", "https://")):
         raise RuntimeError(f"搜索源 {name} URL 无效")
-    indexer = urllib.parse.quote(str(source.get("indexer", "all")), safe="")
-    url = f"{base}/api/v2.0/indexers/{indexer}/results/torznab/api"
+    if source.get("type") == "jackett":
+        indexer = urllib.parse.quote(str(source.get("indexer", "all")), safe="")
+        url = f"{base}/api/v2.0/indexers/{indexer}/results/torznab/api"
+    else:
+        url = base
     search_type = "tvsearch" if media_type == "tv" else "movie"
     params = {"apikey": api_key, "t": search_type, "q": query}
     if source.get("categories"):
@@ -854,11 +880,11 @@ def jackett_search(name: str, source: dict, query: str, media_type: str, limit: 
     request = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers={"User-Agent": "media-downloader/2.0"})
     try:
         with urllib.request.urlopen(request, timeout=int(source.get("timeoutSeconds", 30))) as response:
-            root = ET.fromstring(read_response(response, 10 * 1024 * 1024, f"Jackett {name}"))
+            root = ET.fromstring(read_response(response, 10 * 1024 * 1024, f"Torznab {name}"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Jackett {name} 返回 HTTP {exc.code}") from exc
+        raise RuntimeError(f"Torznab {name} 返回 HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Jackett {name} 连接失败: {exc.reason}") from exc
+        raise RuntimeError(f"Torznab {name} 连接失败: {exc.reason}") from exc
     results = []
     for item in root.findall(".//item")[:limit]:
         enclosure = item.find("enclosure")
@@ -907,8 +933,8 @@ def command_search(args) -> int:
             continue
         try:
             kind = source.get("type")
-            if kind == "jackett":
-                candidates.extend(jackett_search(name, source, args.query, args.media_type, limit))
+            if kind in {"jackett", "torznab"}:
+                candidates.extend(torznab_search(name, source, args.query, args.media_type, limit))
             elif kind == "web":
                 template = str(source.get("urlTemplate", ""))
                 if not template:
@@ -1080,7 +1106,7 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
     plans = []
     seen = set()
     seen_episodes = set()
-    for source in sources:
+    for position, source in enumerate(sources, start=ctx["args"].episode or 1):
         source_info = validate_video(source, minimum)
         fields = {**ctx["namingFields"], "ext": source.suffix.lower().lstrip(".")} if ctx["args"].copy_original else ctx["namingFields"]
         if media_type == "movie":
@@ -1090,6 +1116,8 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
             season = episode = None
         else:
             parsed = episode_from_name(source, ctx["args"].season)
+            if not parsed and getattr(ctx["args"], "playlist", False):
+                parsed = (ctx["args"].season, position)
             if not parsed:
                 if len(sources) == 1 and ctx["args"].episode is not None:
                     parsed = (ctx["args"].season, ctx["args"].episode)
@@ -1211,13 +1239,34 @@ def write_nfo(ctx: dict, plans: list[dict]) -> None:
     root = ET.Element(root_name)
     xml_text(root, "title", metadata.get("title"))
     xml_text(root, "originaltitle", metadata.get("originalTitle"))
-    xml_text(root, "sorttitle", metadata.get("title"))
+    xml_text(root, "sorttitle", metadata.get("sortTitle") or metadata.get("title"))
     xml_text(root, "year", metadata.get("year"))
     xml_text(root, "premiered", metadata.get("premiered"))
     xml_text(root, "plot", metadata.get("plot"))
+    xml_text(root, "tagline", metadata.get("tagline"))
+    xml_text(root, "mpaa", metadata.get("contentRating"))
+    xml_text(root, "rating", metadata.get("rating"))
+    xml_text(root, "runtime", metadata.get("runtime"))
+    xml_text(root, "status", metadata.get("status"))
     xml_text(root, "studio", metadata.get("studio"))
     for genre in metadata.get("genres", []):
         xml_text(root, "genre", genre)
+    for country in metadata.get("countries", []):
+        xml_text(root, "country", country)
+    for tag in metadata.get("tags", []):
+        xml_text(root, "tag", tag)
+    for director in metadata.get("directors", []):
+        xml_text(root, "director", director)
+    for writer in metadata.get("writers", []):
+        xml_text(root, "credits", writer)
+    for actor in metadata.get("actors", []):
+        element = ET.SubElement(root, "actor")
+        if isinstance(actor, str):
+            xml_text(element, "name", actor)
+        else:
+            xml_text(element, "name", actor.get("name"))
+            xml_text(element, "role", actor.get("role"))
+            xml_text(element, "thumb", actor.get("thumb"))
     ids = metadata.get("ids", {}) if isinstance(metadata.get("ids"), dict) else {}
     first = True
     for id_type, value in ids.items():
@@ -1231,12 +1280,18 @@ def write_nfo(ctx: dict, plans: list[dict]) -> None:
         for plan in plans:
             details = next((item for item in episode_items if item["season"] == plan["season"] and item["episode"] == plan["episode"]), {})
             episode_root = ET.Element("episodedetails")
-            xml_text(episode_root, "title", details.get("title") or f"Episode {plan['episode']}")
+            playlist_title = re.sub(r"^\d+\s+|\s+\[[^]]+\]$", "", plan["source"].stem)
+            xml_text(episode_root, "title", details.get("title") or (playlist_title if ctx["args"].playlist else f"Episode {plan['episode']}"))
             xml_text(episode_root, "season", plan["season"])
             xml_text(episode_root, "episode", plan["episode"])
             xml_text(episode_root, "aired", details.get("aired"))
             xml_text(episode_root, "plot", details.get("plot"))
             xml_text(episode_root, "runtime", details.get("runtime"))
+            xml_text(episode_root, "rating", details.get("rating"))
+            for director in details.get("directors", []):
+                xml_text(episode_root, "director", director)
+            for writer in details.get("writers", []):
+                xml_text(episode_root, "credits", writer)
             write_xml(plan["output"].with_suffix(".nfo"), episode_root)
 
 
@@ -1296,14 +1351,16 @@ def write_artwork(ctx: dict, plans: list[dict]) -> None:
     # ponytail: infer only conventional names; ambiguous libraries must provide metadata paths.
     poster = metadata.get("posterPath") or metadata.get("posterUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"poster", "folder", "cover", "default", "movie"}), "")
     fanart = metadata.get("fanartPath") or metadata.get("fanartUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"fanart", "backdrop", "background", "art"}), "")
+    banner = metadata.get("bannerPath") or metadata.get("bannerUrl") or next((str(path) for path in source_images if path.stem.casefold() == "banner"), "")
+    clearlogo = metadata.get("clearlogoPath") or metadata.get("clearlogoUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"clearlogo", "logo"}), "")
     required = bool(ctx["config"].get("metadata", {}).get("requireArtwork", False))
-    for kind, source in (("poster", poster), ("fanart", fanart)):
+    for kind, source, filename in (("poster", poster, "poster.jpg"), ("fanart", fanart, "fanart.jpg"), ("banner", banner, "banner.jpg"), ("clearlogo", clearlogo, "clearlogo.png")):
         if not source:
             if required and kind == "poster":
                 raise RuntimeError("未找到必需的海报")
             continue
         try:
-            download_image(str(source), ctx["outputRoot"] / f"{kind}.jpg", ctx)
+            download_image(str(source), ctx["outputRoot"] / filename, ctx)
         except InterruptedError:
             raise
         except Exception as exc:
@@ -1465,6 +1522,7 @@ def pipeline(args) -> int:
         "profile": ctx["profileName"], "target": ctx["targetName"],
         "naming": ctx["namingName"],
         "mode": "organize" if args.copy_original else "transcode",
+        "archive": not args.no_archive,
         "targetPath": str(ctx["targetShow"]), "source": redacted_source(source),
     }
     if args.dry_run:
@@ -1486,9 +1544,12 @@ def pipeline(args) -> int:
             status_update(ctx["id"], phase="metadata", currentOperation="metadata", currentFile="")
             write_nfo(ctx, plans)
             write_artwork(ctx, plans)
-            status_update(ctx["id"], phase="archiving", currentOperation="archiving")
-            archived = archive(ctx)
-            if not args.keep_work:
+            if args.no_archive:
+                archived = [str(path) for path in sorted(ctx["outputRoot"].rglob("*")) if path.is_file()]
+            else:
+                status_update(ctx["id"], phase="archiving", currentOperation="archiving")
+                archived = archive(ctx)
+            if not args.keep_work and not args.no_archive:
                 remove_owned_work(ctx)
             status_update(ctx["id"], phase="done", currentOperation="done", currentFile="", pid=None, childPid=None, archivedFiles=archived, finishedAt=now())
             log(ctx, f"完成: {ctx['canonical']}")
@@ -1573,7 +1634,7 @@ def command_doctor(_args) -> int:
             status = "unavailable"
         checks.append({"name": "target:environment", "status": status, "path": str(path)})
     for name, source in (config.get("searchSources", {}) or {}).items():
-        if isinstance(source, dict) and source.get("type") == "jackett" and source.get("enabled", True):
+        if isinstance(source, dict) and source.get("type") in {"jackett", "torznab"} and source.get("enabled", True):
             env_name = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
             checks.append({"name": f"search:{name}", "status": "ok" if os.environ.get(env_name) else "error", "detail": env_name})
     metadata = config.get("metadata", {})
@@ -1598,7 +1659,8 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--downloader", choices=("auto", "aria2", "yt-dlp", "local"), default="auto")
     parser.add_argument("--season", type=int, default=1)
     parser.add_argument("--episode", type=int)
-    parser.add_argument("--playlist", action="store_true")
+    parser.add_argument("--playlist", action="store_true", help="显式下载整个 YouTube/Bilibili 播放列表；TV 按列表顺序映射集号")
+    parser.add_argument("--no-archive", action="store_true", help="不转移到目标库；成品保留在本地工作区 output 目录")
     parser.add_argument("--keep-work", action="store_true")
     parser.add_argument("--reset-work", action="store_true")
     parser.add_argument("--update-nfo", action="store_true", help="显式原子更新已有 NFO；不会覆盖媒体、字幕或图片")

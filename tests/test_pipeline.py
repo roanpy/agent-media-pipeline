@@ -112,6 +112,7 @@ def config(root: Path, port: int) -> Path:
         },
         "searchSources": {
             "jackett": {"type": "jackett", "enabled": True, "url": f"http://127.0.0.1:{port}", "indexer": "all", "apiKeyEnv": "TEST_JACKETT_KEY"},
+            "prowlarr": {"type": "torznab", "enabled": False, "url": f"http://127.0.0.1:{port}/torznab/api", "apiKeyEnv": "TEST_TORZNAB_KEY"},
             "web": {"type": "web", "enabled": True, "urlTemplate": "https://example.test/search?q={query}"},
         },
         "metadata": {"provider": "none", "tvFallback": "none", "requireArtwork": False},
@@ -224,6 +225,23 @@ def assert_path_and_naming_guards(module, root: Path):
     id_magnet_b = module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:BBBB")
     assert id_magnet_a != id_magnet_b
     assert id_magnet_a == module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:AAAA")
+    playlist_args = type("Args", (), {"copy_original": True, "season": 3, "episode": 5, "playlist": True})()
+    playlist_root = root / "playlist"
+    playlist_root.mkdir()
+    playlist_files = [playlist_root / "001 开场 [a].mkv", playlist_root / "002 进阶 [b].mkv"]
+    for path in playlist_files:
+        path.write_bytes(b"x")
+    original_validate = module.validate_video
+    module.validate_video = lambda _path, _minimum: {"duration": 1, "hasVideo": True, "hasAudio": False}
+    try:
+        plans = module.planned_outputs({
+            "mediaType": "tv", "config": {"minMediaDurationSeconds": 0}, "args": playlist_args,
+            "namingFields": {"canonical": "课程", "ext": "mkv"},
+            "naming": {"seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}.{ext}"},
+        }, playlist_files)
+        assert [(plan["season"], plan["episode"]) for plan in plans] == [(3, 5), (3, 6)]
+    finally:
+        module.validate_video = original_validate
     try:
         module.sanitize_component("剧" * 100)
     except ValueError as exc:
@@ -290,12 +308,17 @@ def main():
         movie_metadata = root / "movie-metadata.json"
         movie_metadata.write_text(json.dumps({
             "title": "测试电影", "originalTitle": "Test Film", "year": 2025,
-            "plot": "电影剧情", "posterPath": str(root / "source" / "poster.png"),
+            "sortTitle": "Test Film, The", "plot": "电影剧情", "tagline": "电影标语",
+            "countries": ["中国"], "tags": ["测试"], "directors": ["测试导演"],
+            "writers": ["测试编剧"], "actors": [{"name": "测试演员", "role": "角色"}],
+            "posterPath": str(root / "source" / "poster.png"),
+            "bannerPath": str(root / "source" / "poster.png"),
+            "clearlogoPath": str(root / "source" / "poster.png"),
         }, ensure_ascii=False), encoding="utf-8")
 
         with server(root / "http") as port:
             cfg = config(root, port)
-            env = {**os.environ, "MEDIA_DOWNLOADER_CONFIG": str(cfg), "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "status.json"), "MEDIA_DOWNLOADER_CANDIDATE_FILE": str(root / "candidates.json"), "MEDIA_DOWNLOADER_OFFLINE": "1", "TEST_JACKETT_KEY": "secret-key"}
+            env = {**os.environ, "MEDIA_DOWNLOADER_CONFIG": str(cfg), "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "status.json"), "MEDIA_DOWNLOADER_CANDIDATE_FILE": str(root / "candidates.json"), "MEDIA_DOWNLOADER_OFFLINE": "1", "TEST_JACKETT_KEY": "secret-key", "TEST_TORZNAB_KEY": "secret-key"}
 
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
@@ -329,6 +352,20 @@ def main():
             profiles = run([sys.executable, str(SCRIPT), "profiles"], env=modes_env)
             assert json.loads(profiles.stdout)["defaultModes"] == {"tv": "organize", "movie": "transcode"}
 
+            # 不归档时目标库可不可用，成品都留在受控工作区
+            no_archive_config = json.loads(cfg.read_text(encoding="utf-8"))
+            no_archive_config["targets"] = {}
+            no_archive_cfg = root / "no-archive.json"
+            no_archive_cfg.write_text(json.dumps(no_archive_config), encoding="utf-8")
+            no_archive_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(no_archive_cfg)}
+            no_archive_command = [sys.executable, str(SCRIPT), "adopt", "仅处理电影", str(root / "source" / "Film.mkv"), "--type", "movie", "--no-transcode", "--no-archive", "--offline"]
+            no_archive_plan = json.loads(run([*no_archive_command, "--dry-run"], env=no_archive_env).stdout)
+            assert no_archive_plan["archive"] is False
+            run(no_archive_command, env=no_archive_env)
+            local_output = Path(no_archive_plan["targetPath"])
+            assert (local_output / "仅处理电影.mkv").is_file()
+            assert (local_output / "movie.nfo").is_file()
+
             # 无 TMDB key 且 metadata 无海报时 requireArtwork 自动降级，任务可完成
             artwork = json.loads(cfg.read_text(encoding="utf-8"))
             artwork["metadata"] = {"provider": "tmdb", "apiKeyEnv": "UNSET_TEST_TMDB_KEY", "tvFallback": "none", "requireArtwork": True}
@@ -346,6 +383,9 @@ def main():
             assert "downloadUrl" not in payload["candidates"][0]
             assert Handler.last_query["apikey"] == ["secret-key"]
             candidate = payload["candidates"][0]["candidateId"]
+            generic = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "prowlarr", "--type", "tv"], env=env)
+            assert len(json.loads(generic.stdout)["candidates"]) == 1
+            assert Handler.last_query["apikey"] == ["secret-key"]
 
             run([sys.executable, str(SCRIPT), "ingest", "Remote", "--candidate", candidate, "--type", "tv", "--target", "tv", "--offline"], env=env)
             remote = root / "tv" / "Remote" / "Season 01" / "Remote - S01E01.mp4"
@@ -419,6 +459,10 @@ def main():
             film = root / "movie" / "测试电影 (2025)" / "测试电影 (2025).mp4"
             assert film.is_file()
             assert_xml(film.parent / "movie.nfo", "<movie>")
+            assert_xml(film.parent / "movie.nfo", "<sorttitle>Test Film, The</sorttitle>")
+            assert_xml(film.parent / "movie.nfo", "<name>测试演员</name>")
+            assert (film.parent / "banner.jpg").is_file()
+            assert (film.parent / "clearlogo.png").is_file()
             movie_state = next(item for item in json.loads((root / "status.json").read_text(encoding="utf-8")).values() if item.get("requestedTitle") == "待核实电影")
             assert movie_state["title"] == "测试电影 (2025)"
             task_log = Path(movie_state["logPath"])

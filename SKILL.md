@@ -1,6 +1,6 @@
 ---
 name: media-downloader
-description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查候选后用 aria2/yt-dlp/本地文件获取，选择按 TV/Movie 预设转码或保留原容器只整理，再按 Plex 或自定义模板命名、生成 NFO 与图片并校验归档。用于外部 AI Agent 完成媒体检索、下载、转码或免转码整理、归档、状态检查和安全停止。
+description: 搜索用户有权使用的 Jackett、Torznab/Prowlarr 或网页媒体来源，审查候选后用 aria2/yt-dlp/本地文件获取，选择按 TV/Movie 预设转码或保留原容器只整理，再按 Plex 或自定义模板命名、生成 NFO 与图片并选择是否归档。用于外部 AI Agent 处理种子、直链、YouTube/Bilibili 单视频或播放列表、手动媒体、状态检查和安全停止。
 ---
 
 # Media Downloader
@@ -33,6 +33,16 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 6. 运行 `check` 跟踪到 `done` 或 `failed`。`stop` 后再次运行 `check`。
 7. 报告归档路径、实际 profile/naming/target、文件数和任何未满足项。
 
+## 可以直接这样问
+
+- “帮我下载这个 YouTube/Bilibili 视频，按电影整理，使用默认转码并转移到 movie-library。”
+- “帮我下载这个播放列表，按电视剧第 1 季从第 1 集开始整理，不转码，先不转移。”
+- “帮我处理这个本地剧集目录，补齐标题、NFO、海报和背景图，按 Plex 格式归档。”
+- “帮我搜索这部剧的授权来源，先给我候选，不要直接下载。”
+- “按默认处理这个文件。”此时直接使用 `defaultModes.tv|movie`；如果只说“处理”且未表明类型/是否转码/是否转移，先询问关键选择。
+
+底层命令帮助：`./run.sh --help`；具体命令帮助：`./run.sh ingest --help`、`./run.sh adopt --help`、`./run.sh organize --help`。
+
 ## 命令
 
 ```bash
@@ -51,6 +61,14 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 # 使用最终 URL；auto 自动选择 aria2 或 yt-dlp，也可显式指定
 ./run.sh ingest "片名" "https://authorized.example/video" --type movie \
   --downloader yt-dlp --profile movie1080 --target movie-library
+
+# YouTube/Bilibili 播放列表按 TV 顺序整理；显式允许整个列表
+./run.sh ingest "课程名" "https://www.youtube.com/playlist?list=..." --type tv \
+  --downloader yt-dlp --playlist --season 1 --episode 1 --no-transcode
+
+# 只下载/处理/生成 Plex 资料，不转移到磁盘或 NAS；结果留在输出的 targetPath
+./run.sh ingest "课程名" "https://www.bilibili.com/video/..." --type tv \
+  --downloader yt-dlp --season 1 --episode 1 --no-archive
 
 # 带签名/token 的 URL 必须放进当前用户拥有、组/其他无权限的普通文件，避免出现在进程参数
 chmod 600 /private/tmp/source-url
@@ -89,6 +107,8 @@ chmod 600 /private/tmp/source-url
 - 网页检索不在脚本里抓取或解析搜索结果。Agent 用浏览器核实公开页面，把最终授权 URL 交给 `ingest`。
 - 带签名参数、cookie 或 token 的 URL 使用当前用户拥有、组/其他无权限的普通 `--source-file`；推荐 `chmod 600`，不要把它直接写在命令行。
 - 播放列表默认关闭；用户明确要整个列表时才加 `--playlist`。
+- YouTube/Bilibili 单视频及播放列表走 `yt-dlp`。TV 播放列表中无法从文件名识别季集号的项目按列表顺序编号，从 `--season`（默认 1）和 `--episode`（默认 1）开始；下载前应让用户确认顺序。
+- `--no-archive` 不要求目标磁盘/NAS 可用，转码或免转码整理、NFO 和图片仍执行，成品保留在受控工作区 `output`；结果状态的 `targetPath` 给出路径。默认仍会归档转移。
 
 ## 元数据
 
@@ -100,31 +120,44 @@ chmod 600 /private/tmp/source-url
   "originalTitle": "Original Name",
   "year": 2026,
   "premiered": "2026-01-01",
+  "sortTitle": "排序标题",
   "plot": "简介",
+  "tagline": "标语",
+  "contentRating": "PG-13",
+  "rating": 8.5,
+  "runtime": 120,
+  "status": "Ended",
   "genres": ["Drama"],
+  "countries": ["中国"],
+  "tags": ["课程"],
   "studio": "Studio",
+  "directors": ["导演"],
+  "writers": ["编剧"],
+  "actors": [{"name": "演员", "role": "角色", "thumb": "https://authorized.example/person.jpg"}],
   "ids": {"tmdb": 123, "imdb": "tt123"},
   "posterUrl": "https://authorized.example/poster.jpg",
   "fanartUrl": "https://authorized.example/fanart.jpg",
+  "bannerUrl": "https://authorized.example/banner.jpg",
+  "clearlogoUrl": "https://authorized.example/logo.png",
   "episodes": [
     {"season": 1, "episode": 1, "title": "第一集", "aired": "2026-01-01", "plot": "单集简介"}
   ]
 }
 ```
 
-图片也可用 `posterPath`/`fanartPath` 指向本地文件。未配置 TMDB 时仍会生成最小合法 NFO；`metadata.requireArtwork=true` 时缺海报会使任务失败，但既未配置 TMDB key、metadata 又未提供海报时自动降级为海报可选（会有 stderr 警告）。
-`metadata.title` 是核实后的规范标题，会覆盖命令中的检索标题并用于目录、文件名和任务身份；状态中仍保留原检索标题。要让 Plex 读取 NFO，需使用支持 NFO 的 Plex Media Server 并为媒体库选择 Plex NFO Agent。
+图片也可用对应的 `posterPath`/`fanartPath`/`bannerPath`/`clearlogoPath` 指向本地文件。未配置 TMDB 时仍会生成最小合法 NFO；`metadata.requireArtwork=true` 时缺海报会使任务失败，但既未配置 TMDB key、metadata 又未提供海报时自动降级为海报可选（会有 stderr 警告）。
+`metadata.title` 是核实后的规范标题，会覆盖命令中的检索标题并用于目录、文件名和任务身份；状态中仍保留原检索标题。Plex 使用本地图片时在库设置启用 “Use local Assets”；使用 NFO 时选择 Plex NFO Agent。电影和正规剧集默认用 Plex 格式；无法匹配 TMDB/TVDB 的杂项网络视频更适合单独的 Plex “Other Videos” 库，本项目暂不将其伪装成影视条目。
 处理手动下载剧集时优先把文件名整理为 `Show.S01E02.ext`；无法改名时显式传 `--season 1 --episode 2`。已有 NFO 内容不同时默认拒绝覆盖；仅在核实新元数据后使用 `--update-nfo`，媒体、字幕和图片仍不会被覆盖。
 
 ## 配置
 
 首次使用先执行 `cp config.example.json config.json`，再编辑不会被 Git 纳管的 `config.json`：
 
-- `searchSources`：Jackett 或网页检索模板；Jackett key 由 `apiKeyEnv` 指向环境变量。
+- `searchSources`：Jackett、通用 Torznab（含 Prowlarr）或网页检索模板；API key 由 `apiKeyEnv` 指向环境变量。
 - `profiles`：容器、分辨率、codec、CRF/码率、默认 target 和 naming。
 - `defaultProfiles.tv|movie`：TV/Movie 默认压缩 profile。
 - `defaultModes.tv|movie`：默认处理模式，填 `transcode` 或 `organize`；未配置时兼容为 `transcode`。
-- `targets`：目标预设名和路径。
+- `targets`：归档目标预设名和路径；只用 `--no-archive` 时可不配置。
 - `namingPresets`：TV/Movie 目录及文件模板；默认 `plex`。
 - `metadata`：TMDB、TVMaze 回退和图片是否必需。
 
