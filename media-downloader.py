@@ -200,12 +200,18 @@ def validate_public_source_url(value: str, *, template: bool = False) -> str:
     parsed = urllib.parse.urlsplit(value.replace("{query}", "test") if template else value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
         raise ValueError("来源 URL 必须是无内嵌凭据的 HTTP(S) URL")
-    sensitive = {"apikey", "api_key", "key", "token", "auth", "signature", "sig"}
-    if any(key.casefold() in sensitive for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)):
+    if any(is_sensitive_name(key) for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)):
         raise ValueError("来源 URL 不得内嵌密钥或签名；请使用 apiKeyEnv")
     if template and "{query}" not in value:
         raise ValueError("网页来源 URL 模板必须包含 {query}")
     return value
+
+
+def is_sensitive_name(value: str) -> bool:
+    normalized = re.sub(r"[-_]", "", value).casefold()
+    return normalized in {"key", "auth", "authorization", "sig"} or normalized.endswith(
+        ("apikey", "token", "password", "passwd", "secret", "signature")
+    )
 
 
 def runtime_file(env_name: str, filename: str) -> Path:
@@ -300,6 +306,17 @@ def require_target_root(path: Path) -> None:
         raise RuntimeError(f"目标预设目录不可用: {path}")
     if not os.access(path, os.W_OK):
         raise RuntimeError(f"目标预设目录不可写: {path}")
+
+
+def require_work_root(path: Path, label: str) -> None:
+    if path in {Path("/"), Path.home().resolve(), Path("/Volumes")}:
+        raise RuntimeError(f"{label}范围过大，拒绝使用: {path}")
+    require_mounted_volume(path, label)
+    existing = path
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    if not existing.is_dir() or not os.access(existing, os.W_OK):
+        raise RuntimeError(f"{label}不可写: {path}")
 
 
 def directory_identity(path: Path) -> tuple[int, int]:
@@ -480,6 +497,8 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None) -> d
         "plot": detail.get("overview") or item.get("overview") or "",
         "tagline": detail.get("tagline") or "",
         "rating": detail.get("vote_average"),
+        "ratingVotes": detail.get("vote_count"),
+        "ratingSource": "themoviedb",
         "runtime": detail.get("runtime") or next(iter(detail.get("episode_run_time") or []), None),
         "status": detail.get("status") or "",
         "genres": [genre.get("name") for genre in detail.get("genres", []) if genre.get("name")],
@@ -586,29 +605,26 @@ def build_context(config: dict, args) -> dict:
     profile_name, profile = select_profile(config, args.media_type, args.profile)
     metadata = resolve_metadata(config, args)
     metadata_config = config.setdefault("metadata", {})
+    offline = bool(args.offline or os.environ.get("MEDIA_DOWNLOADER_OFFLINE") == "1")
     if metadata_config.get("requireArtwork") and not metadata.get("posterPath") and not metadata.get("posterUrl"):
         key_env = str(metadata_config.get("apiKeyEnv", "TMDB_API_KEY"))
-        if not os.environ.get(key_env):
+        if offline or not os.environ.get(key_env):
             metadata_config["requireArtwork"] = False
-            print(f"警告: 未配置 {key_env}，requireArtwork 降级为海报可选", file=sys.stderr)
+            reason = "离线模式" if offline else f"未配置 {key_env}"
+            print(f"警告: {reason}，requireArtwork 降级为海报可选", file=sys.stderr)
     canonical = canonical_name(metadata.get("title") or title, metadata.get("year"))
     naming_name, naming = select_naming(config, profile, args.media_type, args.naming)
     base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
     state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (base_root / ".state"))
     target_name, target_root = ("work", base_root) if args.no_archive else select_target(config, profile, args.target)
-    forbidden_roots = {Path("/"), Path.home().resolve(), Path("/Volumes")}
-    if base_root in forbidden_roots:
-        raise RuntimeError(f"工作目录范围过大，拒绝使用: {base_root}")
-    if state_root in forbidden_roots:
-        raise RuntimeError(f"状态目录范围过大，拒绝使用: {state_root}")
+    require_work_root(base_root, "工作目录")
+    require_work_root(state_root, "状态目录")
     if not args.no_archive:
         require_target_root(target_root)
         if paths_overlap(base_root, target_root):
             raise RuntimeError(f"工作区与目标目录不得重叠: {base_root} / {target_root}")
         if paths_overlap(state_root, target_root):
             raise RuntimeError(f"状态目录与目标目录不得重叠: {state_root} / {target_root}")
-    require_mounted_volume(base_root, "工作目录")
-    require_mounted_volume(state_root, "状态目录")
     identifier = pipeline_task_id({"mediaType": args.media_type, "canonical": canonical, "targetRoot": target_root}, resolve_source(args)[0])
     work_parent = base_root / ".media-downloader-work"
     work_root = work_parent / identifier
@@ -970,7 +986,7 @@ def command_sources(_args) -> int:
     config = load_config()
     public = {}
     for name, source in config.get("searchSources", {}).items():
-        public[name] = {key: value for key, value in source.items() if key.casefold() not in {"apikey", "api_key", "token", "password", "secret"}}
+        public[name] = {key: value for key, value in source.items() if not is_sensitive_name(key)}
     print(json.dumps({"config": str(config_file()), "sources": public}, ensure_ascii=False, indent=2))
     return 0
 
@@ -1297,7 +1313,12 @@ def write_nfo(ctx: dict, plans: list[dict]) -> None:
     xml_text(root, "plot", metadata.get("plot"))
     xml_text(root, "tagline", metadata.get("tagline"))
     xml_text(root, "mpaa", metadata.get("contentRating"))
-    xml_text(root, "rating", metadata.get("rating"))
+    if metadata.get("rating") not in (None, ""):
+        ratings = ET.SubElement(root, "ratings")
+        source = metadata.get("ratingSource") or ("themoviedb" if metadata.get("ids", {}).get("tmdb") else "default")
+        rating = ET.SubElement(ratings, "rating", {"name": str(source), "max": "10", "default": "true"})
+        xml_text(rating, "value", metadata.get("rating"))
+        xml_text(rating, "votes", metadata.get("ratingVotes"))
     xml_text(root, "runtime", metadata.get("runtime"))
     xml_text(root, "status", metadata.get("status"))
     xml_text(root, "studio", metadata.get("studio"))
@@ -1668,6 +1689,15 @@ def command_doctor(_args) -> int:
     for tool, required in (("ffmpeg", True), ("ffprobe", True), ("aria2c", False), ("yt-dlp", False)):
         location = shutil.which(tool)
         checks.append({"name": tool, "status": "ok" if location else ("error" if required else "optional-missing"), "path": location or ""})
+    base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
+    state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (base_root / ".state"))
+    for name, path, label in (("work:base", base_root, "工作目录"), ("work:state", state_root, "状态目录")):
+        try:
+            require_work_root(path, label)
+            status = "ok"
+        except RuntimeError:
+            status = "error"
+        checks.append({"name": name, "status": status, "path": str(path)})
     for name, raw in (config.get("targets", {}) or {}).items():
         value = raw.get("path") if isinstance(raw, dict) else raw
         path = resolve_path(value)

@@ -40,7 +40,7 @@ This project only handles sources the user is authorized to access and download.
 ## Quick start
 
 ```bash
-git clone <repository-url> agent-media-pipeline
+git clone https://github.com/roanpy/agent-media-pipeline.git
 cd agent-media-pipeline
 cp config.example.json config.json
 chmod 600 config.json
@@ -125,7 +125,7 @@ Transcoding removes inherited global and chapter metadata by default, then relie
 
 ## Plex compatibility
 
-The default naming preset follows Plex's recommended movie and season/episode layout. Local assets include `poster`, `fanart`, `banner`, and `clearlogo`; movie, show, and episode NFO files are generated for the Plex NFO Agent. Enable local assets in the Plex library settings when using local artwork.
+The default naming preset follows Plex's recommended movie and season/episode layout. Local assets include `poster`, `fanart`, `banner`, and `clearlogo`; movie, show, and episode NFO files are generated for the Plex NFO Agent. The official NFO Agent requires Plex Media Server 1.43.1 or newer. Enable local assets in the Plex library settings when using local artwork.
 
 Ordinary channel uploads, clips, and unmatched web videos may fit a separate Plex “Other Videos” library better than a movie or TV library. This project does not automatically disguise arbitrary web content as catalogued film or television.
 

@@ -14,6 +14,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -22,8 +23,8 @@ PROJECT = Path(__file__).resolve().parents[1]
 SCRIPT = PROJECT / "media-downloader.py"
 
 
-def run(command, *, env=None, expect=0):
-    result = subprocess.run(command, cwd=PROJECT, env=env, capture_output=True, text=True)
+def run(command, *, env=None, expect=0, cwd=PROJECT):
+    result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode != expect:
         raise AssertionError(
             f"command returned {result.returncode}, expected {expect}: {command}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
@@ -312,6 +313,7 @@ def main():
         movie_metadata.write_text(json.dumps({
             "title": "测试电影", "originalTitle": "Test Film", "year": 2025,
             "sortTitle": "Test Film, The", "plot": "电影剧情", "tagline": "电影标语",
+            "rating": 7.5, "ratingVotes": 1550, "ratingSource": "themoviedb",
             "countries": ["中国"], "tags": ["测试"], "directors": ["测试导演"],
             "writers": ["测试编剧"], "actors": [{"name": "测试演员", "role": "角色"}],
             "posterPath": str(root / "source" / "poster.png"),
@@ -326,6 +328,8 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             checks = {item["name"]: item["status"] for item in json.loads(doctor.stdout)["checks"]}
+            assert checks["work:base"] == "ok"
+            assert checks["work:state"] == "ok"
             assert checks["target:tv"] == "ok"
             assert checks["target:movie"] == "unavailable"
             (root / "movie").mkdir()
@@ -367,6 +371,17 @@ def main():
             assert "--replace" in duplicate.stderr
             secret_url = run([sys.executable, str(SCRIPT), "add-source", "unsafe", "https://example.test/api?apikey=secret", "--type", "torznab"], env=source_env, expect=1)
             assert "不得内嵌" in secret_url.stderr
+            for index, key in enumerate(("access_token", "auth_token", "password", "client_secret", "X-Amz-Signature"), start=1):
+                secret_url = run([sys.executable, str(SCRIPT), "add-source", f"unsafe{index}", f"https://example.test/api?{key}=secret", "--type", "torznab"], env=source_env, expect=1)
+                assert "不得内嵌" in secret_url.stderr
+
+            broken_work = json.loads(cfg.read_text(encoding="utf-8"))
+            broken_work["baseDir"] = "/"
+            broken_work_cfg = root / "broken-work.json"
+            broken_work_cfg.write_text(json.dumps(broken_work), encoding="utf-8")
+            broken_doctor = run([sys.executable, str(SCRIPT), "doctor"], env={**env, "MEDIA_DOWNLOADER_CONFIG": str(broken_work_cfg)}, expect=1)
+            broken_checks = {item["name"]: item["status"] for item in json.loads(broken_doctor.stdout)["checks"]}
+            assert broken_checks["work:base"] == "error"
 
             # 不归档时目标库可不可用，成品都留在受控工作区
             no_archive_config = json.loads(cfg.read_text(encoding="utf-8"))
@@ -392,6 +407,26 @@ def main():
             downgraded = run([sys.executable, str(SCRIPT), "adopt", "降级剧", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--target", "tv", "--offline"], env=artwork_env)
             assert "降级" in downgraded.stderr
             assert (root / "tv" / "降级剧" / "Season 02" / "降级剧 - S02E03.mp4").is_file()
+            offline_key_env = {**artwork_env, "UNSET_TEST_TMDB_KEY": "present"}
+            offline_key = run([sys.executable, str(SCRIPT), "adopt", "离线有 Key", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--offline"], env=offline_key_env)
+            assert "离线模式" in offline_key.stderr
+            assert (root / "movie" / "离线有 Key" / "离线有 Key.mp4").is_file()
+
+            relative_env = {**no_archive_env, "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "relative-status.json")}
+            relative = run([str(PROJECT / "run.sh"), "adopt", "Relative Background", "Film.mkv", "--type", "movie", "--no-transcode", "--no-archive", "--offline"], env=relative_env, cwd=root / "source")
+            launch_log = Path(next(line.split(": ", 1)[1] for line in relative.stdout.splitlines() if line.startswith("启动日志: ")))
+            try:
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    states = json.loads((root / "relative-status.json").read_text(encoding="utf-8")) if (root / "relative-status.json").exists() else {}
+                    state = next((item for item in states.values() if item.get("requestedTitle") == "Relative Background"), {})
+                    if state.get("phase") in {"done", "failed", "stopped"}:
+                        break
+                    time.sleep(0.1)
+                assert state.get("phase") == "done", (state, launch_log.read_text(encoding="utf-8") if launch_log.exists() else "")
+                assert Path(state["targetPath"]).joinpath("Relative Background.mkv").is_file()
+            finally:
+                launch_log.unlink(missing_ok=True)
 
             searched = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--type", "tv"], env=env)
             payload = json.loads(searched.stdout)
@@ -476,6 +511,9 @@ def main():
             assert film.is_file()
             assert_xml(film.parent / "movie.nfo", "<movie>")
             assert_xml(film.parent / "movie.nfo", "<sorttitle>Test Film, The</sorttitle>")
+            assert_xml(film.parent / "movie.nfo", '<rating name="themoviedb" max="10" default="true">')
+            assert_xml(film.parent / "movie.nfo", "<value>7.5</value>")
+            assert_xml(film.parent / "movie.nfo", "<votes>1550</votes>")
             assert_xml(film.parent / "movie.nfo", "<name>测试演员</name>")
             assert (film.parent / "banner.jpg").is_file()
             assert (film.parent / "clearlogo.png").is_file()

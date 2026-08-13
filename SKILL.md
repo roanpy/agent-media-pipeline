@@ -3,7 +3,7 @@ name: agent-media-pipeline
 description: Discover authorized media through Jackett, Torznab/Prowlarr, or public web sources; review candidates; acquire local files, torrents, direct links, YouTube/Bilibili videos, or playlists; transcode with TV/movie defaults or preserve the original container; generate Plex-compatible naming, NFO, and artwork; and optionally archive to a local folder, external drive, or NAS. Use for agent-guided media search, download, organization, metadata, status, resume, and safe stop workflows.
 ---
 
-# Media Downloader
+# Agent Media Pipeline
 
 Separate agent judgment from deterministic execution. The agent searches, verifies, compares, and asks for decisions. `run.sh` acquires, transcodes or organizes, writes metadata, validates, archives, and cleans up.
 
@@ -122,7 +122,7 @@ Try TMDB through `TMDB_API_KEY`; TV may fall back to TVMaze. A metadata JSON may
 
 Supported root artwork names are `poster`, `fanart`, `banner`, and `clearlogo`. With no TMDB key, still generate minimal valid NFO. If `metadata.requireArtwork=true` but neither a key nor supplied poster exists, warn and downgrade artwork to optional.
 
-Verified `metadata.title` controls canonical naming and task identity while status retains the requested title. Enable “Use local Assets” in Plex for local artwork and select Plex NFO Agent for NFO. Use the Plex preset for catalogued movies and TV. Prefer a separate Plex “Other Videos” library for unmatched clips or ordinary channel uploads rather than disguising them as film/TV.
+Verified `metadata.title` controls canonical naming and task identity while status retains the requested title. Enable “Use local Assets” in Plex for local artwork and select Plex NFO Agent on Plex Media Server 1.43.1 or newer. Use the Plex preset for catalogued movies and TV. Prefer a separate Plex “Other Videos” library for unmatched clips or ordinary channel uploads rather than disguising them as film/TV.
 
 Transcoding defaults to MP4 profiles and removes inherited global and chapter metadata. Normalized filenames, NFO, and artwork carry library metadata. `--no-transcode` promises byte-preserving media organization and therefore does not alter embedded metadata.
 

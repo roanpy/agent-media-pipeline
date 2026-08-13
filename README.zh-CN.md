@@ -40,7 +40,7 @@
 ## 快速开始
 
 ```bash
-git clone <repository-url> agent-media-pipeline
+git clone https://github.com/roanpy/agent-media-pipeline.git
 cd agent-media-pipeline
 cp config.example.json config.json
 chmod 600 config.json
@@ -125,7 +125,7 @@ brew install ffmpeg aria2 yt-dlp
 
 ## Plex 兼容性
 
-默认命名 preset 遵循 Plex 推荐的电影目录和电视剧季/集结构。本地资源包括 `poster`、`fanart`、`banner` 和 `clearlogo`；同时生成电影、剧集和单集 NFO，供 Plex NFO Agent 使用。使用本地图片时需在 Plex 媒体库设置中启用本地资源。
+默认命名 preset 遵循 Plex 推荐的电影目录和电视剧季/集结构。本地资源包括 `poster`、`fanart`、`banner` 和 `clearlogo`；同时生成电影、剧集和单集 NFO，供 Plex NFO Agent 使用。官方 NFO Agent 要求 Plex Media Server 1.43.1 或更高版本。使用本地图片时需在 Plex 媒体库设置中启用本地资源。
 
 普通频道视频、短片或无法匹配影视数据库的网络内容，通常更适合独立的 Plex “Other Videos” 库。本项目不会自动把任意网页视频伪装成正式电影或电视剧。
 

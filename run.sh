@@ -44,7 +44,6 @@ with open(os.devnull, "rb") as stdin, os.fdopen(descriptor, "ab", buffering=0) a
         stdin=stdin,
         stdout=output,
         stderr=subprocess.STDOUT,
-        cwd=os.path.dirname(script),
         start_new_session=True,
         close_fds=True,
         env=os.environ.copy(),
