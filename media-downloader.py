@@ -14,8 +14,10 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -28,8 +30,10 @@ SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
-SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt"}
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
+ARCHIVE_EXTS = VIDEO_EXTS | SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
+MAX_COMPONENT_BYTES = 200
 ACTIVE_CHILD: subprocess.Popen | None = None
 STOP_REQUESTED = False
 
@@ -49,22 +53,52 @@ def read_json(path: Path, default=None):
 
 def atomic_json(path: Path, data, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with open(temp, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    if private:
-        os.chmod(temp, 0o600)
-    os.replace(temp, path)
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        if private:
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def ensure_private_file(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags, 0o600)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        os.close(descriptor)
+        raise RuntimeError(f"日志文件不安全: {path}")
+    os.fchmod(descriptor, 0o600)
+    os.set_blocking(descriptor, True)
     os.close(descriptor)
-    os.chmod(path, 0o600)
+
+
+def write_private_text(path: Path, value: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(value)
+
+
+def read_private_text(path: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 64 * 1024:
+        os.close(descriptor)
+        raise RuntimeError("--source-file 必须是当前用户拥有、无组/其他权限且不超过 64KB 的普通文件")
+    with os.fdopen(descriptor, encoding="utf-8") as handle:
+        return handle.read().strip()
 
 
 def config_file() -> Path:
@@ -81,6 +115,13 @@ def validate_config(data: dict) -> None:
         raise RuntimeError("配置缺少 targets")
     if not isinstance(naming, dict) or not naming:
         raise RuntimeError("配置缺少 namingPresets")
+    try:
+        timeout_hours = float(data.get("timeoutHours", 24))
+        minimum_duration = float(data.get("minMediaDurationSeconds", 120))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("timeoutHours/minMediaDurationSeconds 必须是数字") from exc
+    if timeout_hours <= 0 or minimum_duration < 0:
+        raise RuntimeError("timeoutHours 必须大于 0，minMediaDurationSeconds 不得小于 0")
     defaults = data.get("defaultProfiles", {})
     if not isinstance(defaults, dict):
         raise RuntimeError("defaultProfiles 必须是对象")
@@ -93,15 +134,51 @@ def validate_config(data: dict) -> None:
         if not isinstance(profile, dict) or profile.get("type") not in {"tv", "movie"}:
             raise RuntimeError(f"profile 无效: {name}")
         target = profile.get("target")
-        if target and target not in targets:
+        if not target or target not in targets:
             raise RuntimeError(f"profile {name} 引用了未知 target: {target}")
         naming_name = profile.get("naming") or data.get("defaultNaming") or "plex"
         if naming_name not in naming:
             raise RuntimeError(f"profile {name} 引用了未知 naming: {naming_name}")
+        container = str(profile.get("container", "mp4")).lower().lstrip(".")
+        if not re.fullmatch(r"[a-z0-9]{2,8}", container):
+            raise RuntimeError(f"profile {name} 容器无效: {container}")
+        codec = profile.get("videoCodec", "libx264")
+        audio_codec = profile.get("audioCodec", "aac")
+        if not isinstance(codec, str) or not codec or not isinstance(audio_codec, str) or not audio_codec:
+            raise RuntimeError(f"profile {name} codec 无效")
+        if codec != "copy":
+            try:
+                resolution = int(profile.get("resolution", 1080))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"profile {name} resolution 无效") from exc
+            if not 64 <= resolution <= 4320:
+                raise RuntimeError(f"profile {name} resolution 超出范围: {resolution}")
+        if profile.get("crf") is not None:
+            try:
+                crf = float(profile["crf"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"profile {name} CRF 无效") from exc
+            if not 0 <= crf <= 63:
+                raise RuntimeError(f"profile {name} CRF 超出范围: {crf}")
     for name, value in targets.items():
         raw = value.get("path") if isinstance(value, dict) else value
         if not isinstance(raw, str) or not raw.strip():
             raise RuntimeError(f"target 路径无效: {name}")
+    sources = data.get("searchSources", {})
+    if not isinstance(sources, dict):
+        raise RuntimeError("searchSources 必须是对象")
+    for name, source in sources.items():
+        if not isinstance(source, dict) or source.get("type") not in {"jackett", "web"}:
+            raise RuntimeError(f"搜索源无效: {name}")
+        if source["type"] == "jackett":
+            parsed = urllib.parse.urlsplit(str(source.get("url", "")))
+        else:
+            template = str(source.get("urlTemplate", ""))
+            if "{query}" not in template:
+                raise RuntimeError(f"网页搜索源缺少 {{query}}: {name}")
+            parsed = urllib.parse.urlsplit(template.replace("{query}", "test"))
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise RuntimeError(f"搜索源 URL 无效: {name}")
 
 
 def load_config() -> dict:
@@ -130,7 +207,10 @@ def candidate_file() -> Path:
 def json_lock(path: Path):
     lock_path = path.with_name(f".{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as handle:
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -161,7 +241,9 @@ def sanitize_component(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip(" .")
     if not value or value in {".", ".."}:
         raise ValueError("名称清理后为空")
-    return value[:180]
+    if len(value.encode("utf-8")) > MAX_COMPONENT_BYTES:
+        raise ValueError(f"名称超过 {MAX_COMPONENT_BYTES} 字节: {value[:40]}…")
+    return value
 
 
 def validate_title(title: str) -> str:
@@ -184,19 +266,62 @@ def paths_overlap(left: Path, right: Path) -> bool:
     return contains_path(left, right) or contains_path(right, left)
 
 
-def require_target_root(path: Path) -> None:
-    forbidden = {Path("/"), Path.home().resolve(), Path("/Volumes")}
-    if path in forbidden:
-        raise RuntimeError(f"目标目录范围过大，拒绝使用: {path}")
-    if not path.is_dir():
-        raise RuntimeError(f"目标预设目录不可用: {path}")
-    if not os.access(path, os.W_OK):
-        raise RuntimeError(f"目标预设目录不可写: {path}")
+def require_mounted_volume(path: Path, label: str) -> None:
     parts = path.parts
     if len(parts) >= 3 and parts[1] == "Volumes":
         volume_root = Path("/Volumes") / parts[2]
         if not os.path.ismount(volume_root):
-            raise RuntimeError(f"目标磁盘未挂载: {volume_root}")
+            raise RuntimeError(f"{label}所在磁盘未挂载: {volume_root}")
+
+
+def require_target_root(path: Path) -> None:
+    forbidden = {Path("/"), Path.home().resolve(), Path("/Volumes")}
+    if path in forbidden:
+        raise RuntimeError(f"目标目录范围过大，拒绝使用: {path}")
+    require_mounted_volume(path, "目标目录")
+    if not path.is_dir():
+        raise RuntimeError(f"目标预设目录不可用: {path}")
+    if not os.access(path, os.W_OK):
+        raise RuntimeError(f"目标预设目录不可写: {path}")
+
+
+def directory_identity(path: Path) -> tuple[int, int]:
+    stat = path.lstat()
+    return stat.st_dev, stat.st_ino
+
+
+def ensure_target_parent(ctx: dict, parent: Path) -> None:
+    root = ctx["targetRoot"]
+    require_target_root(root)
+    if directory_identity(root) != ctx["targetIdentity"]:
+        raise RuntimeError(f"目标目录在任务期间发生变化: {root}")
+    try:
+        relative = parent.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"归档目标逃逸: {parent}") from exc
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            current.mkdir()
+        except FileExistsError:
+            pass
+        if current.is_symlink() or not current.is_dir() or not current.resolve().is_relative_to(root):
+            raise RuntimeError(f"归档目录不安全: {current}")
+    if directory_identity(root) != ctx["targetIdentity"]:
+        raise RuntimeError(f"目标目录在任务期间发生变化: {root}")
+
+
+def normalize_year(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        year = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"年份无效: {value}") from exc
+    if not 1000 <= year <= 2999:
+        raise ValueError(f"年份超出范围: {year}")
+    return year
 
 
 def canonical_name(title: str, year: int | None) -> str:
@@ -206,16 +331,13 @@ def canonical_name(title: str, year: int | None) -> str:
     return title
 
 
-def task_id(media_type: str, title: str, year: int | None) -> str:
-    digest = hashlib.sha256(f"{media_type}\0{title}\0{year or ''}".encode()).hexdigest()[:12]
+def task_id(media_type: str, canonical: str, target_root: Path) -> str:
+    digest = hashlib.sha256(f"{media_type}\0{canonical}\0{target_root}".encode()).hexdigest()[:12]
     return f"{media_type}-{digest}"
 
 
 def default_profile_name(config: dict, media_type: str) -> str:
-    defaults = config.get("defaultProfiles", {})
-    if isinstance(defaults, dict) and defaults.get(media_type):
-        return str(defaults[media_type])
-    return str(config.get("defaultProfile") or ("tv1080" if media_type == "tv" else "movie1080"))
+    return str(config["defaultProfiles"][media_type])
 
 
 def select_profile(config: dict, media_type: str, name: str | None) -> tuple[str, dict]:
@@ -227,8 +349,6 @@ def select_profile(config: dict, media_type: str, name: str | None) -> tuple[str
     if profile.get("type", media_type) != media_type:
         raise RuntimeError(f"预设 {name} 不适用于 {media_type}")
     container = str(profile.get("container", "mp4")).lower().lstrip(".")
-    if not re.fullmatch(r"[a-z0-9]{2,8}", container):
-        raise RuntimeError(f"预设容器无效: {container}")
     return name, {**profile, "container": container}
 
 
@@ -245,10 +365,7 @@ def select_target(config: dict, profile: dict, requested: str | None) -> tuple[s
         if not raw:
             raise RuntimeError(f"目标预设不存在: {name}")
         return str(name), resolve_path(raw)
-    raw = profile.get("targetDir") or config.get("targetDir")
-    if not raw:
-        raise RuntimeError("未配置目标预设")
-    return "legacy", resolve_path(raw)
+    raise RuntimeError("未配置目标预设")
 
 
 def select_naming(config: dict, profile: dict, media_type: str, requested: str | None) -> tuple[str, dict]:
@@ -285,12 +402,19 @@ def metadata_from_file(path: str | None) -> dict:
     return data
 
 
+def read_response(response, limit: int, label: str) -> bytes:
+    payload = response.read(limit + 1)
+    if len(payload) > limit:
+        raise RuntimeError(f"{label} 响应超过 {limit // (1024 * 1024)}MB")
+    return payload
+
+
 def http_json(url: str, params: dict, headers: dict | None = None, timeout: int = 20):
     query = urllib.parse.urlencode({key: value for key, value in params.items() if value not in (None, "")})
     request = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": "media-downloader/2.0", **(headers or {})})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return json.loads(read_response(response, 5 * 1024 * 1024, urllib.parse.urlsplit(url).netloc).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"{urllib.parse.urlsplit(url).netloc} 返回 HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
@@ -376,14 +500,38 @@ def resolve_metadata(config: dict, args) -> dict:
         except Exception as exc:
             print(f"警告: TVMaze 元数据查询失败: {exc}", file=sys.stderr)
     metadata = {**fetched, **supplied}
-    metadata["title"] = args.title
-    metadata["year"] = args.year or metadata.get("year")
-    metadata.setdefault("originalTitle", args.title)
+    metadata["title"] = metadata.get("title") or args.title
+    if not isinstance(metadata["title"], str) or not metadata["title"].strip():
+        raise ValueError("metadata.title 必须是非空字符串")
+    metadata["year"] = normalize_year(args.year if args.year is not None else metadata.get("year"))
+    metadata["originalTitle"] = metadata.get("originalTitle") or metadata["title"]
     metadata.setdefault("plot", "")
-    metadata.setdefault("premiered", f"{metadata['year']}-01-01" if metadata.get("year") else "")
-    metadata.setdefault("genres", [])
-    metadata.setdefault("studio", "")
-    metadata.setdefault("ids", {})
+    metadata["premiered"] = metadata.get("premiered") or (f"{metadata['year']}-01-01" if metadata.get("year") else "")
+    genres = metadata.get("genres") or []
+    if not isinstance(genres, list):
+        raise ValueError("metadata.genres 必须是数组")
+    metadata["genres"] = genres
+    metadata["studio"] = metadata.get("studio") or ""
+    ids = metadata.get("ids") or {}
+    if not isinstance(ids, dict):
+        raise ValueError("metadata.ids 必须是对象")
+    metadata["ids"] = ids
+    if args.media_type == "tv":
+        episodes = metadata.get("episodes") or []
+        if not isinstance(episodes, list):
+            raise ValueError("metadata.episodes 必须是数组")
+        for item in episodes:
+            if not isinstance(item, dict):
+                raise ValueError("metadata.episodes 每项必须是对象")
+            try:
+                season = int(item["season"])
+                episode = int(item["episode"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("metadata.episodes 每项必须包含整数 season/episode") from exc
+            if season < 0 or episode < 1:
+                raise ValueError(f"metadata.episodes 季集号无效: S{season:02d}E{episode:02d}")
+            item["season"], item["episode"] = season, episode
+        metadata["episodes"] = episodes
     return metadata
 
 
@@ -397,13 +545,18 @@ def build_context(config: dict, args) -> dict:
     base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
     state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (base_root / ".state"))
     require_target_root(target_root)
-    if base_root in {Path("/"), Path.home().resolve(), Path("/Volumes")}:
+    forbidden_roots = {Path("/"), Path.home().resolve(), Path("/Volumes")}
+    if base_root in forbidden_roots:
         raise RuntimeError(f"工作目录范围过大，拒绝使用: {base_root}")
+    if state_root in forbidden_roots:
+        raise RuntimeError(f"状态目录范围过大，拒绝使用: {state_root}")
     if paths_overlap(base_root, target_root):
         raise RuntimeError(f"工作区与目标目录不得重叠: {base_root} / {target_root}")
     if paths_overlap(state_root, target_root):
         raise RuntimeError(f"状态目录与目标目录不得重叠: {state_root} / {target_root}")
-    identifier = task_id(args.media_type, title, metadata.get("year"))
+    require_mounted_volume(base_root, "工作目录")
+    require_mounted_volume(state_root, "状态目录")
+    identifier = task_id(args.media_type, canonical, target_root)
     work_parent = base_root / ".media-downloader-work"
     work_root = work_parent / identifier
     if not contains_path(work_parent.resolve(strict=False), work_root.resolve(strict=False)):
@@ -429,6 +582,7 @@ def build_context(config: dict, args) -> dict:
         "naming": naming,
         "namingFields": naming_fields,
         "targetRoot": target_root,
+        "targetIdentity": directory_identity(target_root),
         "targetShow": target_show,
         "baseRoot": base_root,
         "stateRoot": state_root,
@@ -436,7 +590,7 @@ def build_context(config: dict, args) -> dict:
         "sourceRoot": work_root / "source",
         "outputRoot": work_root / "output",
         "marker": work_root / ".media-downloader-owned.json",
-        "logPath": Path(f"/tmp/media-downloader-{identifier}.log"),
+        "logPath": state_root / "logs" / f"{identifier}.log",
         "metadata": metadata,
         "args": args,
         "config": config,
@@ -444,11 +598,25 @@ def build_context(config: dict, args) -> dict:
 
 
 def source_fingerprint(ctx: dict, source: str) -> str:
-    value = f"{source}\0{ctx['profileName']}\0{ctx['namingName']}\0{ctx['canonical']}"
+    payload = {
+        "source": source,
+        "canonical": ctx["canonical"],
+        "mediaType": ctx["mediaType"],
+        "profile": ctx["profile"],
+        "naming": ctx["naming"],
+        "metadata": ctx["metadata"],
+        "metadataPolicy": ctx["config"].get("metadata", {}),
+        "downloader": ctx["args"].downloader,
+        "season": ctx["args"].season,
+        "episode": ctx["args"].episode,
+        "playlist": ctx["args"].playlist,
+    }
+    value = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(value.encode()).hexdigest()
 
 
 def remove_owned_work(ctx: dict) -> None:
+    require_mounted_volume(ctx["baseRoot"], "工作目录")
     work = ctx["workRoot"].resolve()
     parent = (ctx["baseRoot"] / ".media-downloader-work").resolve()
     marker = ctx["marker"]
@@ -462,6 +630,12 @@ def ensure_work(ctx: dict, source: str) -> None:
     work = ctx["workRoot"]
     marker = ctx["marker"]
     fingerprint = source_fingerprint(ctx, source)
+    work_parent = ctx["baseRoot"] / ".media-downloader-work"
+    require_mounted_volume(work_parent, "工作目录")
+    work_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if work_parent.is_symlink() or not work_parent.is_dir():
+        raise RuntimeError(f"工作目录不安全: {work_parent}")
+    os.chmod(work_parent, 0o700)
     if work.exists() and ctx["args"].reset_work:
         remove_owned_work(ctx)
     if work.exists():
@@ -471,19 +645,31 @@ def ensure_work(ctx: dict, source: str) -> None:
         if existing.get("sourceFingerprint") != fingerprint:
             raise RuntimeError("失败任务的来源已变化；确认后使用 --reset-work 重建工作区")
     else:
-        work.mkdir(parents=True)
+        work.mkdir(parents=True, mode=0o700)
         atomic_json(marker, {"taskId": ctx["id"], "title": ctx["title"], "sourceFingerprint": fingerprint, "createdAt": now()})
-    ctx["sourceRoot"].mkdir(parents=True, exist_ok=True)
-    ctx["outputRoot"].mkdir(parents=True, exist_ok=True)
-    ctx["stateRoot"].mkdir(parents=True, exist_ok=True)
+    os.chmod(work, 0o700)
+    ctx["sourceRoot"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    ctx["outputRoot"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    require_mounted_volume(ctx["stateRoot"], "状态目录")
+    ctx["stateRoot"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    for path in (ctx["sourceRoot"], ctx["outputRoot"]):
+        os.chmod(path, 0o700)
     ensure_private_file(ctx["logPath"])
 
 
 @contextlib.contextmanager
 def task_lock(ctx: dict):
     path = ctx["stateRoot"] / f"{ctx['id']}.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a+", encoding="utf-8") as handle:
+    require_mounted_volume(path, "状态目录")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        os.close(descriptor)
+        raise RuntimeError(f"任务锁不安全: {path}")
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -501,6 +687,7 @@ def task_lock(ctx: dict):
 def log(ctx: dict, message: str) -> None:
     line = f"[{time.strftime('%H:%M:%S')}] {message}"
     print(line, flush=True)
+    require_mounted_volume(ctx["stateRoot"], "状态目录")
     ensure_private_file(ctx["logPath"])
     with open(ctx["logPath"], "a", encoding="utf-8", errors="replace") as handle:
         handle.write(line + "\n")
@@ -516,7 +703,7 @@ def redacted_source(source: str) -> str:
         if ":" in host:
             host = f"[{host}]"
         netloc = f"{host}:{parsed.port}" if parsed.port else host
-        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+        return f"{parsed.scheme}://{netloc}/…"
     return str(Path(source).expanduser())
 
 
@@ -540,8 +727,6 @@ def validate_source(source: str, allow_local: bool = True) -> str:
 def signal_handler(_signum, _frame):
     global STOP_REQUESTED
     STOP_REQUESTED = True
-    if ACTIVE_CHILD and ACTIVE_CHILD.poll() is None:
-        ACTIVE_CHILD.terminate()
 
 
 def scrub_log(path: Path, secrets: list[str]) -> None:
@@ -560,28 +745,21 @@ def scrub_log(path: Path, secrets: list[str]) -> None:
 
 def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: int | None = None, redactions: list[str] | None = None) -> None:
     global ACTIVE_CHILD
+    require_mounted_volume(ctx["stateRoot"], "状态目录")
     ensure_private_file(ctx["logPath"])
     status_update(ctx["id"], phase=operation, currentOperation=operation, childPid=None)
     code = -1
     try:
         with open(ctx["logPath"], "a", encoding="utf-8", errors="replace") as handle:
-            ACTIVE_CHILD = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
+            ACTIVE_CHILD = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
             status_update(ctx["id"], childPid=ACTIVE_CHILD.pid)
             started = time.monotonic()
             while ACTIVE_CHILD.poll() is None:
                 if STOP_REQUESTED:
-                    ACTIVE_CHILD.terminate()
-                    try:
-                        ACTIVE_CHILD.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        ACTIVE_CHILD.kill()
+                    stop_child(ACTIVE_CHILD)
                     raise InterruptedError("任务已停止")
                 if timeout_seconds and time.monotonic() - started > timeout_seconds:
-                    ACTIVE_CHILD.terminate()
-                    try:
-                        ACTIVE_CHILD.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        ACTIVE_CHILD.kill()
+                    stop_child(ACTIVE_CHILD)
                     raise TimeoutError(f"{operation} 超时")
                 time.sleep(0.25)
             code = ACTIVE_CHILD.returncode
@@ -591,6 +769,19 @@ def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: in
     status_update(ctx["id"], childPid=None)
     if code != 0:
         raise RuntimeError(f"{operation} 失败，退出码 {code}，日志: {ctx['logPath']}")
+
+
+def stop_child(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
 
 
 def is_safe_file(root: Path, path: Path) -> bool:
@@ -644,7 +835,7 @@ def jackett_search(name: str, source: dict, query: str, media_type: str, limit: 
     request = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers={"User-Agent": "media-downloader/2.0"})
     try:
         with urllib.request.urlopen(request, timeout=int(source.get("timeoutSeconds", 30))) as response:
-            root = ET.fromstring(response.read())
+            root = ET.fromstring(read_response(response, 10 * 1024 * 1024, f"Jackett {name}"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Jackett {name} 返回 HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
@@ -731,10 +922,12 @@ def resolve_source(args) -> tuple[str, str]:
         return validate_source(str(entry["downloadUrl"]), allow_local=False), "aria2"
     source = args.source
     if args.source_file:
-        path = resolve_path(args.source_file)
-        if not path.is_file() or path.stat().st_mode & 0o077:
-            raise RuntimeError("--source-file 必须存在且权限为 0600")
-        source = path.read_text(encoding="utf-8").strip()
+        expanded = os.path.expandvars(str(Path(args.source_file).expanduser()))
+        path = Path(os.path.abspath(expanded))
+        try:
+            source = read_private_text(path)
+        except OSError as exc:
+            raise RuntimeError(f"--source-file 无法安全读取: {path}") from exc
     return validate_source(source), args.downloader
 
 
@@ -751,6 +944,10 @@ def classify_downloader(source: str, requested: str) -> str:
         raise RuntimeError(f"不支持的来源协议: {parsed.scheme or 'unknown'}")
     suffix = Path(parsed.path).suffix.lower()
     return "aria2" if suffix in VIDEO_EXTS | {".torrent"} else "yt-dlp"
+
+
+def task_timeout_seconds(config: dict) -> int:
+    return max(1, int(float(config.get("timeoutHours", 24)) * 3600))
 
 
 def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
@@ -775,11 +972,10 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
             command.append(str(local_source.resolve()))
         else:
             input_file = ctx["workRoot"] / ".aria2-input.txt"
-            input_file.write_text(source + "\n", encoding="utf-8")
-            os.chmod(input_file, 0o600)
+            write_private_text(input_file, source + "\n")
             command.append(f"--input-file={input_file}")
         try:
-            run_child(ctx, command, "downloading", int(ctx["config"].get("timeoutHours", 24)) * 3600, [source])
+            run_child(ctx, command, "downloading", task_timeout_seconds(ctx["config"]), [source])
         finally:
             if input_file:
                 input_file.unlink(missing_ok=True)
@@ -792,16 +988,15 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
             raise RuntimeError("yt-dlp 只接受 HTTP(S) URL")
         playlist_flag = "--yes-playlist" if ctx["args"].playlist else "--no-playlist"
         input_file = ctx["workRoot"] / ".yt-dlp-input.txt"
-        input_file.write_text(source + "\n", encoding="utf-8")
-        os.chmod(input_file, 0o600)
+        write_private_text(input_file, source + "\n")
         command = [
             "yt-dlp", "--ignore-config", "--no-remote-components", playlist_flag, "--continue",
-            "--no-overwrites", "--newline", "--write-info-json", "--write-thumbnail",
+            "--no-overwrites", "--newline",
             "--paths", str(ctx["sourceRoot"]),
             "--output", "%(playlist_index|autonumber)03d %(title).180B [%(id)s].%(ext)s", "--batch-file", str(input_file),
         ]
         try:
-            run_child(ctx, command, "downloading", int(ctx["config"].get("timeoutHours", 24)) * 3600, [source])
+            run_child(ctx, command, "downloading", task_timeout_seconds(ctx["config"]), [source])
         finally:
             input_file.unlink(missing_ok=True)
         files = media_files(ctx["sourceRoot"])
@@ -818,10 +1013,13 @@ EPISODE_PATTERNS = [
     re.compile(r"(?i)(?:^|[ ._\-\[])EP?(?P<episode>\d{1,3})(?:$|[ ._\-\]])"),
     re.compile(r"第\s*(?P<episode>\d{1,3})\s*集"),
 ]
+MULTI_EPISODE_PATTERN = re.compile(r"(?i)S\d{1,2}[ ._-]*E\d{1,3}(?:[ ._-]*(?:-|E)E?\d{1,3}(?![0-9p]))+")
 
 
 def episode_from_name(path: Path, default_season: int) -> tuple[int, int] | None:
     for text in (path.stem, path.parent.name):
+        if MULTI_EPISODE_PATTERN.search(text):
+            raise RuntimeError(f"暂不支持多集单文件: {path.name}；请先拆分为单集文件")
         for pattern in EPISODE_PATTERNS:
             match = pattern.search(text)
             if match:
@@ -831,10 +1029,13 @@ def episode_from_name(path: Path, default_season: int) -> tuple[int, int] | None
 
 
 def ffprobe(path: Path) -> dict:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type:format=duration,size", "-of", "json", str(path)],
-        capture_output=True, text=True, timeout=60,
-    )
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type:format=duration,size", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffprobe 读取超时: {path.name}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe 无法读取: {path.name}")
     data = json.loads(result.stdout or "{}")
@@ -859,7 +1060,7 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     plans = []
     seen = set()
-    for index, source in enumerate(sources):
+    for source in sources:
         source_info = validate_video(source, minimum)
         if media_type == "movie":
             if len(sources) != 1:
@@ -869,18 +1070,20 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
         else:
             parsed = episode_from_name(source, ctx["args"].season)
             if not parsed:
-                if len(sources) == 1:
-                    parsed = (ctx["args"].season, ctx["args"].episode or 1)
+                if len(sources) == 1 and ctx["args"].episode is not None:
+                    parsed = (ctx["args"].season, ctx["args"].episode)
                 else:
-                    raise RuntimeError(f"无法识别集号: {source.name}；请规范为 SxxExx/EPxx")
+                    raise RuntimeError(f"无法识别集号: {source.name}；请规范为 SxxExx/EPxx 或显式传 --season/--episode")
             season, episode = parsed
+            if season < 0 or episode < 1:
+                raise RuntimeError(f"季集号无效: S{season:02d}E{episode:02d}")
             fields = {**ctx["namingFields"], "season": season, "episode": episode}
             relative = render_path(ctx["naming"]["seasonDir"], fields) / render_path(ctx["naming"]["episodeFile"], fields)
         if relative in seen:
             raise RuntimeError(f"多个来源映射到同一输出: {relative}")
         seen.add(relative)
         stat = source.stat()
-        plans.append({"source": source, "sourceInfo": source_info, "sourceSize": stat.st_size, "sourceMtimeNs": stat.st_mtime_ns, "relative": relative, "season": season, "episode": episode, "index": index})
+        plans.append({"source": source, "sourceInfo": source_info, "sourceSize": stat.st_size, "sourceMtimeNs": stat.st_mtime_ns, "relative": relative, "season": season, "episode": episode})
     return plans
 
 
@@ -888,7 +1091,7 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path) -> list[str]:
     profile = ctx["profile"]
     codec = str(profile.get("videoCodec", "libx264"))
     audio_codec = str(profile.get("audioCodec", "aac"))
-    command = ["ffmpeg", "-hide_banner", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-dn", "-sn"]
+    command = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-dn", "-sn"]
     if codec == "copy":
         command += ["-c:v", "copy"]
     else:
@@ -903,7 +1106,7 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path) -> list[str]:
     command += ["-c:a", audio_codec]
     if audio_codec != "copy" and profile.get("audioBitrate"):
         command += ["-b:a", str(profile["audioBitrate"])]
-    command += ["-map_metadata", "-1", "-map_chapters", "-1"]
+    command += ["-map_metadata", "-1"]
     if profile["container"] == "mp4":
         command += ["-movflags", "+faststart"]
     command.append(str(target))
@@ -913,27 +1116,33 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path) -> list[str]:
 def transcode(ctx: dict, plans: list[dict]) -> None:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     for plan in plans:
+        require_mounted_volume(ctx["baseRoot"], "工作目录")
         output = ctx["outputRoot"] / plan["relative"]
         output.parent.mkdir(parents=True, exist_ok=True)
         temp = output.with_name(f".{output.stem}.partial{output.suffix}")
         temp.unlink(missing_ok=True)
         status_update(ctx["id"], phase="transcoding", currentFile=plan["source"].name)
         log(ctx, f"转码: {plan['source'].name} -> {plan['relative']}")
-        run_child(ctx, ffmpeg_command(ctx, plan["source"], temp), "transcoding")
+        run_child(ctx, ffmpeg_command(ctx, plan["source"], temp), "transcoding", task_timeout_seconds(ctx["config"]))
         source_stat = plan["source"].stat()
         if source_stat.st_size != plan["sourceSize"] or source_stat.st_mtime_ns != plan["sourceMtimeNs"]:
             temp.unlink(missing_ok=True)
             raise RuntimeError(f"转码期间来源仍在变化: {plan['source'].name}")
         output_info = validate_video(temp, minimum)
-        if output_info["duration"] < plan["sourceInfo"]["duration"] * 0.95:
+        if plan["sourceInfo"]["hasAudio"] and not output_info["hasAudio"]:
+            temp.unlink(missing_ok=True)
+            raise RuntimeError(f"转码输出缺少音频: {plan['source'].name}")
+        allowed_shortfall = max(2.0, min(10.0, plan["sourceInfo"]["duration"] * 0.001))
+        if output_info["duration"] + allowed_shortfall < plan["sourceInfo"]["duration"]:
             temp.unlink(missing_ok=True)
             raise RuntimeError(f"转码输出疑似截断: {plan['source'].name}")
         os.replace(temp, output)
         plan["output"] = output
-        for suffix in SUBTITLE_EXTS:
-            sidecar = plan["source"].with_suffix(suffix)
-            if sidecar.is_file() and not sidecar.is_symlink():
-                shutil.copy2(sidecar, output.with_suffix(suffix))
+        for sidecar in plan["source"].parent.iterdir():
+            if not sidecar.name.startswith(f"{plan['source'].stem}.") or not is_safe_file(plan["source"].parent, sidecar) or sidecar.suffix.lower() not in SUBTITLE_EXTS:
+                continue
+            tag = sidecar.name[len(plan["source"].stem):-len(sidecar.suffix)]
+            shutil.copy2(sidecar, output.with_name(f"{output.stem}{tag}{sidecar.suffix.lower()}"))
 
 
 def xml_text(parent: ET.Element, name: str, value) -> None:
@@ -950,6 +1159,7 @@ def write_xml(path: Path, root: ET.Element) -> None:
 
 
 def write_nfo(ctx: dict, plans: list[dict]) -> None:
+    require_mounted_volume(ctx["baseRoot"], "工作目录")
     metadata = ctx["metadata"]
     root_name = "tvshow" if ctx["mediaType"] == "tv" else "movie"
     root = ET.Element(root_name)
@@ -971,9 +1181,9 @@ def write_nfo(ctx: dict, plans: list[dict]) -> None:
             first = False
     write_xml(ctx["outputRoot"] / f"{root_name}.nfo", root)
     if ctx["mediaType"] == "tv":
-        episode_items = metadata.get("episodes", []) if isinstance(metadata.get("episodes"), list) else []
+        episode_items = metadata["episodes"]
         for plan in plans:
-            details = next((item for item in episode_items if isinstance(item, dict) and int(item.get("season", -1)) == plan["season"] and int(item.get("episode", -1)) == plan["episode"]), {})
+            details = next((item for item in episode_items if item["season"] == plan["season"] and item["episode"] == plan["episode"]), {})
             episode_root = ET.Element("episodedetails")
             xml_text(episode_root, "title", details.get("title") or f"Episode {plan['episode']}")
             xml_text(episode_root, "season", plan["season"])
@@ -993,6 +1203,8 @@ def download_image(source: str, destination: Path, ctx: dict) -> None:
             with urllib.request.urlopen(request, timeout=30) as response, open(temp_source, "wb") as handle:
                 remaining = 25 * 1024 * 1024
                 while remaining > 0:
+                    if STOP_REQUESTED:
+                        raise InterruptedError("任务已停止")
                     chunk = response.read(min(1024 * 1024, remaining))
                     if not chunk:
                         break
@@ -1010,19 +1222,34 @@ def download_image(source: str, destination: Path, ctx: dict) -> None:
         if not source_path.is_file():
             raise RuntimeError(f"图片不存在: {source_path}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source_path), "-frames:v", "1", str(destination)])
-    if result.returncode != 0 or not destination.is_file() or destination.stat().st_size == 0:
-        raise RuntimeError(f"图片转换失败: {source_path.name}")
-    temp_source.unlink(missing_ok=True)
+    temp_destination = destination.with_name(f".{destination.stem}.{os.getpid()}.partial{destination.suffix}")
+    temp_destination.unlink(missing_ok=True)
+    try:
+        run_child(
+            ctx,
+            ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", str(source_path), "-frames:v", "1", str(temp_destination)],
+            "metadata",
+            60,
+        )
+        if not temp_destination.is_file() or temp_destination.stat().st_size == 0:
+            raise RuntimeError(f"图片转换失败: {source_path.name}")
+        os.replace(temp_destination, destination)
+    finally:
+        temp_destination.unlink(missing_ok=True)
+        temp_source.unlink(missing_ok=True)
 
 
 def write_artwork(ctx: dict, plans: list[dict]) -> None:
+    require_mounted_volume(ctx["baseRoot"], "工作目录")
     metadata = ctx["metadata"]
     roots = {ctx["sourceRoot"], *(plan["source"].parent for plan in plans)}
-    source_images = sorted({path for root in roots for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTS and not path.is_symlink()})
+    source_images = {path for path in ctx["sourceRoot"].rglob("*") if is_safe_file(ctx["sourceRoot"], path) and path.suffix.lower() in IMAGE_EXTS}
+    for root in roots - {ctx["sourceRoot"]}:
+        source_images.update(path for path in root.iterdir() if is_safe_file(root, path) and path.suffix.lower() in IMAGE_EXTS)
+    source_images = sorted(source_images)
     # ponytail: infer only conventional names; ambiguous libraries must provide metadata paths.
-    poster = metadata.get("posterPath") or metadata.get("posterUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"poster", "folder", "cover"}), "")
-    fanart = metadata.get("fanartPath") or metadata.get("fanartUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"fanart", "backdrop", "background"}), "")
+    poster = metadata.get("posterPath") or metadata.get("posterUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"poster", "folder", "cover", "default", "movie"}), "")
+    fanart = metadata.get("fanartPath") or metadata.get("fanartUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"fanart", "backdrop", "background", "art"}), "")
     required = bool(ctx["config"].get("metadata", {}).get("requireArtwork", False))
     for kind, source in (("poster", poster), ("fanart", fanart)):
         if not source:
@@ -1031,8 +1258,10 @@ def write_artwork(ctx: dict, plans: list[dict]) -> None:
             continue
         try:
             download_image(str(source), ctx["outputRoot"] / f"{kind}.jpg", ctx)
+        except InterruptedError:
+            raise
         except Exception as exc:
-            if required:
+            if required and kind == "poster":
                 raise
             log(ctx, f"警告: {kind} 获取失败: {exc}")
 
@@ -1041,6 +1270,8 @@ def file_digest(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if STOP_REQUESTED:
+                raise InterruptedError("任务已停止")
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -1049,16 +1280,20 @@ def existing_matches(source: Path, target: Path, minimum_duration: float) -> boo
     if target.is_symlink() or not target.is_file() or source.stat().st_size != target.stat().st_size:
         return False
     if source.suffix.lower() in VIDEO_EXTS:
-        validate_video(target, minimum_duration)
+        try:
+            validate_video(target, minimum_duration)
+        except RuntimeError:
+            return False
     return file_digest(source) == file_digest(target)
 
 
 def atomic_copy(source: Path, target: Path, minimum_duration: float) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_name(f".{target.name}.{os.getpid()}.partial")
-    temp.unlink(missing_ok=True)
+    if target.parent.is_symlink() or not target.parent.is_dir():
+        raise RuntimeError(f"归档目录不可用: {target.parent}")
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".partial", dir=target.parent)
+    temp = Path(temp_name)
     try:
-        with open(source, "rb") as src, open(temp, "wb") as dst:
+        with open(source, "rb") as src, os.fdopen(descriptor, "wb") as dst:
             while True:
                 if STOP_REQUESTED:
                     raise InterruptedError("任务已停止")
@@ -1103,7 +1338,7 @@ def atomic_copy(source: Path, target: Path, minimum_duration: float) -> None:
                     raise RuntimeError(f"目标已被其他任务写入且内容不同，拒绝覆盖: {target}")
             except Exception:
                 with contextlib.suppress(FileNotFoundError):
-                    current = target.stat(follow_symlinks=False)
+                    current = target.lstat()
                     if created_identity == (current.st_dev, current.st_ino):
                         target.unlink()
                 raise
@@ -1114,7 +1349,12 @@ def atomic_copy(source: Path, target: Path, minimum_duration: float) -> None:
 def archive(ctx: dict) -> list[str]:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     output_root = ctx["outputRoot"].resolve()
-    files = sorted(path for path in output_root.rglob("*") if is_safe_file(output_root, path))
+    files = sorted(
+        path for path in output_root.rglob("*")
+        if is_safe_file(output_root, path)
+        and path.suffix.lower() in ARCHIVE_EXTS
+        and not any(part.startswith(".") for part in path.relative_to(output_root).parts)
+    )
     if not files:
         raise RuntimeError("没有可归档文件")
     archived = []
@@ -1125,6 +1365,7 @@ def archive(ctx: dict) -> list[str]:
         target = ctx["targetShow"] / relative
         if not target.resolve(strict=False).is_relative_to(ctx["targetRoot"]):
             raise RuntimeError("归档目标逃逸")
+        ensure_target_parent(ctx, target.parent)
         if target.exists():
             if not existing_matches(source, target, minimum):
                 raise RuntimeError(f"目标已存在且内容不同，拒绝覆盖: {target}")
@@ -1135,11 +1376,10 @@ def archive(ctx: dict) -> list[str]:
                 raise RuntimeError(f"归档校验失败: {target}")
         archived.append(str(target))
         status_update(ctx["id"], phase="archiving", currentFile=str(relative), archivedFiles=archived)
+    require_target_root(ctx["targetRoot"])
+    if directory_identity(ctx["targetRoot"]) != ctx["targetIdentity"]:
+        raise RuntimeError(f"目标目录在任务期间发生变化: {ctx['targetRoot']}")
     return archived
-
-
-def cleanup_work(ctx: dict) -> None:
-    remove_owned_work(ctx)
 
 
 def pipeline(args) -> int:
@@ -1148,7 +1388,7 @@ def pipeline(args) -> int:
     source, requested_downloader = resolve_source(args)
     plan = {
         "taskId": ctx["id"], "title": ctx["canonical"], "mediaType": ctx["mediaType"],
-        "requestedTitle": ctx["title"],
+        "requestedTitle": args.title,
         "profile": ctx["profileName"], "target": ctx["targetName"],
         "naming": ctx["namingName"],
         "targetPath": str(ctx["targetShow"]), "source": redacted_source(source),
@@ -1156,13 +1396,14 @@ def pipeline(args) -> int:
     if args.dry_run:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
-    ensure_work(ctx, source)
     with task_lock(ctx):
+        ensure_work(ctx, source)
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
         status_update(
             ctx["id"], **plan, phase="starting", pid=os.getpid(), childPid=None,
-            currentOperation="starting", currentFile="", startedAt=now(), logPath=str(ctx["logPath"]),
+            currentOperation="starting", currentFile="", startedAt=now(), finishedAt=None,
+            lastError="", archivedFiles=[], logPath=str(ctx["logPath"]),
         )
         try:
             sources = acquire(ctx, source, requested_downloader)
@@ -1174,7 +1415,7 @@ def pipeline(args) -> int:
             status_update(ctx["id"], phase="archiving", currentOperation="archiving")
             archived = archive(ctx)
             if not args.keep_work:
-                cleanup_work(ctx)
+                remove_owned_work(ctx)
             status_update(ctx["id"], phase="done", currentOperation="done", currentFile="", pid=None, childPid=None, archivedFiles=archived, finishedAt=now())
             log(ctx, f"完成: {ctx['canonical']}")
             return 0
@@ -1198,7 +1439,10 @@ def command_check(args) -> int:
     states = status_read()
     if args.title:
         title = args.title.casefold()
-        states = {key: value for key, value in states.items() if title in str(value.get("title", "")).casefold()}
+        states = {
+            key: value for key, value in states.items()
+            if any(title in str(value.get(name, "")).casefold() for name in ("title", "requestedTitle"))
+        }
     print(json.dumps(states, ensure_ascii=False, indent=2))
     return 0 if states else 1
 
@@ -1211,7 +1455,8 @@ def process_matches(pid: int, title: str) -> bool:
 def command_stop(args) -> int:
     matches = []
     for identifier, state in status_read().items():
-        if args.title.casefold() == str(state.get("title", "")).casefold() and state.get("phase") not in {"done", "failed", "stopped"}:
+        names = {str(state.get("title", "")).casefold(), str(state.get("requestedTitle", "")).casefold()}
+        if args.title.casefold() in names and state.get("phase") not in {"done", "failed", "stopped"}:
             matches.append((identifier, state))
     if not matches:
         print("未找到运行中的任务")
@@ -1220,10 +1465,13 @@ def command_stop(args) -> int:
         pid = state.get("pid")
         process_title = str(state.get("requestedTitle") or state.get("title", ""))
         if isinstance(pid, int) and process_matches(pid, process_title):
-            os.kill(pid, signal.SIGTERM)
-            print(f"已发送停止信号: {state.get('title')} pid={pid}")
+            try:
+                os.kill(pid, signal.SIGTERM)
+                print(f"已发送停止信号: {state.get('title')} pid={pid}")
+            except ProcessLookupError:
+                status_update(identifier, phase="stopped", lastError="stale process", pid=None, childPid=None)
         else:
-            status_update(identifier, phase="stopped", lastError="stale process")
+            status_update(identifier, phase="stopped", lastError="stale process", pid=None, childPid=None)
     return 0
 
 
@@ -1242,6 +1490,14 @@ def command_doctor(_args) -> int:
         except RuntimeError:
             status = "unavailable"
         checks.append({"name": f"target:{name}", "status": status, "path": str(path)})
+    if os.environ.get("MEDIA_DOWNLOADER_TARGET_DIR"):
+        path = resolve_path(os.environ["MEDIA_DOWNLOADER_TARGET_DIR"])
+        try:
+            require_target_root(path)
+            status = "ok"
+        except RuntimeError:
+            status = "unavailable"
+        checks.append({"name": "target:environment", "status": status, "path": str(path)})
     for name, source in (config.get("searchSources", {}) or {}).items():
         if isinstance(source, dict) and source.get("type") == "jackett" and source.get("enabled", True):
             env_name = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
@@ -1258,7 +1514,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("title")
     parser.add_argument("source", nargs=None if source_required else "?")
     parser.add_argument("--candidate")
-    parser.add_argument("--source-file", help="权限为 0600、只含一个来源的文件；用于带凭据 URL")
+    parser.add_argument("--source-file", help="当前用户拥有、组/其他无权限、只含一个来源的普通文件")
     parser.add_argument("--type", dest="media_type", choices=("tv", "movie"), default="tv")
     parser.add_argument("--year", type=int)
     parser.add_argument("--profile")

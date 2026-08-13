@@ -28,6 +28,7 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
    - Agent 可直接提供本地路径、magnet、`.torrent`、HTTP(S) 直链或网页媒体 URL。
 4. 比较候选标题、季/集、年份、分辨率、编码、大小、发布时间、做种数和来源可信度。不要仅按做种数盲选。
 5. 用户已授权选择后执行 `ingest`；Jackett 候选使用 `--candidate`，网页/直链使用 URL。
+   - TV 文件名没有季集号时必须显式传 `--season`/`--episode`；多集单文件应先拆成单集。
 6. 运行 `check` 跟踪到 `done` 或 `failed`。`stop` 后再次运行 `check`。
 7. 报告归档路径、实际 profile/naming/target、文件数和任何未满足项。
 
@@ -50,7 +51,8 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 ./run.sh ingest "片名" "https://authorized.example/video" --type movie \
   --downloader yt-dlp --profile movie1080 --target movie-library
 
-# 带签名/token 的 URL 必须放进 chmod 600 的文件，避免出现在进程参数
+# 带签名/token 的 URL 必须放进当前用户拥有、组/其他无权限的普通文件，避免出现在进程参数
+chmod 600 /private/tmp/source-url
 ./run.sh ingest "片名" --source-file /private/tmp/source-url --type movie
 
 # 接管本地文件或目录
@@ -70,7 +72,7 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 - `auto`：本地普通文件/目录走 local；magnet、`.torrent`、明确媒体直链走 aria2；其他 HTTP(S) 页面走 yt-dlp。
 - Jackett 结果缓存 7 天，仅向 Agent展示 `candidateId` 和审查字段；真实 URL 保存在权限为 `0600` 的本地缓存。
 - 网页检索不在脚本里抓取或解析搜索结果。Agent 用浏览器核实公开页面，把最终授权 URL 交给 `ingest`。
-- 带签名参数、cookie 或 token 的 URL 使用权限为 `0600` 的 `--source-file`；不要把它直接写在命令行。
+- 带签名参数、cookie 或 token 的 URL 使用当前用户拥有、组/其他无权限的普通 `--source-file`；推荐 `chmod 600`，不要把它直接写在命令行。
 - 播放列表默认关闭；用户明确要整个列表时才加 `--playlist`。
 
 ## 元数据
@@ -96,6 +98,7 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 ```
 
 图片也可用 `posterPath`/`fanartPath` 指向本地文件。未配置 TMDB 时仍会生成最小合法 NFO；`metadata.requireArtwork=true` 时缺海报会使任务失败。
+`metadata.title` 是核实后的规范标题，会覆盖命令中的检索标题并用于目录、文件名和任务身份；状态中仍保留原检索标题。要让 Plex 读取 NFO，需使用支持 NFO 的 Plex Media Server 并为媒体库选择 Plex NFO Agent。
 
 ## 配置
 

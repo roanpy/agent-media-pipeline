@@ -33,12 +33,11 @@ fi
 import os
 import subprocess
 import sys
-import time
+import tempfile
 
 script, *args = sys.argv[1:]
-log_path = f"/tmp/media-downloader-launch-{int(time.time())}-{os.getpid()}.log"
-descriptor = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-os.chmod(log_path, 0o600)
+descriptor, log_path = tempfile.mkstemp(prefix="media-downloader-launch-", suffix=".log")
+os.fchmod(descriptor, 0o600)
 with open(os.devnull, "rb") as stdin, os.fdopen(descriptor, "ab", buffering=0) as output:
     process = subprocess.Popen(
         [sys.executable, script, *args],
