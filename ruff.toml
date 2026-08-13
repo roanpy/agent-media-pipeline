@@ -1,0 +1,4 @@
+# Lint gate for CI: keep it to bug-prone checks, not style preferences.
+# Newer ruff releases expand defaults; pinning the rule set keeps CI stable.
+[lint]
+select = ["F", "E9"]
