@@ -225,6 +225,9 @@ def assert_path_and_naming_guards(module, root: Path):
     id_magnet_b = module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:BBBB")
     assert id_magnet_a != id_magnet_b
     assert id_magnet_a == module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:AAAA")
+    command = module.ffmpeg_command({"profile": {"container": "mp4", "videoCodec": "libx264", "audioCodec": "aac", "resolution": 720}}, Path("input.mkv"), Path("output.mp4"))
+    assert command[command.index("-map_metadata") + 1] == "-1"
+    assert command[command.index("-map_chapters") + 1] == "-1"
     playlist_args = type("Args", (), {"copy_original": True, "season": 3, "episode": 5, "playlist": True})()
     playlist_root = root / "playlist"
     playlist_root.mkdir()
@@ -351,6 +354,19 @@ def main():
             assert json.loads(legacy_default.stdout)["mode"] == "transcode"
             profiles = run([sys.executable, str(SCRIPT), "profiles"], env=modes_env)
             assert json.loads(profiles.stdout)["defaultModes"] == {"tv": "organize", "movie": "transcode"}
+
+            source_cfg = root / "source-config.json"
+            source_cfg.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
+            source_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(source_cfg)}
+            added_web = run([sys.executable, str(SCRIPT), "add-source", "public_web", "https://example.test/search?q={query}", "--type", "web"], env=source_env)
+            assert json.loads(added_web.stdout)["saved"] == "public_web"
+            assert stat.S_IMODE(source_cfg.stat().st_mode) == 0o600
+            listed = json.loads(run([sys.executable, str(SCRIPT), "sources"], env=source_env).stdout)
+            assert listed["sources"]["public_web"]["urlTemplate"].endswith("{query}")
+            duplicate = run([sys.executable, str(SCRIPT), "add-source", "public_web", "https://example.test/find?q={query}", "--type", "web"], env=source_env, expect=1)
+            assert "--replace" in duplicate.stderr
+            secret_url = run([sys.executable, str(SCRIPT), "add-source", "unsafe", "https://example.test/api?apikey=secret", "--type", "torznab"], env=source_env, expect=1)
+            assert "不得内嵌" in secret_url.stderr
 
             # 不归档时目标库可不可用，成品都留在受控工作区
             no_archive_config = json.loads(cfg.read_text(encoding="utf-8"))

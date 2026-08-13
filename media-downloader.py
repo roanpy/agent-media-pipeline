@@ -174,14 +174,14 @@ def validate_config(data: dict) -> None:
         if not isinstance(source, dict) or source.get("type") not in {"jackett", "torznab", "web"}:
             raise RuntimeError(f"搜索源无效: {name}")
         if source["type"] == "jackett":
-            parsed = urllib.parse.urlsplit(str(source.get("url", "")))
+            value = str(source.get("url", ""))
+            parsed = urllib.parse.urlsplit(validate_public_source_url(value))
         elif source["type"] == "torznab":
-            parsed = urllib.parse.urlsplit(str(source.get("url", "")))
+            value = str(source.get("url", ""))
+            parsed = urllib.parse.urlsplit(validate_public_source_url(value))
         else:
             template = str(source.get("urlTemplate", ""))
-            if "{query}" not in template:
-                raise RuntimeError(f"网页搜索源缺少 {{query}}: {name}")
-            parsed = urllib.parse.urlsplit(template.replace("{query}", "test"))
+            parsed = urllib.parse.urlsplit(validate_public_source_url(template, template=True).replace("{query}", "test"))
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise RuntimeError(f"搜索源 URL 无效: {name}")
 
@@ -194,6 +194,18 @@ def load_config() -> dict:
         raise RuntimeError("配置根节点必须是对象")
     validate_config(data)
     return data
+
+
+def validate_public_source_url(value: str, *, template: bool = False) -> str:
+    parsed = urllib.parse.urlsplit(value.replace("{query}", "test") if template else value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("来源 URL 必须是无内嵌凭据的 HTTP(S) URL")
+    sensitive = {"apikey", "api_key", "key", "token", "auth", "signature", "sig"}
+    if any(key.casefold() in sensitive for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)):
+        raise ValueError("来源 URL 不得内嵌密钥或签名；请使用 apiKeyEnv")
+    if template and "{query}" not in value:
+        raise ValueError("网页来源 URL 模板必须包含 {query}")
+    return value
 
 
 def runtime_file(env_name: str, filename: str) -> Path:
@@ -954,6 +966,46 @@ def command_search(args) -> int:
     return 0 if public or browse else 1
 
 
+def command_sources(_args) -> int:
+    config = load_config()
+    public = {}
+    for name, source in config.get("searchSources", {}).items():
+        public[name] = {key: value for key, value in source.items() if key.casefold() not in {"apikey", "api_key", "token", "password", "secret"}}
+    print(json.dumps({"config": str(config_file()), "sources": public}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_add_source(args) -> int:
+    path = config_file()
+    if not path.is_file():
+        raise RuntimeError(f"配置不存在: {path}；请先复制 config.example.json")
+    config = load_config()
+    sources = config.setdefault("searchSources", {})
+    if args.name in sources and not args.replace:
+        raise RuntimeError(f"搜索源已存在: {args.name}；确认替换后使用 --replace")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", args.name):
+        raise ValueError("来源名只能包含小写字母、数字、下划线和连字符")
+    if args.kind == "web":
+        source = {"type": "web", "enabled": True, "urlTemplate": validate_public_source_url(args.url, template=True)}
+    else:
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", args.api_key_env):
+            raise ValueError("apiKeyEnv 必须是大写环境变量名")
+        if not 1 <= args.timeout <= 300:
+            raise ValueError("timeout 必须在 1-300 秒之间")
+        source = {
+            "type": "torznab", "enabled": True,
+            "url": validate_public_source_url(args.url),
+            "apiKeyEnv": args.api_key_env,
+            "categories": args.category or [],
+            "timeoutSeconds": args.timeout,
+        }
+    sources[args.name] = source
+    validate_config(config)
+    atomic_json(path, config, private=True)
+    print(json.dumps({"saved": args.name, "config": str(path), "source": source}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def resolve_source(args) -> tuple[str, str]:
     provided = int(bool(args.candidate)) + int(bool(args.source)) + int(bool(args.source_file))
     if provided != 1:
@@ -1158,7 +1210,7 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path) -> list[str]:
     command += ["-c:a", audio_codec]
     if audio_codec != "copy" and profile.get("audioBitrate"):
         command += ["-b:a", str(profile["audioBitrate"])]
-    command += ["-map_metadata", "-1"]
+    command += ["-map_metadata", "-1", "-map_chapters", "-1"]
     if profile["container"] == "mp4":
         command += ["-movflags", "+faststart"]
     command.append(str(target))
@@ -1682,6 +1734,17 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--type", dest="media_type", choices=("tv", "movie"), default="tv")
     search.add_argument("--limit", type=int, default=20)
     search.set_defaults(handler=command_search)
+    sources = commands.add_parser("sources", help="查看当前私有配置中的搜索来源")
+    sources.set_defaults(handler=command_sources)
+    add_source = commands.add_parser("add-source", help="向私有 config.json 添加经用户确认的搜索来源")
+    add_source.add_argument("name")
+    add_source.add_argument("url")
+    add_source.add_argument("--type", dest="kind", choices=("web", "torznab"), required=True)
+    add_source.add_argument("--api-key-env", default="TORZNAB_API_KEY")
+    add_source.add_argument("--category", action="append")
+    add_source.add_argument("--timeout", type=int, default=30)
+    add_source.add_argument("--replace", action="store_true")
+    add_source.set_defaults(handler=command_add_source)
     for name in ("ingest", "resume", "download"):
         add_pipeline_arguments(commands.add_parser(name, help="获取、转码、整理并归档"), source_required=False)
     for name in ("adopt", "process"):

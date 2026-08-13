@@ -16,7 +16,7 @@ for argument in "$@"; do
     esac
 done
 
-if [[ "$1" =~ ^(search|profile|profiles|check|status|stop|cancel|doctor)$ ]]; then
+if [[ "$1" =~ ^(search|sources|add-source|profile|profiles|check|status|stop|cancel|doctor)$ ]]; then
     foreground=true
 fi
 

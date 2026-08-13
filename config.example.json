@@ -1,6 +1,6 @@
 {
-  "baseDir": "/path/to/media-work",
-  "stateDir": "/path/to/media-work/.media-downloader-state",
+  "baseDir": "$HOME/MediaDownloader",
+  "stateDir": "$HOME/MediaDownloader/.state",
   "timeoutHours": 24,
   "minMediaDurationSeconds": 120,
   "defaultProfiles": {
@@ -12,14 +12,7 @@
     "movie": "transcode"
   },
   "defaultNaming": "plex",
-  "targets": {
-    "tv-library": {
-      "path": "/path/to/tv-library"
-    },
-    "movie-library": {
-      "path": "/path/to/movie-library"
-    }
-  },
+  "targets": {},
   "namingPresets": {
     "plex": {
       "tv": {
@@ -44,7 +37,6 @@
       "audioCodec": "aac",
       "audioBitrate": "160k",
       "preset": "medium",
-      "target": "tv-library",
       "naming": "plex"
     },
     "tv1080": {
@@ -57,7 +49,6 @@
       "audioCodec": "aac",
       "audioBitrate": "192k",
       "preset": "medium",
-      "target": "tv-library",
       "naming": "plex"
     },
     "movie720": {
@@ -70,7 +61,6 @@
       "audioCodec": "aac",
       "audioBitrate": "192k",
       "preset": "medium",
-      "target": "movie-library",
       "naming": "plex"
     },
     "movie1080": {
@@ -83,7 +73,6 @@
       "audioCodec": "aac",
       "audioBitrate": "256k",
       "preset": "medium",
-      "target": "movie-library",
       "naming": "plex"
     }
   },
