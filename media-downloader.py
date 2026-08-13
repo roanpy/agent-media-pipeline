@@ -607,6 +607,7 @@ def source_fingerprint(ctx: dict, source: str) -> str:
         "metadata": ctx["metadata"],
         "metadataPolicy": ctx["config"].get("metadata", {}),
         "downloader": ctx["args"].downloader,
+        "copyOriginal": ctx["args"].copy_original,
         "season": ctx["args"].season,
         "episode": ctx["args"].episode,
         "playlist": ctx["args"].playlist,
@@ -1060,12 +1061,14 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     plans = []
     seen = set()
+    seen_episodes = set()
     for source in sources:
         source_info = validate_video(source, minimum)
+        fields = {**ctx["namingFields"], "ext": source.suffix.lower().lstrip(".")} if ctx["args"].copy_original else ctx["namingFields"]
         if media_type == "movie":
             if len(sources) != 1:
                 raise RuntimeError("电影任务必须明确提供单个主视频")
-            relative = render_path(ctx["naming"]["movieFile"], ctx["namingFields"])
+            relative = render_path(ctx["naming"]["movieFile"], fields)
             season = episode = None
         else:
             parsed = episode_from_name(source, ctx["args"].season)
@@ -1077,8 +1080,11 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
             season, episode = parsed
             if season < 0 or episode < 1:
                 raise RuntimeError(f"季集号无效: S{season:02d}E{episode:02d}")
-            fields = {**ctx["namingFields"], "season": season, "episode": episode}
-            relative = render_path(ctx["naming"]["seasonDir"], fields) / render_path(ctx["naming"]["episodeFile"], fields)
+            if (season, episode) in seen_episodes:
+                raise RuntimeError(f"多个来源映射到同一集: S{season:02d}E{episode:02d}")
+            seen_episodes.add((season, episode))
+            episode_fields = {**fields, "season": season, "episode": episode}
+            relative = render_path(ctx["naming"]["seasonDir"], episode_fields) / render_path(ctx["naming"]["episodeFile"], episode_fields)
         if relative in seen:
             raise RuntimeError(f"多个来源映射到同一输出: {relative}")
         seen.add(relative)
@@ -1113,6 +1119,15 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path) -> list[str]:
     return command
 
 
+def copy_sidecars(plan: dict) -> None:
+    output = plan["output"]
+    for sidecar in plan["source"].parent.iterdir():
+        if not sidecar.name.startswith(f"{plan['source'].stem}.") or not is_safe_file(plan["source"].parent, sidecar) or sidecar.suffix.lower() not in SUBTITLE_EXTS:
+            continue
+        tag = sidecar.name[len(plan["source"].stem):-len(sidecar.suffix)]
+        shutil.copy2(sidecar, output.with_name(f"{output.stem}{tag}{sidecar.suffix.lower()}"))
+
+
 def transcode(ctx: dict, plans: list[dict]) -> None:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     for plan in plans:
@@ -1138,11 +1153,24 @@ def transcode(ctx: dict, plans: list[dict]) -> None:
             raise RuntimeError(f"转码输出疑似截断: {plan['source'].name}")
         os.replace(temp, output)
         plan["output"] = output
-        for sidecar in plan["source"].parent.iterdir():
-            if not sidecar.name.startswith(f"{plan['source'].stem}.") or not is_safe_file(plan["source"].parent, sidecar) or sidecar.suffix.lower() not in SUBTITLE_EXTS:
-                continue
-            tag = sidecar.name[len(plan["source"].stem):-len(sidecar.suffix)]
-            shutil.copy2(sidecar, output.with_name(f"{output.stem}{tag}{sidecar.suffix.lower()}"))
+        copy_sidecars(plan)
+
+
+def organize(ctx: dict, plans: list[dict]) -> None:
+    minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
+    for plan in plans:
+        require_mounted_volume(ctx["baseRoot"], "工作目录")
+        output = ctx["outputRoot"] / plan["relative"]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        status_update(ctx["id"], phase="organizing", currentFile=plan["source"].name)
+        log(ctx, f"整理原文件: {plan['source'].name} -> {plan['relative']}")
+        atomic_copy(plan["source"], output, minimum)
+        source_stat = plan["source"].stat()
+        if source_stat.st_size != plan["sourceSize"] or source_stat.st_mtime_ns != plan["sourceMtimeNs"]:
+            output.unlink(missing_ok=True)
+            raise RuntimeError(f"整理期间来源仍在变化: {plan['source'].name}")
+        plan["output"] = output
+        copy_sidecars(plan)
 
 
 def xml_text(parent: ET.Element, name: str, value) -> None:
@@ -1416,6 +1444,7 @@ def pipeline(args) -> int:
         "requestedTitle": args.title,
         "profile": ctx["profileName"], "target": ctx["targetName"],
         "naming": ctx["namingName"],
+        "mode": "organize" if args.copy_original else "transcode",
         "targetPath": str(ctx["targetShow"]), "source": redacted_source(source),
     }
     if args.dry_run:
@@ -1433,7 +1462,7 @@ def pipeline(args) -> int:
         try:
             sources = acquire(ctx, source, requested_downloader)
             plans = planned_outputs(ctx, sources)
-            transcode(ctx, plans)
+            (organize if args.copy_original else transcode)(ctx, plans)
             status_update(ctx["id"], phase="metadata", currentOperation="metadata", currentFile="")
             write_nfo(ctx, plans)
             write_artwork(ctx, plans)
@@ -1555,7 +1584,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--update-nfo", action="store_true", help="显式原子更新已有 NFO；不会覆盖媒体、字幕或图片")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--offline", action="store_true")
-    parser.set_defaults(handler=pipeline)
+    parser.set_defaults(handler=pipeline, copy_original=False)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1569,8 +1598,11 @@ def parser() -> argparse.ArgumentParser:
     search.set_defaults(handler=command_search)
     for name in ("ingest", "resume", "download"):
         add_pipeline_arguments(commands.add_parser(name, help="获取、转码、整理并归档"), source_required=False)
-    for name in ("adopt", "process", "organize"):
+    for name in ("adopt", "process"):
         add_pipeline_arguments(commands.add_parser(name, help="处理本地媒体并归档"), source_required=True)
+    organize_parser = commands.add_parser("organize", help="不转码，按原容器整理本地媒体并归档")
+    add_pipeline_arguments(organize_parser, source_required=True)
+    organize_parser.set_defaults(copy_original=True)
     profiles = commands.add_parser("profiles", aliases=["profile"])
     profiles.set_defaults(handler=command_profiles)
     check = commands.add_parser("check", aliases=["status"])

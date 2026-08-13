@@ -1,6 +1,6 @@
 ---
 name: media-downloader
-description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查候选后用 aria2/yt-dlp/本地文件获取，按 TV/Movie 压缩预设转码、Plex 或自定义模板命名、生成 NFO 与图片，并校验归档到目标预设。用于外部 AI Agent 完成媒体检索、下载、整理、归档、状态检查和安全停止。
+description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查候选后用 aria2/yt-dlp/本地文件获取，选择按 TV/Movie 预设转码或保留原容器只整理，再按 Plex 或自定义模板命名、生成 NFO 与图片并校验归档。用于外部 AI Agent 完成媒体检索、下载、转码或免转码整理、归档、状态检查和安全停止。
 ---
 
 # Media Downloader
@@ -21,7 +21,7 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 ## 固定流程
 
 1. 运行 `./run.sh doctor`，确认 FFmpeg/FFprobe、目标预设和所需下载器。未挂载的可选目标显示为 `unavailable`，仅在本次选用它时才需要处理。
-2. 明确类型、标题、年份、目标、压缩 profile、命名 preset 与质量要求。类型不确定时询问用户。
+2. 明确类型、标题、年份、目标、是否转码、profile、命名 preset 与质量要求。类型或是否转码不确定时询问用户。
 3. 搜索：
    - Jackett：`./run.sh search "查询" --source jackett --type tv|movie`
    - 网页：同一命令会返回 `browseUrl`；使用浏览器查看公开页面，提取用户有权使用的最终 URL。
@@ -63,13 +63,19 @@ chmod 600 /private/tmp/source-url
 ./run.sh adopt "剧名" "/path/to/Show.S01E02.mkv" --type tv --year 2026 \
   --metadata "/path/to/metadata.json" --update-nfo
 
+# 只整理、不转码；保留原容器，仍按 Plex 命名并生成 NFO/图片
+./run.sh organize "剧名" "/path/to/Show.S01E02.mkv" --type tv --year 2026 \
+  --metadata "/path/to/metadata.json" --target tv-library
+./run.sh organize "片名" "/path/to/Movie.mkv" --type movie --year 2026 \
+  --metadata "/path/to/metadata.json" --target movie-library
+
 # 预演、状态和停止
 ./run.sh ingest "剧名" "magnet:?xt=urn:btih:..." --type tv --dry-run
 ./run.sh check "剧名 (2026)"
 ./run.sh stop "剧名 (2026)"
 ```
 
-`resume`/`download` 是 `ingest` 别名；`process`/`organize` 是 `adopt` 别名。耗时命令默认后台启动；调试时加 `--foreground`。
+`resume`/`download` 是 `ingest` 别名；`process` 是 `adopt` 别名。`organize` 只整理原文件，不按 profile 转码，但仍使用 profile 的默认 target/naming。耗时命令默认后台启动；调试时加 `--foreground`。
 
 ## 来源选择
 

@@ -225,6 +225,29 @@ def assert_path_and_naming_guards(module, root: Path):
     else:
         raise AssertionError("overlong UTF-8 path components must be rejected")
 
+    args = type("Args", (), {"copy_original": True, "season": 1, "episode": None})()
+    duplicate_root = root / "duplicate-episodes"
+    duplicate_root.mkdir()
+    first = duplicate_root / "Show.S01E01.mkv"
+    second = duplicate_root / "Show.S01E01.mp4"
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+    original_validate = module.validate_video
+    module.validate_video = lambda _path, _minimum: {"duration": 1, "hasVideo": True, "hasAudio": False}
+    try:
+        try:
+            module.planned_outputs({
+                "mediaType": "tv", "config": {"minMediaDurationSeconds": 0}, "args": args,
+                "namingFields": {"canonical": "Show", "ext": "mp4"},
+                "naming": {"seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}.{ext}"},
+            }, [first, second])
+        except RuntimeError as exc:
+            assert "同一集" in str(exc)
+        else:
+            raise AssertionError("duplicate episodes with different containers must be rejected")
+    finally:
+        module.validate_video = original_validate
+
 
 def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
@@ -235,6 +258,8 @@ def main():
             (root / name).mkdir()
         make_video(root / "source" / "Example.S02E03.mkv")
         make_video(root / "source" / "Film.mkv")
+        make_video(root / "source" / "Organize.Show.S04E05.mkv")
+        make_video(root / "source" / "Organize.Movie.mkv")
         make_video(root / "http" / "Remote.S01E01.mp4")
         make_image(root / "source" / "poster.png")
         (root / "source" / "Example.S02E03.zh.forced.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
@@ -302,6 +327,20 @@ def main():
             assert_xml(episode.with_suffix(".nfo"), "<title>修正后的第三集</title>")
             assert episode.read_bytes() == episode_digest
             assert (show / "poster.jpg").read_bytes() == poster_digest
+
+            organize_tv_source = root / "source" / "Organize.Show.S04E05.mkv"
+            run([sys.executable, str(SCRIPT), "organize", "原样剧集", str(organize_tv_source), "--type", "tv", "--target", "tv", "--offline"], env=env)
+            organized_episode = root / "tv" / "原样剧集" / "Season 04" / "原样剧集 - S04E05.mkv"
+            assert organized_episode.read_bytes() == organize_tv_source.read_bytes()
+            assert organized_episode.with_suffix(".nfo").is_file()
+            assert not organized_episode.with_suffix(".mp4").exists()
+
+            organize_movie_source = root / "source" / "Organize.Movie.mkv"
+            run([sys.executable, str(SCRIPT), "organize", "原样电影", str(organize_movie_source), "--type", "movie", "--target", "movie", "--offline"], env=env)
+            organized_movie = root / "movie" / "原样电影" / "原样电影.mkv"
+            assert organized_movie.read_bytes() == organize_movie_source.read_bytes()
+            assert (organized_movie.parent / "movie.nfo").is_file()
+            assert not organized_movie.with_suffix(".mp4").exists()
 
             source_conflict = root / "source" / "Conflict.S01E01.mkv"
             make_video(source_conflict)

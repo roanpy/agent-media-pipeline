@@ -1,4 +1,4 @@
 interface:
   display_name: "Media Downloader"
-  short_description: "搜索授权来源、转码并按 Plex 标准安全归档媒体文件"
-  default_prompt: "使用 $media-downloader 搜索我有权使用的来源，确认候选后按预设转码并归档。"
+  short_description: "搜索授权来源、转码或免转码整理并安全归档媒体"
+  default_prompt: "使用 $media-downloader 处理我有权使用的媒体，按我的选择转码或保留原容器整理归档。"
