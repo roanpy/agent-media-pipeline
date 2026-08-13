@@ -236,6 +236,7 @@ def assert_path_and_naming_guards(module, root: Path):
     original_validate = module.validate_video
     module.validate_video = lambda _path, _minimum: {"duration": 1, "hasVideo": True, "hasAudio": False}
     try:
+        # 转码模式：同集不同容器映射到同一输出
         try:
             module.planned_outputs({
                 "mediaType": "tv", "config": {"minMediaDurationSeconds": 0}, "args": args,
@@ -246,6 +247,17 @@ def assert_path_and_naming_guards(module, root: Path):
             assert "同一集" in str(exc)
         else:
             raise AssertionError("duplicate episodes with different containers must be rejected")
+        # 免转码模式：同集不同容器保留原名会互相覆盖
+        try:
+            module.planned_outputs({
+                "mediaType": "tv", "config": {"minMediaDurationSeconds": 0}, "args": args,
+                "namingFields": {"canonical": "Show", "ext": "{sourceExt}"},
+                "naming": {"seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}.{ext}"},
+            }, [first, second])
+        except RuntimeError as exc:
+            assert "同一集" in str(exc)
+        else:
+            raise AssertionError("organize mode must reject duplicate episodes in different containers")
     finally:
         module.validate_video = original_validate
 
@@ -396,6 +408,21 @@ def main():
             task_log = Path(movie_state["logPath"])
             assert task_log.resolve().is_relative_to((root / "state").resolve())
             assert stat.S_IMODE(task_log.stat().st_mode) == 0o600
+
+            # movie 路径 --update-nfo：只更新 movie.nfo，媒体与海报字节不变
+            movie_nfo = film.parent / "movie.nfo"
+            film_digest = film.read_bytes()
+            movie_poster_digest = (film.parent / "poster.jpg").read_bytes()
+            movie_metadata.write_text(json.dumps({
+                "title": "测试电影", "originalTitle": "Test Film", "year": 2025,
+                "plot": "更新后的电影剧情", "posterPath": str(root / "source" / "poster.png"),
+            }, ensure_ascii=False), encoding="utf-8")
+            refused_movie = run([sys.executable, str(SCRIPT), "adopt", "待核实电影", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--metadata", str(movie_metadata), "--offline"], env=env, expect=1)
+            assert "拒绝覆盖" in refused_movie.stderr
+            run([sys.executable, str(SCRIPT), "adopt", "待核实电影", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--metadata", str(movie_metadata), "--offline", "--update-nfo"], env=env)
+            assert_xml(movie_nfo, "<plot>更新后的电影剧情</plot>")
+            assert film.read_bytes() == film_digest
+            assert (film.parent / "poster.jpg").read_bytes() == movie_poster_digest
 
             no_token = root / "source" / "NoToken.mkv"
             no_token.write_bytes((root / "source" / "Film.mkv").read_bytes())
