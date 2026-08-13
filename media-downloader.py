@@ -469,9 +469,16 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None) -> d
         return {}
     language = metadata_config.get("language", "zh-CN")
     kind = "tv" if media_type == "tv" else "movie"
-    params = {"api_key": api_key, "language": language, "query": title}
+    # TMDB v4 只读 token 是 JWT（eyJ 开头），必须走 Bearer header；v3 key 走 api_key 参数
+    if api_key.startswith("eyJ"):
+        auth = {"Authorization": f"Bearer {api_key}"}
+        auth_params = {}
+    else:
+        auth = None
+        auth_params = {"api_key": api_key}
+    params = {**auth_params, "language": language, "query": title}
     params["first_air_date_year" if kind == "tv" else "year"] = year
-    search = http_json(f"https://api.themoviedb.org/3/search/{kind}", params)
+    search = http_json(f"https://api.themoviedb.org/3/search/{kind}", params, auth)
     results = search.get("results", []) if isinstance(search, dict) else []
     if not results:
         return {}
@@ -479,7 +486,8 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None) -> d
     tmdb_id = item.get("id")
     detail = http_json(
         f"https://api.themoviedb.org/3/{kind}/{tmdb_id}",
-        {"api_key": api_key, "language": language, "append_to_response": "external_ids,credits"},
+        {**auth_params, "language": language, "append_to_response": "external_ids,credits"},
+        auth,
     )
     date_key = "first_air_date" if kind == "tv" else "release_date"
     name_key = "name" if kind == "tv" else "title"

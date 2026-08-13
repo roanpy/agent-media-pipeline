@@ -196,6 +196,41 @@ def assert_atomic_copy_never_overwrites(root: Path):
     return module
 
 
+def assert_tmdb_auth_modes():
+    spec = importlib.util.spec_from_file_location("media_downloader_tmdb", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    calls = []
+
+    def fake_http_json(url, params, headers=None, timeout=20):
+        calls.append((url, dict(params), dict(headers or {})))
+        if "/search/" in url:
+            return {"results": [{"id": 42, "name": "Stub", "first_air_date": "2020-01-01"}]}
+        return {"id": 42, "name": "Stub", "first_air_date": "2020-01-01"}
+
+    original = module.http_json
+    module.http_json = fake_http_json
+    try:
+        config = {"metadata": {"apiKeyEnv": "TEST_TMDB_AUTH_KEY"}}
+        # v4 JWT（eyJ 开头）必须走 Bearer header，且不出现 api_key 参数
+        os.environ["TEST_TMDB_AUTH_KEY"] = "eyJhbGciOiJIUzI1NiJ9.stub.sig"
+        module.fetch_tmdb(config, "tv", "Stub", None)
+        assert calls[0][2].get("Authorization") == "Bearer eyJhbGciOiJIUzI1NiJ9.stub.sig", calls
+        assert "api_key" not in calls[0][1], calls
+        assert calls[1][2].get("Authorization") == "Bearer eyJhbGciOiJIUzI1NiJ9.stub.sig", calls
+        calls.clear()
+        # v3 key 保持 api_key 参数，不带 Authorization header
+        os.environ["TEST_TMDB_AUTH_KEY"] = "v3-api-key-123"
+        module.fetch_tmdb(config, "tv", "Stub", None)
+        assert calls[0][1].get("api_key") == "v3-api-key-123", calls
+        assert not calls[0][2].get("Authorization"), calls
+        assert calls[1][1].get("api_key") == "v3-api-key-123", calls
+    finally:
+        module.http_json = original
+        os.environ.pop("TEST_TMDB_AUTH_KEY", None)
+
+
 def assert_path_and_naming_guards(module, root: Path):
     assert module.episode_from_name(Path("Show.S01E01-1080p.mkv"), 1) == (1, 1)
     assert module.episode_from_name(Path("Show.S01E01-720p.mkv"), 1) == (1, 1)
@@ -294,6 +329,7 @@ def main():
         root = Path(temp)
         module = assert_atomic_copy_never_overwrites(root)
         assert_path_and_naming_guards(module, root)
+        assert_tmdb_auth_modes()
         for name in ("tv", "movie", "source", "http"):
             (root / name).mkdir()
         make_video(root / "source" / "Example.S02E03.mkv")
