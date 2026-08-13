@@ -288,6 +288,20 @@ def main():
             assert (show / "poster.jpg").is_file()
             assert_xml(show / "tvshow.nfo", "<uniqueid type=\"tmdb\" default=\"true\">123</uniqueid>")
             assert_xml(episode.with_suffix(".nfo"), "<title>第三集</title>")
+            episode_digest = episode.read_bytes()
+            poster_digest = (show / "poster.jpg").read_bytes()
+            metadata.write_text(json.dumps({
+                "title": "示例剧", "originalTitle": "Example Show", "year": 2026,
+                "plot": "更新后的剧集简介", "ids": {"tmdb": 123}, "posterPath": str(root / "source" / "poster.png"),
+                "episodes": [{"season": 2, "episode": 3, "title": "修正后的第三集", "plot": "更新后的单集简介"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            refused_nfo = run([sys.executable, str(SCRIPT), "adopt", "示例剧", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--year", "2026", "--target", "tv", "--metadata", str(metadata), "--offline"], env=env, expect=1)
+            assert "拒绝覆盖" in refused_nfo.stderr
+            run([sys.executable, str(SCRIPT), "adopt", "示例剧", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--year", "2026", "--target", "tv", "--metadata", str(metadata), "--offline", "--update-nfo"], env=env)
+            assert_xml(show / "tvshow.nfo", "<plot>更新后的剧集简介</plot>")
+            assert_xml(episode.with_suffix(".nfo"), "<title>修正后的第三集</title>")
+            assert episode.read_bytes() == episode_digest
+            assert (show / "poster.jpg").read_bytes() == poster_digest
 
             source_conflict = root / "source" / "Conflict.S01E01.mkv"
             make_video(source_conflict)

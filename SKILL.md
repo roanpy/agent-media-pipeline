@@ -55,9 +55,13 @@ description: 搜索用户有权使用的 Jackett 或网页媒体来源，审查�
 chmod 600 /private/tmp/source-url
 ./run.sh ingest "片名" --source-file /private/tmp/source-url --type movie
 
-# 接管本地文件或目录
+# 手动下载的单集：文件名含 SxxExx 时自动识别，也可显式传 --season/--episode
 ./run.sh adopt "剧名" "/path/to/files" --type tv --year 2026 \
   --metadata "/path/to/metadata.json"
+
+# 已归档同一集但要修正剧集/单集 NFO；只允许更新 .nfo
+./run.sh adopt "剧名" "/path/to/Show.S01E02.mkv" --type tv --year 2026 \
+  --metadata "/path/to/metadata.json" --update-nfo
 
 # 预演、状态和停止
 ./run.sh ingest "剧名" "magnet:?xt=urn:btih:..." --type tv --dry-run
@@ -99,6 +103,7 @@ chmod 600 /private/tmp/source-url
 
 图片也可用 `posterPath`/`fanartPath` 指向本地文件。未配置 TMDB 时仍会生成最小合法 NFO；`metadata.requireArtwork=true` 时缺海报会使任务失败。
 `metadata.title` 是核实后的规范标题，会覆盖命令中的检索标题并用于目录、文件名和任务身份；状态中仍保留原检索标题。要让 Plex 读取 NFO，需使用支持 NFO 的 Plex Media Server 并为媒体库选择 Plex NFO Agent。
+处理手动下载剧集时优先把文件名整理为 `Show.S01E02.ext`；无法改名时显式传 `--season 1 --episode 2`。已有 NFO 内容不同时默认拒绝覆盖；仅在核实新元数据后使用 `--update-nfo`，媒体、字幕和图片仍不会被覆盖。
 
 ## 配置
 

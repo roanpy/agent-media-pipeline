@@ -1346,6 +1346,27 @@ def atomic_copy(source: Path, target: Path, minimum_duration: float) -> None:
         temp.unlink(missing_ok=True)
 
 
+def atomic_replace_nfo(source: Path, target: Path) -> None:
+    if target.is_symlink() or not target.is_file():
+        raise RuntimeError(f"NFO 目标不安全: {target}")
+    identity = directory_identity(target)
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".partial", dir=target.parent)
+    temp = Path(temp_name)
+    try:
+        with open(source, "rb") as src, os.fdopen(descriptor, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copystat(source, temp)
+        if file_digest(source) != file_digest(temp):
+            raise RuntimeError(f"NFO 复制哈希不一致: {target}")
+        if directory_identity(target) != identity:
+            raise RuntimeError(f"NFO 在更新期间发生变化: {target}")
+        os.replace(temp, target)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def archive(ctx: dict) -> list[str]:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     output_root = ctx["outputRoot"].resolve()
@@ -1368,7 +1389,11 @@ def archive(ctx: dict) -> list[str]:
         ensure_target_parent(ctx, target.parent)
         if target.exists():
             if not existing_matches(source, target, minimum):
-                raise RuntimeError(f"目标已存在且内容不同，拒绝覆盖: {target}")
+                if source.suffix.lower() == ".nfo" and ctx["args"].update_nfo:
+                    log(ctx, f"更新 NFO: {relative}")
+                    atomic_replace_nfo(source, target)
+                else:
+                    raise RuntimeError(f"目标已存在且内容不同，拒绝覆盖: {target}")
         else:
             log(ctx, f"归档: {relative}")
             atomic_copy(source, target, minimum)
@@ -1527,6 +1552,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--playlist", action="store_true")
     parser.add_argument("--keep-work", action="store_true")
     parser.add_argument("--reset-work", action="store_true")
+    parser.add_argument("--update-nfo", action="store_true", help="显式原子更新已有 NFO；不会覆盖媒体、字幕或图片")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--offline", action="store_true")
     parser.set_defaults(handler=pipeline)
