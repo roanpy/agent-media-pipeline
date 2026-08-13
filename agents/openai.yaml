@@ -1,4 +1,4 @@
 interface:
-  display_name: "Media Downloader"
-  short_description: "主动搜索或下载授权媒体，生成 Plex 资料并选择处理与归档方式"
-  default_prompt: "使用 $media-downloader 帮我搜索或处理有权使用的媒体；先确认类型、是否转码、是否播放列表以及是否归档。"
+  display_name: "Agent Media Pipeline"
+  short_description: "Discover authorized media and build Plex-ready output safely"
+  default_prompt: "Use $media-downloader to find or process authorized media; confirm the media type, playlist scope, transcode mode, and archive choice first."

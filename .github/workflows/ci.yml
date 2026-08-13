@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 ffmpeg
+          python -m pip install ruff yt-dlp
+      - name: Validate
+        run: |
+          python -m py_compile media-downloader.py tests/test_pipeline.py
+          bash -n run.sh
+          python -m json.tool config.example.json >/dev/null
+          ruff check media-downloader.py tests/test_pipeline.py
+          ./scripts/smoke-test.sh
