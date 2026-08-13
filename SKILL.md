@@ -112,7 +112,7 @@ chmod 600 /private/tmp/source-url
 }
 ```
 
-图片也可用 `posterPath`/`fanartPath` 指向本地文件。未配置 TMDB 时仍会生成最小合法 NFO；`metadata.requireArtwork=true` 时缺海报会使任务失败。
+图片也可用 `posterPath`/`fanartPath` 指向本地文件。未配置 TMDB 时仍会生成最小合法 NFO；`metadata.requireArtwork=true` 时缺海报会使任务失败，但既未配置 TMDB key、metadata 又未提供海报时自动降级为海报可选（会有 stderr 警告）。
 `metadata.title` 是核实后的规范标题，会覆盖命令中的检索标题并用于目录、文件名和任务身份；状态中仍保留原检索标题。要让 Plex 读取 NFO，需使用支持 NFO 的 Plex Media Server 并为媒体库选择 Plex NFO Agent。
 处理手动下载剧集时优先把文件名整理为 `Show.S01E02.ext`；无法改名时显式传 `--season 1 --episode 2`。已有 NFO 内容不同时默认拒绝覆盖；仅在核实新元数据后使用 `--update-nfo`，媒体、字幕和图片仍不会被覆盖。
 
@@ -129,5 +129,7 @@ chmod 600 /private/tmp/source-url
 - `metadata`：TMDB、TVMaze 回退和图片是否必需。
 
 常用环境覆盖：`MEDIA_DOWNLOADER_CONFIG`、`MEDIA_DOWNLOADER_BASE_DIR`、`MEDIA_DOWNLOADER_STATE_DIR`、`MEDIA_DOWNLOADER_TARGET_DIR`、`MEDIA_DOWNLOADER_OFFLINE=1`。
+
+状态分两处，别混淆：`stateDir`（或 `MEDIA_DOWNLOADER_STATE_DIR`）放任务工作区、任务锁和每任务日志；全局 `status.json` 与 `candidates.json` 默认在技能目录 `.runtime/`（可用 `MEDIA_DOWNLOADER_STATUS_FILE` / `MEDIA_DOWNLOADER_CANDIDATE_FILE` 覆盖）。任务身份 = 类型 + 规范标题 + 目标库 + 来源：同一标题换源重下互不覆盖，重放同一来源则复用同一任务。
 
 修改代码或配置后运行：`./scripts/smoke-test.sh`。

@@ -219,6 +219,11 @@ def assert_path_and_naming_guards(module, root: Path):
     canonical_id = module.task_id("movie", "测试电影 (2025)", root / "movie")
     assert canonical_id == module.task_id("movie", "测试电影 (2025)", root / "movie")
     assert canonical_id != module.task_id("movie", "测试电影 (2025)", root / "other-movie")
+    ctx_a = {"mediaType": "tv", "canonical": "测试剧 (2026)", "targetRoot": root / "tv"}
+    id_magnet_a = module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:AAAA")
+    id_magnet_b = module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:BBBB")
+    assert id_magnet_a != id_magnet_b
+    assert id_magnet_a == module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:AAAA")
     try:
         module.sanitize_component("剧" * 100)
     except ValueError as exc:
@@ -323,6 +328,17 @@ def main():
             assert json.loads(legacy_default.stdout)["mode"] == "transcode"
             profiles = run([sys.executable, str(SCRIPT), "profiles"], env=modes_env)
             assert json.loads(profiles.stdout)["defaultModes"] == {"tv": "organize", "movie": "transcode"}
+
+            # 无 TMDB key 且 metadata 无海报时 requireArtwork 自动降级，任务可完成
+            artwork = json.loads(cfg.read_text(encoding="utf-8"))
+            artwork["metadata"] = {"provider": "tmdb", "apiKeyEnv": "UNSET_TEST_TMDB_KEY", "tvFallback": "none", "requireArtwork": True}
+            artwork_cfg = root / "artwork.json"
+            artwork_cfg.write_text(json.dumps(artwork), encoding="utf-8")
+            artwork_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(artwork_cfg)}
+            artwork_env.pop("UNSET_TEST_TMDB_KEY", None)
+            downgraded = run([sys.executable, str(SCRIPT), "adopt", "降级剧", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--target", "tv", "--offline"], env=artwork_env)
+            assert "降级" in downgraded.stderr
+            assert (root / "tv" / "降级剧" / "Season 02" / "降级剧 - S02E03.mp4").is_file()
 
             searched = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--type", "tv"], env=env)
             payload = json.loads(searched.stdout)

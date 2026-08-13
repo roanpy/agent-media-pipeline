@@ -342,6 +342,12 @@ def task_id(media_type: str, canonical: str, target_root: Path) -> str:
     return f"{media_type}-{digest}"
 
 
+def pipeline_task_id(ctx: dict, source: str) -> str:
+    # 下载/转换/整理任务：身份含来源，同标题换源重下互不覆盖
+    digest = hashlib.sha256(f"{ctx['mediaType']}\0{ctx['canonical']}\0{ctx['targetRoot']}\0{source}".encode()).hexdigest()[:12]
+    return f"{ctx['mediaType']}-{digest}"
+
+
 def default_profile_name(config: dict, media_type: str) -> str:
     return str(config["defaultProfiles"][media_type])
 
@@ -545,6 +551,12 @@ def build_context(config: dict, args) -> dict:
     title = validate_title(args.title)
     profile_name, profile = select_profile(config, args.media_type, args.profile)
     metadata = resolve_metadata(config, args)
+    metadata_config = config.setdefault("metadata", {})
+    if metadata_config.get("requireArtwork") and not metadata.get("posterPath") and not metadata.get("posterUrl"):
+        key_env = str(metadata_config.get("apiKeyEnv", "TMDB_API_KEY"))
+        if not os.environ.get(key_env):
+            metadata_config["requireArtwork"] = False
+            print(f"警告: 未配置 {key_env}，requireArtwork 降级为海报可选", file=sys.stderr)
     canonical = canonical_name(metadata.get("title") or title, metadata.get("year"))
     target_name, target_root = select_target(config, profile, args.target)
     naming_name, naming = select_naming(config, profile, args.media_type, args.naming)
@@ -562,7 +574,7 @@ def build_context(config: dict, args) -> dict:
         raise RuntimeError(f"状态目录与目标目录不得重叠: {state_root} / {target_root}")
     require_mounted_volume(base_root, "工作目录")
     require_mounted_volume(state_root, "状态目录")
-    identifier = task_id(args.media_type, canonical, target_root)
+    identifier = pipeline_task_id({"mediaType": args.media_type, "canonical": canonical, "targetRoot": target_root}, resolve_source(args)[0])
     work_parent = base_root / ".media-downloader-work"
     work_root = work_parent / identifier
     if not contains_path(work_parent.resolve(strict=False), work_root.resolve(strict=False)):
