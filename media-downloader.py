@@ -122,6 +122,9 @@ def validate_config(data: dict) -> None:
         raise RuntimeError("timeoutHours/minMediaDurationSeconds 必须是数字") from exc
     if timeout_hours <= 0 or minimum_duration < 0:
         raise RuntimeError("timeoutHours 必须大于 0，minMediaDurationSeconds 不得小于 0")
+    download_dir = data.get("downloadDir")
+    if download_dir not in (None, "") and (not isinstance(download_dir, str) or not download_dir.strip()):
+        raise RuntimeError("downloadDir 必须是非空路径字符串")
     defaults = data.get("defaultProfiles", {})
     if not isinstance(defaults, dict):
         raise RuntimeError("defaultProfiles 必须是对象")
@@ -281,6 +284,11 @@ def resolve_path(value: str | Path) -> Path:
     return Path(os.path.expandvars(str(value))).expanduser().resolve(strict=False)
 
 
+def configured_download_root(config: dict) -> Path | None:
+    value = os.environ.get("MEDIA_DOWNLOADER_DOWNLOAD_DIR") or config.get("downloadDir")
+    return resolve_path(value) if value else None
+
+
 def contains_path(parent: Path, child: Path) -> bool:
     return child == parent or child.is_relative_to(parent)
 
@@ -317,6 +325,13 @@ def require_work_root(path: Path, label: str) -> None:
         existing = existing.parent
     if not existing.is_dir() or not os.access(existing, os.W_OK):
         raise RuntimeError(f"{label}不可写: {path}")
+
+
+def validate_download_root(base_root: Path, download_root: Path) -> None:
+    require_work_root(download_root, "下载成品目录")
+    work_parent = (base_root / ".media-downloader-work").resolve(strict=False)
+    if contains_path(work_parent, download_root.resolve(strict=False)):
+        raise RuntimeError(f"下载成品目录不得位于任务工作区内: {download_root}")
 
 
 def directory_identity(path: Path) -> tuple[int, int]:
@@ -632,15 +647,16 @@ def build_context(config: dict, args) -> dict:
     naming_name, naming = select_naming(config, profile, args.media_type, args.naming)
     base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
     state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (base_root / ".state"))
-    download_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_DOWNLOAD_DIR") or config.get("downloadDir") or "") if (os.environ.get("MEDIA_DOWNLOADER_DOWNLOAD_DIR") or config.get("downloadDir")) else None
-    target_name, target_root = ("work", base_root) if args.no_archive else select_target(config, profile, args.target)
+    download_root = configured_download_root(config)
+    if args.no_archive:
+        target_name, target_root = ("download", download_root) if download_root is not None else ("work", base_root)
+    else:
+        target_name, target_root = select_target(config, profile, args.target)
     require_work_root(base_root, "工作目录")
     require_work_root(state_root, "状态目录")
-    if download_root is not None:
-        require_work_root(download_root, "下载成品目录")
-        if paths_overlap(base_root, download_root):
-            raise RuntimeError(f"下载成品目录与工作区不得重叠: {download_root} / {base_root}")
-    if not args.no_archive:
+    if args.no_archive and download_root is not None:
+        validate_download_root(base_root, download_root)
+    elif not args.no_archive:
         require_target_root(target_root)
         if paths_overlap(base_root, target_root):
             raise RuntimeError(f"工作区与目标目录不得重叠: {base_root} / {target_root}")
@@ -659,8 +675,11 @@ def build_context(config: dict, args) -> dict:
     }
     show_subdir = render_path(naming["showDir"], naming_fields)
     # no-archive 也让 output 直接是 Plex 就绪结构（套片名目录），拖进库即用，无需手动建目录
-    output_root = (work_root / "output" / show_subdir) if args.no_archive else (work_root / "output")
-    target_show = output_root if args.no_archive else (target_root / show_subdir)
+    output_root = work_root / "output" / show_subdir if args.no_archive else work_root / "output"
+    if args.no_archive:
+        target_show = download_root / show_subdir if download_root is not None else output_root
+    else:
+        target_show = target_root / show_subdir
     if not args.no_archive and not contains_path(target_root, target_show):
         raise RuntimeError("目标目录逃逸")
     return {
@@ -721,7 +740,17 @@ def remove_owned_work(ctx: dict) -> None:
     shutil.rmtree(work)
 
 
+def prepare_download_root(ctx: dict) -> None:
+    root = ctx["downloadRoot"]
+    validate_download_root(ctx["baseRoot"], root)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    require_target_root(root)
+    ctx["targetIdentity"] = directory_identity(root)
+
+
 def ensure_work(ctx: dict, source: str) -> None:
+    if ctx["args"].no_archive and ctx["downloadRoot"] is not None:
+        prepare_download_root(ctx)
     work = ctx["workRoot"]
     marker = ctx["marker"]
     fingerprint = source_fingerprint(ctx, source)
@@ -1574,7 +1603,7 @@ def atomic_replace_nfo(source: Path, target: Path) -> None:
         temp.unlink(missing_ok=True)
 
 
-def archive(ctx: dict) -> list[str]:
+def archive(ctx: dict, phase: str = "archiving", action: str = "归档") -> list[str]:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     output_root = ctx["outputRoot"].resolve()
     files = sorted(
@@ -1602,37 +1631,16 @@ def archive(ctx: dict) -> list[str]:
                 else:
                     raise RuntimeError(f"目标已存在且内容不同，拒绝覆盖: {target}")
         else:
-            log(ctx, f"归档: {relative}")
+            log(ctx, f"{action}: {relative}")
             atomic_copy(source, target, minimum)
             if not target.is_file() or source.stat().st_size != target.stat().st_size:
-                raise RuntimeError(f"归档校验失败: {target}")
+                raise RuntimeError(f"{action}校验失败: {target}")
         archived.append(str(target))
-        status_update(ctx["id"], phase="archiving", currentFile=str(relative), archivedFiles=archived)
+        status_update(ctx["id"], phase=phase, currentFile=str(relative), archivedFiles=archived)
     require_target_root(ctx["targetRoot"])
     if directory_identity(ctx["targetRoot"]) != ctx["targetIdentity"]:
         raise RuntimeError(f"目标目录在任务期间发生变化: {ctx['targetRoot']}")
     return archived
-
-
-def deliver_download(ctx: dict) -> list[str]:
-    """no-archive + downloadDir：把 Plex 就绪的片名目录整体移到下载成品目录。"""
-    source_dir = ctx["outputRoot"]
-    download_root = ctx["downloadRoot"]
-    require_mounted_volume(download_root, "下载成品目录")
-    download_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if download_root.is_symlink() or not download_root.is_dir():
-        raise RuntimeError(f"下载成品目录不安全: {download_root}")
-    target = download_root / source_dir.name
-    if not target.resolve(strict=False).is_relative_to(download_root.resolve()):
-        raise RuntimeError("下载成品目标逃逸")
-    if target.exists():
-        raise RuntimeError(f"下载成品目录已存在，拒绝覆盖: {target}")
-    log(ctx, f"转移到下载目录: {source_dir.name} -> {target}")
-    shutil.move(str(source_dir), str(target))
-    files = sorted(str(path) for path in target.rglob("*") if path.is_file())
-    if not files:
-        raise RuntimeError(f"下载目录转移后为空: {target}")
-    return files
 
 
 def pipeline(args) -> int:
@@ -1672,7 +1680,7 @@ def pipeline(args) -> int:
             if args.no_archive:
                 if ctx["downloadRoot"] is not None:
                     status_update(ctx["id"], phase="delivering", currentOperation="delivering")
-                    archived = deliver_download(ctx)
+                    archived = archive(ctx, phase="delivering", action="转移到下载目录")
                 else:
                     archived = [str(path) for path in sorted(ctx["outputRoot"].rglob("*")) if path.is_file()]
             else:
@@ -1696,7 +1704,7 @@ def pipeline(args) -> int:
 
 def command_profiles(_args) -> int:
     config = load_config()
-    print(json.dumps({"defaultModes": config.get("defaultModes", {"tv": "transcode", "movie": "transcode"}), "defaultProfiles": config.get("defaultProfiles", {}), "defaultNaming": config.get("defaultNaming", "plex"), "profiles": config.get("profiles", {}), "targets": config.get("targets", {}), "namingPresets": config.get("namingPresets", {})}, ensure_ascii=False, indent=2))
+    print(json.dumps({"defaultModes": config.get("defaultModes", {"tv": "transcode", "movie": "transcode"}), "defaultProfiles": config.get("defaultProfiles", {}), "defaultNaming": config.get("defaultNaming", "plex"), "downloadDir": str(configured_download_root(config) or ""), "profiles": config.get("profiles", {}), "targets": config.get("targets", {}), "namingPresets": config.get("namingPresets", {})}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1755,6 +1763,14 @@ def command_doctor(_args) -> int:
         except RuntimeError:
             status = "error"
         checks.append({"name": name, "status": status, "path": str(path)})
+    download_root = configured_download_root(config)
+    if download_root is not None:
+        try:
+            validate_download_root(base_root, download_root)
+            status = "ok"
+        except RuntimeError:
+            status = "unavailable"
+        checks.append({"name": "download:output", "status": status, "path": str(download_root)})
     for name, raw in (config.get("targets", {}) or {}).items():
         value = raw.get("path") if isinstance(raw, dict) else raw
         path = resolve_path(value)

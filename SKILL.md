@@ -1,6 +1,6 @@
 ---
 name: agent-media-pipeline
-description: Discover authorized media through Jackett, Torznab/Prowlarr, or public web sources; review candidates; acquire local files, torrents, direct links, YouTube/Bilibili videos, or playlists; transcode with TV/movie defaults or preserve the original container; generate Plex-compatible naming, NFO, and artwork; and optionally archive to a local folder, external drive, or NAS. Use for agent-guided media search, download, organization, metadata, status, resume, and safe stop workflows.
+description: Discover authorized media through Jackett, Torznab/Prowlarr, or public web sources; review candidates; acquire local files, torrents, direct links, YouTube/Bilibili videos, or playlists; transcode with TV/movie defaults or preserve the original container; generate Plex-compatible naming, NFO, and artwork; deliver locally with cache cleanup; and optionally archive to a local folder, external drive, or NAS. Use for agent-guided media search, download, organization, metadata, status, resume, and safe stop workflows.
 ---
 
 # Agent Media Pipeline
@@ -13,15 +13,15 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
 - Do not provide infringing sources, circumvention instructions, credentials, or keys.
 - Return and compare candidates before downloading unless the user supplied an exact source or explicitly authorized automatic selection.
 - Keep API keys, cookies, tokens, and credential-bearing URLs out of commands, configuration, logs, and responses. Store keys only in environment variables.
-- Archival is optional. When enabled, the local, external-drive, or NAS target must already exist and be writable; external volumes must be mounted. Never create a fake mount directory.
+- Archival is optional. With `--no-archive`, deliver to configured `downloadDir`; without that setting, retain the Plex-ready folder in the owned workspace for backward compatibility. Archive targets must already exist and be writable; external volumes must be mounted. Never create a fake mount directory.
 - Never overwrite an existing different file. Preserve the owned workspace and source after failure.
-- Remove a Skill-created workspace only after size, SHA-256, media-validity, and archive-target checks pass.
+- Remove a Skill-created workspace only after size, SHA-256, media-validity, and delivery/archive-target checks pass.
 - `--reset-work` deletes a verified failed-task workspace. Use it only after the user confirms rebuilding that task.
 
 ## Workflow
 
-1. Run `./run.sh doctor`. Confirm FFmpeg/FFprobe and the required downloader. Archive targets are optional; an unused missing target may remain `unavailable`.
-2. Establish media type, verified title/year, playlist scope, transcode mode, archive choice/target, profile, naming preset, and quality requirements.
+1. Run `./run.sh doctor`. Confirm FFmpeg/FFprobe, the required downloader, and `download:output` when using local delivery. Archive targets are optional; an unused missing target may remain `unavailable`.
+2. Establish media type, verified title/year, playlist scope, transcode mode, local-delivery/archive choice and target, profile, naming preset, and quality requirements.
    - Run `profiles` to inspect `defaultModes.tv|movie`.
    - If the user says “use the default,” apply it directly.
    - If the user only supplies media and does not specify type, transcode mode, or archive choice, explain the relevant defaults and ask for the missing decisions.
@@ -41,7 +41,7 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
 ## Natural-language examples
 
 - “Download this YouTube or Bilibili video, organize it as a movie, use the default transcode mode, and archive it to my movie library.”
-- “Download this playlist as TV season 1 starting at episode 1, preserve the containers, and do not archive it yet.”
+- “Download this playlist as TV season 1 starting at episode 1, preserve the containers, deliver it to my download directory, and clean the cache.”
 - “Process this local episode folder, complete titles, NFO, poster, and fanart, then organize it for Plex.”
 - “Search for authorized sources for this show and show me candidates before downloading.”
 - “Process this with the defaults.” Use `defaultModes.tv|movie` without another mode question once the media type is known.
@@ -114,7 +114,7 @@ chmod 600 /private/tmp/source-url
 - Put signed/tokenized URLs in a user-owned regular `0600` `--source-file` rather than a command argument.
 - Playlists are disabled by default. Add `--playlist` only after the user explicitly requests the whole list.
 - For TV playlists without recognizable episode tokens, assign episodes in playlist order starting from `--season` (default 1) and `--episode` (default 1). Confirm ordering first.
-- `--no-archive` needs no target or NAS. Transcoding/organization, NFO, and artwork still run; the status `targetPath` identifies the retained workspace output.
+- `--no-archive` needs no library target or NAS. Transcoding/organization, NFO, and artwork still run. With `downloadDir`, output is validated and copied to `downloadDir/<Plex folder>` before the owned cache is removed; `--keep-work` retains it. Without `downloadDir`, the Plex-ready folder remains in the owned workspace for backward compatibility. Status `targetPath` always identifies the final output.
 
 ## Metadata and Plex
 
@@ -128,17 +128,18 @@ Transcoding defaults to MP4 profiles and removes inherited global and chapter me
 
 ## Configuration
 
-Run `cp config.example.json config.json && chmod 600 config.json`. The example uses `$HOME/MediaDownloader`, defines no archive targets, and works with `--no-archive`; NAS is not required.
+Run `cp config.example.json config.json && chmod 600 config.json`. The example uses `$HOME/MediaDownloader`, delivers `--no-archive` output to `$HOME/MediaDownloader/Incoming`, defines no archive targets, and requires no NAS.
 
 - `searchSources`: Jackett, generic Torznab/Prowlarr, or web templates; `apiKeyEnv` names an environment variable.
 - `profiles`: container, resolution, codec, CRF/bitrate, optional target, and naming. Default profiles produce MP4.
 - `defaultProfiles.tv|movie`: default compression profiles.
 - `defaultModes.tv|movie`: `transcode` or `organize`; omitted values remain backward-compatible as `transcode`.
+- `downloadDir`: final local destination for `--no-archive`; it is created when its parent is writable, may equal or sit inside `baseDir`, but must never sit inside `.media-downloader-work`.
 - `targets`: optional local directory, external-drive, or NAS presets; keep `{}` for local-only use.
 - `namingPresets`: TV/movie path templates; `plex` is the default.
 - `metadata`: TMDB, TVMaze fallback, and artwork requirements.
 
-Environment overrides include `MEDIA_DOWNLOADER_CONFIG`, `MEDIA_DOWNLOADER_BASE_DIR`, `MEDIA_DOWNLOADER_STATE_DIR`, `MEDIA_DOWNLOADER_TARGET_DIR`, and `MEDIA_DOWNLOADER_OFFLINE=1`.
+Environment overrides include `MEDIA_DOWNLOADER_CONFIG`, `MEDIA_DOWNLOADER_BASE_DIR`, `MEDIA_DOWNLOADER_STATE_DIR`, `MEDIA_DOWNLOADER_DOWNLOAD_DIR`, `MEDIA_DOWNLOADER_TARGET_DIR`, and `MEDIA_DOWNLOADER_OFFLINE=1`.
 
 `stateDir` stores task locks and per-task logs. Global `status.json` and `candidates.json` default to `.runtime/` and can be overridden with `MEDIA_DOWNLOADER_STATUS_FILE` / `MEDIA_DOWNLOADER_CANDIDATE_FILE`.
 

@@ -425,7 +425,7 @@ def main():
             broken_checks = {item["name"]: item["status"] for item in json.loads(broken_doctor.stdout)["checks"]}
             assert broken_checks["work:base"] == "error"
 
-            # 不归档时目标库可不可用，成品都留在受控工作区
+            # 未配置 downloadDir 时，no-archive 向后兼容：成品留在受控工作区
             no_archive_config = json.loads(cfg.read_text(encoding="utf-8"))
             no_archive_config["targets"] = {}
             no_archive_cfg = root / "no-archive.json"
@@ -438,6 +438,48 @@ def main():
             local_output = Path(no_archive_plan["targetPath"])
             assert (local_output / "仅处理电影.mkv").is_file()
             assert (local_output / "movie.nfo").is_file()
+
+            # downloadDir 可位于 baseDir 内；交付经完整校验后清理任务工作区
+            delivery_config = json.loads(no_archive_cfg.read_text(encoding="utf-8"))
+            delivery_root = root / "work" / "Incoming"
+            delivery_config["downloadDir"] = str(delivery_root)
+            delivery_cfg = root / "delivery.json"
+            delivery_cfg.write_text(json.dumps(delivery_config), encoding="utf-8")
+            delivery_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(delivery_cfg)}
+            delivery_checks = {item["name"]: item["status"] for item in json.loads(run([sys.executable, str(SCRIPT), "doctor"], env=delivery_env).stdout)["checks"]}
+            assert delivery_checks["download:output"] == "ok"
+            delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
+            delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
+            delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
+            delivery_output = delivery_root / "交付电影 (2026)"
+            assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
+            assert delivery_plan["target"] == "download"
+            run(delivery_command, env=delivery_env)
+            assert (delivery_output / "交付电影 (2026).mp4").is_file()
+            assert (delivery_output / "movie.nfo").is_file()
+            delivery_work = root / "work" / ".media-downloader-work" / delivery_plan["taskId"]
+            assert not delivery_work.exists()
+            delivery_state = json.loads((root / "status.json").read_text(encoding="utf-8"))[delivery_plan["taskId"]]
+            assert delivery_state["targetPath"] == str(delivery_output.resolve())
+            assert all(Path(path).is_relative_to(delivery_output.resolve()) for path in delivery_state["archivedFiles"])
+
+            # --keep-work 保留缓存和处理产物，同时仍交付下载目录
+            keep_command = [sys.executable, str(SCRIPT), "adopt", "保留工作区", str(root / "source" / "Film.mkv"), "--type", "movie", "--no-transcode", "--no-archive", "--offline", "--keep-work"]
+            keep_plan = json.loads(run([*keep_command, "--dry-run"], env=delivery_env).stdout)
+            run(keep_command, env=delivery_env)
+            keep_work = root / "work" / ".media-downloader-work" / keep_plan["taskId"]
+            assert keep_work.is_dir()
+            assert (keep_work / "output" / "保留工作区" / "保留工作区.mkv").is_file()
+            assert (delivery_root / "保留工作区" / "保留工作区.mkv").is_file()
+
+            # 成品目录不得放进任务工作区，避免后续清理误删交付物
+            unsafe_delivery = dict(delivery_config)
+            unsafe_delivery["downloadDir"] = str(root / "work" / ".media-downloader-work" / "Incoming")
+            unsafe_delivery_cfg = root / "unsafe-delivery.json"
+            unsafe_delivery_cfg.write_text(json.dumps(unsafe_delivery), encoding="utf-8")
+            unsafe_delivery_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(unsafe_delivery_cfg)}
+            unsafe_result = run([*delivery_command, "--dry-run"], env=unsafe_delivery_env, expect=1)
+            assert "不得位于任务工作区内" in unsafe_result.stderr
 
             # 无 TMDB key 且 metadata 无海报时 requireArtwork 自动降级，任务可完成
             artwork = json.loads(cfg.read_text(encoding="utf-8"))

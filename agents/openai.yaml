@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Media Pipeline"
   short_description: "Discover authorized media and build Plex-ready output safely"
-  default_prompt: "Use $agent-media-pipeline to find or process authorized media; confirm the media type, playlist scope, transcode mode, and archive choice first."
+  default_prompt: "Use $agent-media-pipeline to find or process authorized media; confirm the media type, playlist scope, transcode mode, and local delivery/archive choice first."

@@ -24,7 +24,7 @@ It works without a NAS, a media server, Docker, or an `*Arr` stack. Archive targ
 | Multiple acquisition paths | Local files, magnet links, torrent files, HTTP(S) links, and yt-dlp-supported pages including YouTube and Bilibili |
 | Explicit processing choices | TV/movie defaults with per-task `--transcode`, `--no-transcode`, playlist, and archive overrides |
 | Plex-ready output | Movie and TV naming, NFO, subtitles, poster, fanart, banner, and clear logo assets |
-| Optional archival | Keep output in a controlled local workspace or validate and atomically copy it to a configured target |
+| Local delivery or archival | Deliver finished Plex folders to `downloadDir` and clean the cache, or validate and atomically copy them to a configured library target |
 | Safety and recovery | Private configuration, redacted sources, task locks, resumable workspaces, no-clobber archival, SHA-256 checks, safe stop, and mounted-volume checks |
 
 This project only handles sources the user is authorized to access and download. It does not bypass DRM, paywalls, authentication controls, CAPTCHAs, or site restrictions.
@@ -47,7 +47,7 @@ chmod 600 config.json
 ./run.sh doctor
 ```
 
-The example configuration uses `$HOME/MediaDownloader` and defines no archive targets. Process a local movie without archiving:
+The example configuration delivers local output to `$HOME/MediaDownloader/Incoming` and defines no archive targets. Process a local movie without archiving; the finished Plex folder is delivered there and the task cache is removed:
 
 ```bash
 ./run.sh adopt "Example Movie" "/path/to/movie.mkv" \
@@ -119,7 +119,7 @@ Transcoding removes inherited global and chapter metadata by default, then relie
 - Signed or tokenized URLs can be supplied through a user-owned `0600` file with `--source-file`.
 - `config.json`, runtime state, logs, and caches are Git-ignored; private JSON files are written as `0600`.
 - Existing different files are never overwritten. Matching files are verified before being accepted.
-- Archive cleanup runs only after size, SHA-256, media, and target-identity checks succeed.
+- Delivery/archive cleanup runs only after size, SHA-256, media, and target-identity checks succeed. Use `--keep-work` to retain the task cache for debugging.
 - `--reset-work` removes only a verified task-owned workspace and must be used deliberately.
 - Newly discovered reusable websites are saved only after user confirmation and only to private `config.json`.
 
