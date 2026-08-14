@@ -5,7 +5,7 @@
   English · [简体中文](README.zh-CN.md)
 
   [![Status: Beta](https://img.shields.io/badge/status-beta-2563eb.svg)](#project-status)
-  [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg?logo=python&logoColor=white)](#requirements)
+  [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](#requirements)
   [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-compatible-111827.svg)](SKILL.md)
   [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 </div>
@@ -67,7 +67,7 @@ Run `./run.sh --help`, `./run.sh ingest --help`, or invoke the [`agent-media-pip
 ## Requirements
 
 - macOS or Linux
-- Python 3.10+
+- Python 3.9+
 - FFmpeg and FFprobe
 - Optional: aria2 for torrents/direct links
 - Optional: yt-dlp for supported web video sites and playlists

@@ -5,7 +5,7 @@
   [English](README.md) · 简体中文
 
   [![状态：Beta](https://img.shields.io/badge/status-beta-2563eb.svg)](#项目状态)
-  [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg?logo=python&logoColor=white)](#运行要求)
+  [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](#运行要求)
   [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-compatible-111827.svg)](SKILL.md)
   [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 </div>
@@ -67,7 +67,7 @@ chmod 600 config.json
 ## 运行要求
 
 - macOS 或 Linux
-- Python 3.10+
+- Python 3.9+
 - FFmpeg 和 FFprobe
 - 可选：aria2，用于种子和直链
 - 可选：yt-dlp，用于网页视频和播放列表
