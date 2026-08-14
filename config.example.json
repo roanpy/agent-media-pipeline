@@ -1,6 +1,7 @@
 {
   "baseDir": "$HOME/MediaDownloader",
   "stateDir": "$HOME/MediaDownloader/.state",
+  "downloadDir": "$HOME/MediaDownloader/Incoming",
   "timeoutHours": 24,
   "minMediaDurationSeconds": 120,
   "defaultProfiles": {

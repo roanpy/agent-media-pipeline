@@ -632,9 +632,14 @@ def build_context(config: dict, args) -> dict:
     naming_name, naming = select_naming(config, profile, args.media_type, args.naming)
     base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
     state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (base_root / ".state"))
+    download_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_DOWNLOAD_DIR") or config.get("downloadDir") or "") if (os.environ.get("MEDIA_DOWNLOADER_DOWNLOAD_DIR") or config.get("downloadDir")) else None
     target_name, target_root = ("work", base_root) if args.no_archive else select_target(config, profile, args.target)
     require_work_root(base_root, "工作目录")
     require_work_root(state_root, "状态目录")
+    if download_root is not None:
+        require_work_root(download_root, "下载成品目录")
+        if paths_overlap(base_root, download_root):
+            raise RuntimeError(f"下载成品目录与工作区不得重叠: {download_root} / {base_root}")
     if not args.no_archive:
         require_target_root(target_root)
         if paths_overlap(base_root, target_root):
@@ -672,6 +677,7 @@ def build_context(config: dict, args) -> dict:
         "targetRoot": target_root,
         "targetIdentity": None if args.no_archive else directory_identity(target_root),
         "targetShow": target_show,
+        "downloadRoot": download_root,
         "baseRoot": base_root,
         "stateRoot": state_root,
         "workRoot": work_root,
@@ -1608,6 +1614,27 @@ def archive(ctx: dict) -> list[str]:
     return archived
 
 
+def deliver_download(ctx: dict) -> list[str]:
+    """no-archive + downloadDir：把 Plex 就绪的片名目录整体移到下载成品目录。"""
+    source_dir = ctx["outputRoot"]
+    download_root = ctx["downloadRoot"]
+    require_mounted_volume(download_root, "下载成品目录")
+    download_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if download_root.is_symlink() or not download_root.is_dir():
+        raise RuntimeError(f"下载成品目录不安全: {download_root}")
+    target = download_root / source_dir.name
+    if not target.resolve(strict=False).is_relative_to(download_root.resolve()):
+        raise RuntimeError("下载成品目标逃逸")
+    if target.exists():
+        raise RuntimeError(f"下载成品目录已存在，拒绝覆盖: {target}")
+    log(ctx, f"转移到下载目录: {source_dir.name} -> {target}")
+    shutil.move(str(source_dir), str(target))
+    files = sorted(str(path) for path in target.rglob("*") if path.is_file())
+    if not files:
+        raise RuntimeError(f"下载目录转移后为空: {target}")
+    return files
+
+
 def pipeline(args) -> int:
     config = load_config()
     if args.copy_original is None:
@@ -1643,11 +1670,16 @@ def pipeline(args) -> int:
             write_nfo(ctx, plans)
             write_artwork(ctx, plans)
             if args.no_archive:
-                archived = [str(path) for path in sorted(ctx["outputRoot"].rglob("*")) if path.is_file()]
+                if ctx["downloadRoot"] is not None:
+                    status_update(ctx["id"], phase="delivering", currentOperation="delivering")
+                    archived = deliver_download(ctx)
+                else:
+                    archived = [str(path) for path in sorted(ctx["outputRoot"].rglob("*")) if path.is_file()]
             else:
                 status_update(ctx["id"], phase="archiving", currentOperation="archiving")
                 archived = archive(ctx)
-            if not args.keep_work and not args.no_archive:
+            # no-archive 配了 downloadDir 时成品已移走，工作区（含下载缓存）也可安全清理
+            if not args.keep_work and (not args.no_archive or ctx["downloadRoot"] is not None):
                 remove_owned_work(ctx)
             status_update(ctx["id"], phase="done", currentOperation="done", currentFile="", pid=None, childPid=None, archivedFiles=archived, finishedAt=now())
             log(ctx, f"完成: {ctx['canonical']}")
@@ -1767,8 +1799,8 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--season", type=int, default=1)
     parser.add_argument("--episode", type=int)
     parser.add_argument("--playlist", action="store_true", help="显式下载整个 YouTube/Bilibili 播放列表；TV 按列表顺序映射集号")
-    parser.add_argument("--no-archive", action="store_true", help="不转移到目标库；成品保留在本地工作区 output 目录")
-    parser.add_argument("--keep-work", action="store_true")
+    parser.add_argument("--no-archive", action="store_true", help="不转移到目标库；成品落到 downloadDir（若配置）否则保留在工作区 output")
+    parser.add_argument("--keep-work", action="store_true", help="完成后保留下载缓存/工作区（默认归档或交付后清理）")
     parser.add_argument("--reset-work", action="store_true")
     parser.add_argument("--update-nfo", action="store_true", help="显式原子更新已有 NFO；不会覆盖媒体、字幕或图片")
     if mode_override:
