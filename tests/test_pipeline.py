@@ -498,7 +498,7 @@ def main():
 
             relative_env = {**no_archive_env, "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "relative-status.json")}
             relative = run([str(PROJECT / "run.sh"), "adopt", "Relative Background", "Film.mkv", "--type", "movie", "--no-transcode", "--no-archive", "--offline"], env=relative_env, cwd=root / "source")
-            launch_log = Path(next(line.split(": ", 1)[1] for line in relative.stdout.splitlines() if line.startswith("启动日志: ")))
+            launch_log = Path(next(line.split(": ", 1)[1] for line in relative.stdout.splitlines() if line.startswith("Launch log: ")))
             try:
                 deadline = time.time() + 20
                 while time.time() < deadline:

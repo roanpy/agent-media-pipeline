@@ -48,6 +48,6 @@ with open(os.devnull, "rb") as stdin, os.fdopen(descriptor, "ab", buffering=0) a
         close_fds=True,
         env=os.environ.copy(),
     )
-print(f"后台已启动，PID: {process.pid}")
-print(f"启动日志: {log_path}")
+print(f"Started in background, PID: {process.pid}")
+print(f"Launch log: {log_path}")
 PY
