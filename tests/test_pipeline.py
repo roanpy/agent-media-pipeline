@@ -293,6 +293,30 @@ def assert_path_and_naming_guards(module, root: Path):
     assert len(long_magnet) > 255
     assert module.validate_source(long_magnet) == long_magnet
     assert module.classify_downloader(long_magnet, "auto") == "aria2"
+    assert module.is_plausible_path(long_magnet) is False
+    assert module.is_plausible_path("https://example.test/video.mp4") is False
+    # 回归实际 acquire 分支：长 magnet 必须写入 aria2 input-file，不能进入 Path.exists()。
+    magnet_work = root / "magnet-work"
+    magnet_source = magnet_work / "source"
+    magnet_source.mkdir(parents=True)
+    fake_media = magnet_source / "result.mkv"
+    fake_media.write_bytes(b"x")
+    captured = []
+    original_log, original_run_child, original_which = module.log, module.run_child, module.shutil.which
+    try:
+        module.log = lambda *_args: None
+        module.shutil.which = lambda name: f"/fake/{name}"
+        module.run_child = lambda _ctx, command, *_args: captured.append(command)
+        acquired = module.acquire({
+            "sourceRoot": magnet_source,
+            "workRoot": magnet_work,
+            "config": {"timeoutHours": 1},
+            "args": type("Args", (), {"playlist": False})(),
+        }, long_magnet, "auto")
+        assert acquired == [fake_media]
+        assert any(arg.startswith("--input-file=") for arg in captured[0]), captured
+    finally:
+        module.log, module.run_child, module.shutil.which = original_log, original_run_child, original_which
 
     # customWords：屏蔽/替换作用于检索词；偏移按 media_type+清洗后标题匹配
     words_config = {"customWords": {

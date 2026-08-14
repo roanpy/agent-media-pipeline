@@ -857,10 +857,16 @@ def redacted_source(source: str) -> str:
     return str(Path(source).expanduser())
 
 
-# macOS/Unix 单文件组件上限 255 字节；超长字符串不可能是真实路径，
-# 直接 stat 会触发 OSError(ENAMETOOLONG)，先挡掉再进 Path.exists()。
+# macOS 路径总长通常上限 1024 字节、单个组件上限 255 字节；两者都要检查，
+# 否则 827 字节的 magnet 会被当成一个合法路径组件并在 stat 时触发 ENAMETOOLONG。
 def is_plausible_path(value: str) -> bool:
-    return len(value.encode("utf-8", errors="ignore")) <= 1024 and "\x00" not in value
+    if urllib.parse.urlsplit(value).scheme.casefold() in {"magnet", "http", "https"}:
+        return False
+    return (
+        "\x00" not in value
+        and len(os.fsencode(value)) <= 1024
+        and all(len(os.fsencode(part)) <= 255 for part in Path(value).parts)
+    )
 
 
 def validate_source(source: str, allow_local: bool = True) -> str:
