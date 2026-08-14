@@ -652,7 +652,10 @@ def build_context(config: dict, args) -> dict:
         "year": metadata.get("year") or "",
         "ext": profile["container"],
     }
-    target_show = work_root / "output" if args.no_archive else target_root / render_path(naming["showDir"], naming_fields)
+    show_subdir = render_path(naming["showDir"], naming_fields)
+    # no-archive 也让 output 直接是 Plex 就绪结构（套片名目录），拖进库即用，无需手动建目录
+    output_root = (work_root / "output" / show_subdir) if args.no_archive else (work_root / "output")
+    target_show = output_root if args.no_archive else (target_root / show_subdir)
     if not args.no_archive and not contains_path(target_root, target_show):
         raise RuntimeError("目标目录逃逸")
     return {
@@ -673,7 +676,7 @@ def build_context(config: dict, args) -> dict:
         "stateRoot": state_root,
         "workRoot": work_root,
         "sourceRoot": work_root / "source",
-        "outputRoot": work_root / "output",
+        "outputRoot": output_root,
         "marker": work_root / ".media-downloader-owned.json",
         "logPath": state_root / "logs" / f"{identifier}.log",
         "metadata": metadata,
