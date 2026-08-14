@@ -1425,6 +1425,10 @@ def write_nfo(ctx: dict, plans: list[dict]) -> None:
                 xml_text(episode_root, "director", director)
             for writer in details.get("writers", []):
                 xml_text(episode_root, "credits", writer)
+            # 单集也写 uniqueid，供 Plex NFO Agent 在跨季同集/改名时稳定匹配
+            for id_type, value in ids.items():
+                if value:
+                    ET.SubElement(episode_root, "uniqueid", {"type": str(id_type)}).text = str(value)
             write_xml(plan["output"].with_suffix(".nfo"), episode_root)
 
 

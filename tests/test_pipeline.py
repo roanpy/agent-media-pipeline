@@ -539,6 +539,7 @@ def main():
             assert (show / "poster.jpg").is_file()
             assert_xml(show / "tvshow.nfo", "<uniqueid type=\"tmdb\" default=\"true\">123</uniqueid>")
             assert_xml(episode.with_suffix(".nfo"), "<title>第三集</title>")
+            assert_xml(episode.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">123</uniqueid>")
             episode_digest = episode.read_bytes()
             poster_digest = (show / "poster.jpg").read_bytes()
             metadata.write_text(json.dumps({
