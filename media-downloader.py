@@ -476,7 +476,15 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None) -> d
     else:
         auth = None
         auth_params = {"api_key": api_key}
-    params = {**auth_params, "language": language, "query": title}
+    # 用户常输入带年份的标题（"The Odyssey 2026"），TMDB 的 query 是全文匹配会 0 命中；
+    # 剥离末尾年份单独走 year 过滤参数，标题回到干净检索词。
+    query = title
+    if year is None:
+        match = re.match(r"^(?P<name>.+?)\s*[\(\[]?(?P<year>(?:19|20)\d{2})[\)\]]?$", title.strip())
+        if match:
+            query = match.group("name").strip()
+            year = int(match.group("year"))
+    params = {**auth_params, "language": language, "query": query}
     params["first_air_date_year" if kind == "tv" else "year"] = year
     search = http_json(f"https://api.themoviedb.org/3/search/{kind}", params, auth)
     results = search.get("results", []) if isinstance(search, dict) else []
@@ -785,16 +793,22 @@ def redacted_source(source: str) -> str:
     return str(Path(source).expanduser())
 
 
+# macOS/Unix 单文件组件上限 255 字节；超长字符串不可能是真实路径，
+# 直接 stat 会触发 OSError(ENAMETOOLONG)，先挡掉再进 Path.exists()。
+def is_plausible_path(value: str) -> bool:
+    return len(value.encode("utf-8", errors="ignore")) <= 1024 and "\x00" not in value
+
+
 def validate_source(source: str, allow_local: bool = True) -> str:
     if not source or source != source.strip() or any(ord(char) < 32 for char in source):
         raise RuntimeError("来源包含不安全控制字符")
-    local = Path(source).expanduser()
-    if allow_local and local.exists():
-        return source
     if source.startswith("magnet:"):
         parsed = urllib.parse.urlsplit(source)
         if "xt=urn:btih:" not in parsed.query.casefold():
             raise RuntimeError("magnet 来源缺少 BTIH")
+        return source
+    local = Path(source).expanduser() if is_plausible_path(source) else None
+    if allow_local and local is not None and local.exists():
         return source
     parsed = urllib.parse.urlsplit(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -1055,11 +1069,11 @@ def resolve_source(args) -> tuple[str, str]:
 def classify_downloader(source: str, requested: str) -> str:
     if requested != "auto":
         return requested
-    local = Path(source).expanduser()
-    if local.exists():
-        return "aria2" if local.suffix.lower() == ".torrent" else "local"
     if source.startswith("magnet:"):
         return "aria2"
+    local = Path(source).expanduser() if is_plausible_path(source) else None
+    if local is not None and local.exists():
+        return "aria2" if local.suffix.lower() == ".torrent" else "local"
     parsed = urllib.parse.urlsplit(source)
     if parsed.scheme not in {"http", "https"}:
         raise RuntimeError(f"不支持的来源协议: {parsed.scheme or 'unknown'}")
@@ -1088,8 +1102,8 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
             "--check-integrity=true", "--seed-time=0", "--summary-interval=10",
         ]
         input_file = None
-        local_source = Path(source).expanduser()
-        if local_source.exists():
+        local_source = Path(source).expanduser() if is_plausible_path(source) else None
+        if local_source is not None and local_source.exists():
             command.append(str(local_source.resolve()))
         else:
             input_file = ctx["workRoot"] / ".aria2-input.txt"

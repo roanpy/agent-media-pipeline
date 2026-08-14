@@ -288,6 +288,12 @@ def assert_path_and_naming_guards(module, root: Path):
     else:
         raise AssertionError("overlong UTF-8 path components must be rejected")
 
+    # 超长 magnet（827 字符）不得被当成本地路径 stat 而炸 ENAMETOOLONG
+    long_magnet = "magnet:?xt=urn:btih:ABCDEF0123456789&dn=" + "x" * 780
+    assert len(long_magnet) > 255
+    assert module.validate_source(long_magnet) == long_magnet
+    assert module.classify_downloader(long_magnet, "auto") == "aria2"
+
     args = type("Args", (), {"copy_original": True, "season": 1, "episode": None})()
     duplicate_root = root / "duplicate-episodes"
     duplicate_root.mkdir()
