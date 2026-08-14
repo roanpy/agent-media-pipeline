@@ -107,5 +107,10 @@
     "language": "zh-CN",
     "tvFallback": "tvmaze",
     "requireArtwork": true
+  },
+  "customWords": {
+    "ignore": ["全39集", "更新至"],
+    "replace": [{"from": "第12话", "to": "E12"}],
+    "episodeOffset": [{"pattern": "(?i)shows?-name", "offset": 50}]
   }
 }

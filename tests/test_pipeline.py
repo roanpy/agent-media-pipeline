@@ -294,6 +294,43 @@ def assert_path_and_naming_guards(module, root: Path):
     assert module.validate_source(long_magnet) == long_magnet
     assert module.classify_downloader(long_magnet, "auto") == "aria2"
 
+    # customWords：屏蔽/替换作用于检索词；偏移按 media_type+清洗后标题匹配
+    words_config = {"customWords": {
+        "ignore": ["全39集"],
+        "replace": [{"from": "第12话", "to": "E12"}],
+        "episodeOffset": [{"pattern": r"(?i)tv:续作", "offset": 50}],
+    }}
+    cleaned, offset = module.apply_custom_words(words_config, "tv", "狂飙 全39集")
+    assert cleaned == "狂飙" and offset == 0, (cleaned, offset)
+    cleaned, _ = module.apply_custom_words(words_config, "tv", "某剧 第12话")
+    assert cleaned == "某剧 E12", cleaned
+    cleaned, offset = module.apply_custom_words(words_config, "tv", "续作 第二季")
+    assert offset == 50, (cleaned, offset)
+    # 偏移作用于集号；movie 不匹配 tv 前缀的 pattern
+    assert module.episode_from_name(Path("续作.E05.mkv"), 1, 50) == (1, 55)
+    _, offset = module.apply_custom_words(words_config, "movie", "续作 第二季")
+    assert offset == 0
+    try:
+        module.episode_from_name(Path("续作.E05.mkv"), 1, -10)
+    except RuntimeError as exc:
+        assert "偏移" in str(exc)
+    else:
+        raise AssertionError("offset producing episode < 1 must be rejected")
+
+    # 缺集报告：空洞检测 + 不计更大集号
+    report_ctx = {
+        "mediaType": "tv",
+        "args": type("Args", (), {"playlist": False})(),
+        "metadata": {"episodes": []},
+    }
+    plans = [{"season": 1, "episode": 1}, {"season": 1, "episode": 3}, {"season": 1, "episode": 4}]
+    assert module.missing_episode_report(report_ctx, plans) == {"S01": [2]}
+    assert module.missing_episode_report(report_ctx, [{"season": 1, "episode": 1}, {"season": 1, "episode": 2}]) is None
+    report_ctx["metadata"]["episodes"] = [{"season": 1, "episode": 5}, {"season": 1, "episode": 6}]
+    assert module.missing_episode_report(report_ctx, [{"season": 1, "episode": 1}, {"season": 1, "episode": 2}]) == {"S01": [5, 6]}
+    report_ctx["args"] = type("Args", (), {"playlist": True})()
+    assert module.missing_episode_report(report_ctx, plans) is None
+
     args = type("Args", (), {"copy_original": True, "season": 1, "episode": None})()
     duplicate_root = root / "duplicate-episodes"
     duplicate_root.mkdir()

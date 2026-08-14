@@ -185,8 +185,30 @@ def validate_config(data: dict) -> None:
         else:
             template = str(source.get("urlTemplate", ""))
             parsed = urllib.parse.urlsplit(validate_public_source_url(template, template=True).replace("{query}", "test"))
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise RuntimeError(f"搜索源 URL 无效: {name}")
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise RuntimeError(f"搜索源 URL 无效: {name}")
+    words = data.get("customWords", {})
+    if not isinstance(words, dict):
+        raise RuntimeError("customWords 必须是对象")
+    for field in ("ignore", "replace", "episodeOffset"):
+        if field in words and not isinstance(words[field], list):
+            raise RuntimeError(f"customWords.{field} 必须是数组")
+    for item in words.get("ignore", []):
+        if not isinstance(item, str) or not item:
+            raise RuntimeError("customWords.ignore 每项必须是非空字符串")
+    for item in words.get("replace", []):
+        if not isinstance(item, dict) or not isinstance(item.get("from"), str) or not isinstance(item.get("to"), str) or not item["from"]:
+            raise RuntimeError('customWords.replace 每项必须是 {"from": ..., "to": ...}')
+    for item in words.get("episodeOffset", []):
+        if not isinstance(item, dict) or not isinstance(item.get("pattern"), str) or not item["pattern"]:
+            raise RuntimeError('customWords.episodeOffset 每项必须是 {"pattern": ..., "offset": ±整数}')
+        try:
+            re.compile(item["pattern"])
+            offset = int(item.get("offset", 0))
+        except (TypeError, ValueError, re.error) as exc:
+            raise RuntimeError(f"customWords.episodeOffset 项无效: {item}") from exc
+        if not -10000 <= offset <= 10000:
+            raise RuntimeError(f"customWords.episodeOffset 偏移超出范围: {offset}")
 
 
 def load_config() -> dict:
@@ -570,17 +592,21 @@ def fetch_tvmaze(title: str) -> dict:
 
 def resolve_metadata(config: dict, args) -> dict:
     supplied = metadata_from_file(args.metadata)
+    # 识别词作用于检索词，让 "狂飙.全39集" 这类标题能命中 TMDB；不改写 metadata.title 存储
+    query_title, episode_offset = apply_custom_words(config, args.media_type, args.title)
+    args.episode_offset = episode_offset
+    query_title = query_title or args.title
     fetched = {}
     offline = bool(args.offline or os.environ.get("MEDIA_DOWNLOADER_OFFLINE") == "1")
     metadata_config = config.get("metadata", {})
     if not offline and metadata_config.get("provider") == "tmdb":
         try:
-            fetched = fetch_tmdb(config, args.media_type, args.title, args.year)
+            fetched = fetch_tmdb(config, args.media_type, query_title, args.year)
         except Exception as exc:
             print(f"警告: TMDB 元数据查询失败: {exc}", file=sys.stderr)
     if not fetched and not offline and args.media_type == "tv" and metadata_config.get("tvFallback", "tvmaze") == "tvmaze":
         try:
-            fetched = fetch_tvmaze(args.title)
+            fetched = fetch_tvmaze(query_title)
         except Exception as exc:
             print(f"警告: TVMaze 元数据查询失败: {exc}", file=sys.stderr)
     metadata = {**fetched, **supplied}
@@ -1189,7 +1215,22 @@ EPISODE_PATTERNS = [
 MULTI_EPISODE_PATTERN = re.compile(r"(?i)S\d{1,2}[ ._-]*E\d{1,3}(?:[ ._-]*(?:-|E)E?\d{1,3}(?![0-9p]))+")
 
 
-def episode_from_name(path: Path, default_season: int) -> tuple[int, int] | None:
+def apply_custom_words(config: dict, media_type: str, title: str) -> tuple[str, int]:
+    """识别词预处理：屏蔽 → 替换 → 集数偏移（作用于识别前，不改用户标题存储）。"""
+    words = config.get("customWords", {})
+    for item in words.get("ignore", []):
+        title = title.replace(item, " ")
+    for item in words.get("replace", []):
+        title = title.replace(item["from"], item["to"])
+    offset = 0
+    key = f"{media_type}:{title.casefold()}"
+    for item in words.get("episodeOffset", []):
+        if re.search(item["pattern"], key, re.IGNORECASE):
+            offset = int(item.get("offset", 0))
+    return re.sub(r"\s+", " ", title).strip(), offset
+
+
+def episode_from_name(path: Path, default_season: int, offset: int = 0) -> tuple[int, int] | None:
     for text in (path.stem, path.parent.name):
         if MULTI_EPISODE_PATTERN.search(text):
             raise RuntimeError(f"暂不支持多集单文件: {path.name}；请先拆分为单集文件")
@@ -1197,7 +1238,10 @@ def episode_from_name(path: Path, default_season: int) -> tuple[int, int] | None
             match = pattern.search(text)
             if match:
                 season = int(match.groupdict().get("season") or default_season)
-                return season, int(match.group("episode"))
+                episode = int(match.group("episode")) + offset
+                if episode < 1:
+                    raise RuntimeError(f"集数偏移后无效: {path.name} (E{int(match.group('episode'))}{offset:+d})")
+                return season, episode
     return None
 
 
@@ -1243,7 +1287,7 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
             relative = render_path(ctx["naming"]["movieFile"], fields)
             season = episode = None
         else:
-            parsed = episode_from_name(source, ctx["args"].season)
+            parsed = episode_from_name(source, ctx["args"].season, getattr(ctx["args"], "episode_offset", 0))
             if not parsed and getattr(ctx["args"], "playlist", False):
                 parsed = (ctx["args"].season, position)
             if not parsed:
@@ -1506,6 +1550,24 @@ def write_artwork(ctx: dict, plans: list[dict]) -> None:
             log(ctx, f"警告: {kind} 获取失败: {exc}")
 
 
+def missing_episode_report(ctx: dict, plans: list[dict]) -> str | None:
+    """剧集缺集检查：对本次覆盖到的季，按已知集数范围找空洞。只报告，不阻断。"""
+    if ctx["mediaType"] != "tv" or ctx["args"].playlist:
+        return None
+    known = {(item["season"], item["episode"]) for item in ctx["metadata"].get("episodes", [])}
+    by_season: dict[int, set[int]] = {}
+    for plan in plans:
+        if plan["season"] is not None:
+            by_season.setdefault(plan["season"], set()).add(plan["episode"])
+    missing: dict[str, list[int]] = {}
+    for season, episodes in sorted(by_season.items()):
+        candidates = {episode for s, episode in known if s == season} or set(range(1, max(episodes) + 1))
+        gaps = sorted(candidates - episodes)
+        if gaps:
+            missing[f"S{season:02d}"] = gaps
+    return missing or None
+
+
 def file_digest(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -1681,6 +1743,11 @@ def pipeline(args) -> int:
             status_update(ctx["id"], phase="metadata", currentOperation="metadata", currentFile="")
             write_nfo(ctx, plans)
             write_artwork(ctx, plans)
+            missing = missing_episode_report(ctx, plans)
+            if missing:
+                gaps = ", ".join(f"{season} 缺 {','.join(f'E{episode:02d}' for episode in episodes)}" for season, episodes in missing.items())
+                log(ctx, f"缺集提醒: {gaps}")
+                print(f"缺集提醒: {gaps}", file=sys.stderr)
             if args.no_archive:
                 if ctx["downloadRoot"] is not None:
                     status_update(ctx["id"], phase="delivering", currentOperation="delivering")
