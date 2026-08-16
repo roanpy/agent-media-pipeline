@@ -34,6 +34,7 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
    - The agent may use browser search for one-off public discovery. Before saving a reusable site, show its name, domain, type, URL template, and credential requirements. Save it with `add-source` only after explicit confirmation. Never silently add sites or secrets to `SKILL.md`, code, or `config.example.json`.
 4. Compare title, season/episode, year, resolution, codec, size, publication time, seeders, and source trust. Do not select by seed count alone.
 5. After authorization, run `ingest`. Use `--candidate` for cached structured results and a URL for web/direct sources.
+   - For YouTube/Bilibili, issue one `ingest --playlist` command. Never run raw yt-dlp and then manually schedule `adopt`; the pipeline must continue through processing, NFO/artwork, delivery/archive, and cleanup under one task/status record.
    - A TV file without a season/episode token requires explicit `--season`/`--episode`.
    - Split unsupported multi-episode files before processing.
    - When separate tasks add episodes to the same existing TV show, use `--merge`. It keeps existing different show-level artwork and `tvshow.nfo`, but still rejects different media, subtitles, and episode NFO files.
@@ -88,6 +89,10 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
 ./run.sh ingest "Course Name" "VIDEO_URL" --type tv --downloader yt-dlp \
   --season 1 --episode 1 --no-archive
 
+# Process but do not archive or deliver; keep the finished folder in the owned workspace
+./run.sh ingest "Course Name" "VIDEO_URL" --type tv --downloader yt-dlp \
+  --no-transcode --no-deliver
+
 # Keep a signed/tokenized URL out of process arguments
 chmod 600 /private/tmp/source-url
 ./run.sh ingest "Movie Name" --source-file /private/tmp/source-url --type movie
@@ -131,10 +136,11 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 - Default `transcode` profiles produce final MP4 regardless of the downloaded container. `--no-transcode` preserves the downloaded codecs/container; if MP4 is mandatory, use the MP4 transcode profile rather than assuming a web source provides MP4.
 - `--cookies` takes a supported browser spec (`chrome`, `firefox`, `edge`, `safari`, `brave`, `chromium`, `opera`, `vivaldi`, `whale`) or a current-user-owned `0600` Netscape cookies.txt path. Use it only for the user's authorized session when YouTube bot checks or Bilibili login/quality restrictions require authentication. Do not export, log, copy, or commit cookies, and do not attempt to bypass DRM, CAPTCHA, membership, or regional controls.
 - `--no-archive` needs no library target or NAS. Transcoding/organization, NFO, and artwork still run. With `downloadDir`, output is validated and copied to `downloadDir/<Plex folder>` before the owned cache is removed; `--keep-work` retains it. Without `downloadDir`, the Plex-ready folder remains in the owned workspace for backward compatibility. Status `targetPath` always identifies the final output.
+- `--no-deliver` implies `--no-archive`, ignores configured `downloadDir` for that task, and retains the Plex-ready folder/workspace. Use it only when the user explicitly wants no transfer and no cleanup of that task workspace.
 
 ## Metadata and Plex
 
-Try TMDB through `TMDB_API_KEY`; TV may fall back to TVMaze. A metadata JSON may override or supplement title, original/sort title, year, premiere date, plot, tagline, content rating, rating, runtime, status, genres, countries, tags, studio, directors, writers, actors, external IDs, episode details, and artwork URLs/paths.
+Try TMDB through `TMDB_API_KEY`; TV may fall back to TVMaze. Both providers are optional. When available, fetch the requested season's episode titles/details and use episode-specific IDs in each episode NFO. Without them, continue with minimal NFO and the stable `SxxEyy` filename. A metadata JSON may override or supplement title, original/sort title, year, premiere date, plot, tagline, content rating, rating, runtime, status, genres, countries, tags, studio, directors, writers, actors, external IDs, episode details, and artwork URLs/paths.
 
 Supported root artwork names are `poster`, `fanart`, `banner`, and `clearlogo`. With no TMDB key, still generate minimal valid NFO. If `metadata.requireArtwork=true` but neither a key nor supplied poster exists, warn and downgrade artwork to optional.
 
@@ -148,7 +154,7 @@ Transcoding defaults to MP4 profiles and removes inherited global and chapter me
 
 Run `cp config.example.json config.json && chmod 600 config.json`. The example uses `$HOME/MediaDownloader`, delivers `--no-archive` output to `$HOME/MediaDownloader/Incoming`, defines no archive targets, and requires no NAS.
 
-- `searchSources`: Jackett, generic Torznab/Prowlarr, or web templates; `apiKeyEnv` names an environment variable.
+- `searchSources`: optional Jackett, generic Torznab/Prowlarr, or web templates; `apiKeyEnv` names an environment variable. Missing keys appear as `optional-missing` in doctor and fail only when that source is actually searched.
 - `btStopTimeoutSeconds`: aria2 sustained-zero-traffic limit; default `600`, set `0` only to disable it deliberately.
 - `profiles`: container, resolution, codec, CRF/bitrate, optional target, and naming. Default profiles produce MP4.
 - `defaultProfiles.tv|movie`: default compression profiles.

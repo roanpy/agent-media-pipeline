@@ -66,6 +66,8 @@ chmod 600 config.json
 
 `probe URL` 会列出单个视频的可用格式；`probe URL --playlist` 返回脱敏后的播放列表数量和顺序。仅当用户自己的 YouTube/Bilibili 会话确实需要登录时，才在探测和下载中同时加入 `--cookies chrome`，或传入当前用户拥有且权限为 `0600` 的 Netscape cookies.txt。
 
+网页媒体应只发一条 `ingest`：脚本会连续完成下载、转码或整理、NFO/图片、交付或归档及缓存清理，不需要下载后再补发 `adopt`。若明确不转移，使用 `--no-deliver`，成品和该任务工作区会保留。
+
 运行 `./run.sh --help`、`./run.sh ingest --help`，或直接调用 [`agent-media-pipeline` Skill](SKILL.md) 用自然语言描述任务。
 
 ## 运行要求
@@ -123,7 +125,7 @@ brew install ffmpeg aria2 yt-dlp
 
 yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时可使用 `--format "bv*[height<=720]+ba/b[height<=720]"`。它只控制下载源，不决定流水线是否转码：默认转码 profile 决定最终 MP4，`--no-transcode` 则保留 yt-dlp 下载后的编码和容器。播放列表及 Bilibili 分 P/合集必须使用 `--type tv --playlist`，并在核实顺序后从 `--season`/`--episode` 开始映射。
 
-默认 Plex 电视剧模板在取得可靠单集标题时命名为 `剧名 - S01E03 - 单集标题.ext`；没有标题则保持 `剧名 - S01E03.ext`。同一个标题写入该集旁边的单集 NFO；`tvshow.nfo` 只保存整部剧资料，不重复塞入全季集数清单。
+默认 Plex 电视剧模板在取得可靠单集标题时命名为 `剧名 - S01E03 - 单集标题.ext`；没有标题则保持 `剧名 - S01E03.ext`。同一个标题和该集自己的来源 ID 写入单集 NFO；`tvshow.nfo` 只保存整部剧资料，不重复塞入全季集数清单。TMDB、TVMaze fallback、Jackett 和 Prowlarr 都是可选项，缺少凭据不会阻塞直链、本地文件或网页媒体主流程。
 
 ## 安全与隐私
 

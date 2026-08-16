@@ -66,6 +66,8 @@ Download an authorized YouTube or Bilibili playlist, organize it as a TV season,
 
 `probe URL` lists a single video's available formats. `probe URL --playlist` returns a redacted JSON summary of playlist count and order. Add `--cookies chrome` (or a private `0600` Netscape cookies.txt path) to both probe and ingest only when the user's authorized YouTube/Bilibili session is required.
 
+Use one `ingest` command for the whole web pipeline. It downloads, transcodes or organizes, writes NFO/artwork, delivers or archives, and cleans its cache without a second `adopt` command. Add `--no-deliver` when the finished folder must stay in the owned workspace with no transfer or cleanup.
+
 Run `./run.sh --help`, `./run.sh ingest --help`, or invoke the [`agent-media-pipeline` Skill](SKILL.md) and ask the agent in natural language.
 
 ## Requirements
@@ -123,7 +125,7 @@ Transcoding removes inherited global and chapter metadata by default, then relie
 
 For yt-dlp sources, omit `--format` for the best available streams or set a ceiling such as `--format "bv*[height<=720]+ba/b[height<=720]"`. This controls source selection only. The default transcode profile determines the final MP4 output; `--no-transcode` preserves yt-dlp's downloaded codecs and container. Playlists and Bilibili multi-part collections require `--type tv --playlist` and are mapped in confirmed playlist order from `--season`/`--episode`.
 
-The default Plex TV template appends a verified per-episode title when available: `Show - S01E03 - Episode title.ext`. With no reliable title it keeps `Show - S01E03.ext`. The same title is written to the sibling episode NFO; `tvshow.nfo` remains show-level and does not embed the episode catalogue.
+The default Plex TV template appends a verified per-episode title when available: `Show - S01E03 - Episode title.ext`. With no reliable title it keeps `Show - S01E03.ext`. The same title and episode-specific provider ID are written to the sibling episode NFO; `tvshow.nfo` remains show-level and does not embed the episode catalogue. TMDB, TVMaze fallback, Jackett, and Prowlarr are optional; missing credentials do not block direct/local/web ingest.
 
 ## Safety and privacy
 

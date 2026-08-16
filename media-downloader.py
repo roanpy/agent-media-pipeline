@@ -525,7 +525,7 @@ def http_json(url: str, params: dict, headers: dict | None = None, timeout: int 
         raise RuntimeError(f"{urllib.parse.urlsplit(url).netloc} 连接失败: {exc.reason}") from exc
 
 
-def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None) -> dict:
+def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None, season: int | None = None) -> dict:
     metadata_config = config.get("metadata", {})
     key_env = metadata_config.get("apiKeyEnv", "TMDB_API_KEY")
     api_key = os.environ.get(str(key_env), "")
@@ -569,6 +569,29 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None) -> d
     credits = detail.get("credits", {}) if isinstance(detail.get("credits"), dict) else {}
     crew = credits.get("crew", []) if isinstance(credits.get("crew"), list) else []
     countries = detail.get("production_countries", []) if isinstance(detail.get("production_countries"), list) else []
+    episodes = []
+    if kind == "tv" and season is not None:
+        try:
+            season_detail = http_json(
+                f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}",
+                {**auth_params, "language": language}, auth,
+            )
+            for episode in season_detail.get("episodes", []) if isinstance(season_detail, dict) else []:
+                episode_crew = episode.get("crew", []) if isinstance(episode.get("crew"), list) else []
+                episodes.append({
+                    "season": int(episode.get("season_number", season)),
+                    "episode": int(episode["episode_number"]),
+                    "title": episode.get("name") or "",
+                    "plot": episode.get("overview") or "",
+                    "aired": episode.get("air_date") or "",
+                    "runtime": episode.get("runtime"),
+                    "rating": episode.get("vote_average"),
+                    "directors": [person.get("name") for person in episode_crew if person.get("job") == "Director" and person.get("name")],
+                    "writers": [person.get("name") for person in episode_crew if person.get("department") == "Writing" and person.get("name")],
+                    "ids": {"tmdb": episode.get("id")},
+                })
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            print(f"警告: TMDB 第 {season} 季分集详情查询失败: {exc}", file=sys.stderr)
     return {
         "title": detail.get(name_key) or item.get(name_key),
         "originalTitle": detail.get(original_key) or item.get(original_key),
@@ -590,10 +613,11 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None) -> d
         "ids": {"tmdb": tmdb_id, "imdb": externals.get("imdb_id"), "tvdb": externals.get("tvdb_id")},
         "posterUrl": f"https://image.tmdb.org/t/p/original{detail.get('poster_path')}" if detail.get("poster_path") else "",
         "fanartUrl": f"https://image.tmdb.org/t/p/original{detail.get('backdrop_path')}" if detail.get("backdrop_path") else "",
+        "episodes": episodes,
     }
 
 
-def fetch_tvmaze(title: str) -> dict:
+def fetch_tvmaze(title: str, season: int | None = None) -> dict:
     payload = http_json("https://api.tvmaze.com/search/shows", {"q": title})
     candidates = [item.get("show") for item in payload if isinstance(item, dict) and isinstance(item.get("show"), dict)] if isinstance(payload, list) else []
     if not candidates:
@@ -604,6 +628,18 @@ def fetch_tvmaze(title: str) -> dict:
     image = show.get("image") if isinstance(show.get("image"), dict) else {}
     externals = show.get("externals") if isinstance(show.get("externals"), dict) else {}
     summary = re.sub(r"<[^>]+>", "", show.get("summary") or "")
+    episodes = []
+    if season is not None and show.get("id"):
+        try:
+            items = http_json(f"https://api.tvmaze.com/shows/{show['id']}/episodes", {})
+            episodes = [{
+                "season": int(item["season"]), "episode": int(item["number"]),
+                "title": item.get("name") or "", "plot": re.sub(r"<[^>]+>", "", item.get("summary") or ""),
+                "aired": item.get("airdate") or "", "runtime": item.get("runtime"),
+                "ids": {"tvmaze": item.get("id")},
+            } for item in items if isinstance(item, dict) and item.get("season") == season and item.get("number")]
+        except (TypeError, ValueError, RuntimeError) as exc:
+            print(f"警告: TVMaze 第 {season} 季分集详情查询失败: {exc}", file=sys.stderr)
     return {
         "title": show.get("name"),
         "originalTitle": show.get("name"),
@@ -614,6 +650,7 @@ def fetch_tvmaze(title: str) -> dict:
         "studio": (show.get("network") or show.get("webChannel") or {}).get("name", ""),
         "ids": {"tvmaze": show.get("id"), "imdb": externals.get("imdb"), "tvdb": externals.get("thetvdb")},
         "posterUrl": image.get("original") or image.get("medium") or "",
+        "episodes": episodes,
     }
 
 
@@ -628,12 +665,12 @@ def resolve_metadata(config: dict, args) -> dict:
     metadata_config = config.get("metadata", {})
     if not offline and metadata_config.get("provider") == "tmdb":
         try:
-            fetched = fetch_tmdb(config, args.media_type, query_title, args.year)
+            fetched = fetch_tmdb(config, args.media_type, query_title, args.year, args.season if args.media_type == "tv" else None)
         except Exception as exc:
             print(f"警告: TMDB 元数据查询失败: {exc}", file=sys.stderr)
     if not fetched and not offline and args.media_type == "tv" and metadata_config.get("tvFallback", "tvmaze") == "tvmaze":
         try:
-            fetched = fetch_tvmaze(query_title)
+            fetched = fetch_tvmaze(query_title, args.season)
         except Exception as exc:
             print(f"警告: TVMaze 元数据查询失败: {exc}", file=sys.stderr)
     metadata = {**fetched, **supplied}
@@ -679,6 +716,8 @@ def resolve_metadata(config: dict, args) -> dict:
             for field in ("directors", "writers"):
                 if field in item and not isinstance(item[field], list):
                     raise ValueError(f"metadata.episodes.{field} 必须是数组")
+            if "ids" in item and not isinstance(item["ids"], dict):
+                raise ValueError("metadata.episodes.ids 必须是对象")
             item["season"], item["episode"] = season, episode
         metadata["episodes"] = episodes
     return metadata
@@ -700,7 +739,7 @@ def build_context(config: dict, args) -> dict:
     naming_name, naming = select_naming(config, profile, args.media_type, args.naming)
     base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
     state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (base_root / ".state"))
-    download_root = configured_download_root(config)
+    download_root = None if args.no_deliver else configured_download_root(config)
     if args.no_archive:
         target_name, target_root = ("download", download_root) if download_root is not None else ("work", base_root)
     else:
@@ -1678,8 +1717,9 @@ def write_nfo(ctx: dict, plans: list[dict]) -> None:
                 xml_text(episode_root, "director", director)
             for writer in details.get("writers", []):
                 xml_text(episode_root, "credits", writer)
-            # 单集也写 uniqueid，供 Plex NFO Agent 在跨季同集/改名时稳定匹配
-            for id_type, value in ids.items():
+            # 单集使用分集自身 ID；剧集 ID 只留在 tvshow.nfo，避免把整部剧误标成某一集。
+            episode_ids = details.get("ids", {}) if isinstance(details.get("ids"), dict) else {}
+            for id_type, value in episode_ids.items():
                 if value:
                     ET.SubElement(episode_root, "uniqueid", {"type": str(id_type)}).text = str(value)
             write_xml(plan["output"].with_suffix(".nfo"), episode_root)
@@ -1973,6 +2013,8 @@ def archive(ctx: dict, phase: str = "archiving", action: str = "归档") -> list
 
 def pipeline(args) -> int:
     config = load_config()
+    if args.no_deliver:
+        args.no_archive = True
     if args.copy_original is None:
         args.copy_original = config.get("defaultModes", {}).get(args.media_type, "transcode") == "organize"
     ctx = build_context(config, args)
@@ -2184,7 +2226,7 @@ def command_doctor(_args) -> int:
     for name, source in (config.get("searchSources", {}) or {}).items():
         if isinstance(source, dict) and source.get("type") in {"jackett", "torznab"} and source.get("enabled", True):
             env_name = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
-            checks.append({"name": f"search:{name}", "status": "ok" if os.environ.get(env_name) else "error", "detail": env_name})
+            checks.append({"name": f"search:{name}", "status": "ok" if os.environ.get(env_name) else "optional-missing", "detail": env_name})
     metadata = config.get("metadata", {})
     if metadata.get("provider") == "tmdb":
         env_name = str(metadata.get("apiKeyEnv", "TMDB_API_KEY"))
@@ -2211,6 +2253,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--format", help="yt-dlp format selector (e.g. bv*[height<=720]+ba/b[height<=720])")
     parser.add_argument("--cookies", help="Browser name for --cookies-from-browser (e.g. chrome) or path to a cookies.txt for --cookies")
     parser.add_argument("--no-archive", action="store_true", help="Skip archive transfer; deliver to downloadDir if configured, else keep output in the workspace")
+    parser.add_argument("--no-deliver", action="store_true", help="Do not archive or deliver; keep Plex-ready output in the owned workspace")
     parser.add_argument("--keep-work", action="store_true", help="Keep the download cache/workspace after completion (cleaned by default after delivery/archive)")
     parser.add_argument("--reset-work", action="store_true")
     parser.add_argument("--update-nfo", action="store_true", help="Atomically update existing NFO only; never overwrites media, subtitles, or artwork")
