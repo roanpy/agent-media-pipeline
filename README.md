@@ -22,7 +22,7 @@ It works without a NAS, a media server, Docker, or an `*Arr` stack. Archive targ
 | --- | --- |
 | Agent-guided discovery | Jackett, generic Torznab/Prowlarr, reusable web search templates, and browser-assisted public-source discovery |
 | Multiple acquisition paths | Local files, magnet links, torrent files, HTTP(S) links, and yt-dlp-supported pages including YouTube and Bilibili |
-| Explicit processing choices | TV/movie defaults with per-task `--transcode`, `--no-transcode`, playlist, and archive overrides |
+| Explicit processing choices | TV/movie defaults with per-task `--transcode`, `--no-transcode`, playlist, `--format` (yt-dlp selector), `--cookies` (browser or cookies.txt), and archive overrides |
 | Plex-ready output | Movie and TV naming, NFO, subtitles, poster, fanart, banner, and clear logo assets |
 | Local delivery or archival | Deliver finished Plex folders to `downloadDir`, or preflight and atomically merge/archive them into an existing library target |
 | Safety and recovery | Private configuration, redacted sources, task locks, resumable workspaces, no-clobber archival, SHA-256 checks, safe stop, and mounted-volume checks |

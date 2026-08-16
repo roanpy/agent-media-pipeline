@@ -77,6 +77,10 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
 ./run.sh ingest "Course Name" "PLAYLIST_URL" --type tv --downloader yt-dlp \
   --playlist --season 1 --episode 1 --no-transcode
 
+# Select yt-dlp format (decides whether transcoding is needed) and login for member-only/high-quality content
+./run.sh ingest "Course Name" "PLAYLIST_URL" --type tv --downloader yt-dlp \
+  --playlist --format "bv*[height<=720]+ba/b[height<=720]" --cookies chrome
+
 # Process locally without any target configuration or archive transfer
 ./run.sh ingest "Course Name" "VIDEO_URL" --type tv --downloader yt-dlp \
   --season 1 --episode 1 --no-archive
@@ -119,6 +123,8 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 - Put signed/tokenized URLs in a user-owned regular `0600` `--source-file` rather than a command argument.
 - Playlists are disabled by default. Add `--playlist` only after the user explicitly requests the whole list.
 - For TV playlists without recognizable episode tokens, assign episodes in playlist order starting from `--season` (default 1) and `--episode` (default 1). Confirm ordering first.
+- `--format` passes a yt-dlp format selector (e.g. `bv*[height<=720]+ba/b[height<=720]`) and decides whether the downloaded stream needs transcoding; confirm the user's quality requirement first.
+- `--cookies` takes a browser name for `--cookies-from-browser` (`chrome`, `firefox`, `edge`, `safari`, `brave`, `opera`, `vivaldi`) or a path to a Netscape cookies.txt for `--cookies`. Required for Bilibili 1080P+ and member-only content; without login those streams fail or fall back to lower quality.
 - `--no-archive` needs no library target or NAS. Transcoding/organization, NFO, and artwork still run. With `downloadDir`, output is validated and copied to `downloadDir/<Plex folder>` before the owned cache is removed; `--keep-work` retains it. Without `downloadDir`, the Plex-ready folder remains in the owned workspace for backward compatibility. Status `targetPath` always identifies the final output.
 
 ## Metadata and Plex

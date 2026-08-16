@@ -1229,6 +1229,13 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
         command = ["yt-dlp", "--ignore-config"]
         if ytdlp_supports_no_remote_components():
             command.append("--no-remote-components")
+        if ctx["args"].format:
+            command += ["--format", ctx["args"].format]
+        if ctx["args"].cookies:
+            if re.match(r"^(chrome|chromium|firefox|edge|safari|brave|opera|vivaldi)(:|$)", ctx["args"].cookies, re.IGNORECASE):
+                command += ["--cookies-from-browser", ctx["args"].cookies]
+            else:
+                command += ["--cookies", ctx["args"].cookies]
         command += [
             playlist_flag, "--continue",
             "--no-overwrites", "--newline",
@@ -2008,6 +2015,8 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--season", type=int, default=1)
     parser.add_argument("--episode", type=int)
     parser.add_argument("--playlist", action="store_true", help="Explicitly download a whole YouTube/Bilibili playlist; TV maps episodes in playlist order")
+    parser.add_argument("--format", help="yt-dlp format selector (e.g. bv*[height<=720]+ba/b[height<=720])")
+    parser.add_argument("--cookies", help="Browser name for --cookies-from-browser (e.g. chrome) or path to a cookies.txt for --cookies")
     parser.add_argument("--no-archive", action="store_true", help="Skip archive transfer; deliver to downloadDir if configured, else keep output in the workspace")
     parser.add_argument("--keep-work", action="store_true", help="Keep the download cache/workspace after completion (cleaned by default after delivery/archive)")
     parser.add_argument("--reset-work", action="store_true")
