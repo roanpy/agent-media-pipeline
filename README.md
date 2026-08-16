@@ -44,6 +44,7 @@ git clone https://github.com/roanpy/agent-media-pipeline.git
 cd agent-media-pipeline
 cp config.example.json config.json
 chmod 600 config.json
+./run.sh --version
 ./run.sh doctor
 ```
 
@@ -116,6 +117,7 @@ Transcoding removes inherited global and chapter metadata by default, then relie
 ## Safety and privacy
 
 - Search results expose review fields and candidate IDs, not stored download URLs.
+- `--version`, doctor, dry-run, and task status expose the pipeline version/config schema for stale-install detection.
 - Signed or tokenized URLs can be supplied through a user-owned `0600` file with `--source-file`.
 - `config.json`, runtime state, logs, and caches are Git-ignored; private JSON files are written as `0600`.
 - Existing different files are never overwritten. Matching files are verified before being accepted.

@@ -20,7 +20,7 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
 
 ## Workflow
 
-1. Run `./run.sh doctor`. Confirm FFmpeg/FFprobe, the required downloader, and `download:output` when using local delivery. Archive targets are optional; an unused missing target may remain `unavailable`.
+1. Run `./run.sh --version`, then `./run.sh doctor`. Record the pipeline version/config schema and confirm FFmpeg/FFprobe, the required downloader, and `download:output` when using local delivery. Archive targets are optional; an unused missing target may remain `unavailable`.
 2. Establish media type, verified title/year, playlist scope, transcode mode, local-delivery/archive choice and target, profile, naming preset, and quality requirements.
    - Run `profiles` to inspect `defaultModes.tv|movie`.
    - If the user says “use the default,” apply it directly.
@@ -54,6 +54,7 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
 
 ```bash
 # Diagnose and inspect configuration
+./run.sh --version
 ./run.sh doctor
 ./run.sh profiles
 ./run.sh sources
@@ -150,5 +151,7 @@ For TV runs, the pipeline logs a `缺集提醒` after metadata when the covered 
 Environment overrides include `MEDIA_DOWNLOADER_CONFIG`, `MEDIA_DOWNLOADER_BASE_DIR`, `MEDIA_DOWNLOADER_STATE_DIR`, `MEDIA_DOWNLOADER_DOWNLOAD_DIR`, `MEDIA_DOWNLOADER_TARGET_DIR`, and `MEDIA_DOWNLOADER_OFFLINE=1`.
 
 `stateDir` stores task locks and per-task logs. Global `status.json` and `candidates.json` default to `.runtime/` and can be overridden with `MEDIA_DOWNLOADER_STATUS_FILE` / `MEDIA_DOWNLOADER_CANDIDATE_FILE`.
+
+`--version`, doctor JSON, dry-run plans, and task status expose the pipeline version and configuration schema so an agent can detect stale installations before execution.
 
 After code or configuration changes, run `./scripts/smoke-test.sh`.

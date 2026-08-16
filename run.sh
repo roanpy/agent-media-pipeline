@@ -12,7 +12,7 @@ fi
 foreground=false
 for argument in "$@"; do
     case "$argument" in
-        --foreground|--dry-run|-h|--help) foreground=true ;;
+        --foreground|--dry-run|--version|-h|--help) foreground=true ;;
     esac
 done
 

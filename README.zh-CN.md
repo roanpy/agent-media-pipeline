@@ -44,6 +44,7 @@ git clone https://github.com/roanpy/agent-media-pipeline.git
 cd agent-media-pipeline
 cp config.example.json config.json
 chmod 600 config.json
+./run.sh --version
 ./run.sh doctor
 ```
 
@@ -116,6 +117,7 @@ brew install ffmpeg aria2 yt-dlp
 ## 安全与隐私
 
 - 搜索结果仅公开审查字段和候选 ID，不公开缓存的下载 URL。
+- `--version`、doctor、dry-run 和任务状态都会提供程序版本及配置 schema，供 Agent 执行前识别旧副本。
 - 带签名或 token 的 URL 通过当前用户拥有的 `0600` 文件配合 `--source-file` 传入。
 - `config.json`、运行状态、日志和缓存都被 Git 忽略；私有 JSON 文件按 `0600` 写入。
 - 已存在且内容不同的目标文件永不覆盖。

@@ -29,6 +29,8 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
+VERSION = "0.2.0"
+CONFIG_SCHEMA_VERSION = 1
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
@@ -1770,6 +1772,7 @@ def pipeline(args) -> int:
     ctx = build_context(config, args)
     source, requested_downloader = resolve_source(args)
     plan = {
+        "version": VERSION, "configSchemaVersion": CONFIG_SCHEMA_VERSION,
         "taskId": ctx["id"], "title": ctx["canonical"], "mediaType": ctx["mediaType"],
         "requestedTitle": args.title,
         "profile": ctx["profileName"], "target": ctx["targetName"],
@@ -1968,7 +1971,7 @@ def command_doctor(_args) -> int:
     if metadata.get("provider") == "tmdb":
         env_name = str(metadata.get("apiKeyEnv", "TMDB_API_KEY"))
         checks.append({"name": "metadata:tmdb", "status": "ok" if os.environ.get(env_name) else "optional-missing", "detail": env_name})
-    print(json.dumps({"config": str(config_file()), "checks": checks}, ensure_ascii=False, indent=2))
+    print(json.dumps({"version": VERSION, "configSchemaVersion": CONFIG_SCHEMA_VERSION, "config": str(config_file()), "checks": checks}, ensure_ascii=False, indent=2))
     return 1 if any(item["status"] == "error" for item in checks) else 0
 
 
@@ -2003,6 +2006,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Agent media ingest pipeline")
+    root.add_argument("--version", action="version", version=f"Agent Media Pipeline {VERSION} (config schema {CONFIG_SCHEMA_VERSION})")
     commands = root.add_subparsers(dest="command", required=True)
     search = commands.add_parser("search", help="Search configured structured sources and cache candidates")
     search.add_argument("query")

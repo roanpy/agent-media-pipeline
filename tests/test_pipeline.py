@@ -429,6 +429,8 @@ def assert_path_and_naming_guards(module, root: Path):
 def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
+        version = run([sys.executable, str(SCRIPT), "--version"])
+        assert version.stdout.strip() == "Agent Media Pipeline 0.2.0 (config schema 1)"
         module = assert_atomic_copy_never_overwrites(root)
         assert_path_and_naming_guards(module, root)
         assert_tmdb_auth_modes()
@@ -465,7 +467,10 @@ def main():
 
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
-            checks = {item["name"]: item["status"] for item in json.loads(doctor.stdout)["checks"]}
+            doctor_payload = json.loads(doctor.stdout)
+            assert doctor_payload["version"] == "0.2.0"
+            assert doctor_payload["configSchemaVersion"] == 1
+            checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
             assert checks["work:state"] == "ok"
             assert checks["target:tv"] == "ok"
@@ -547,6 +552,7 @@ def main():
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
+            assert delivery_plan["version"] == "0.2.0" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
