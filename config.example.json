@@ -76,6 +76,30 @@
       "audioBitrate": "256k",
       "preset": "medium",
       "naming": "plex"
+    },
+    "movie1080-mkv": {
+      "type": "movie",
+      "label": "Movie 1080p H.264 MKV (keeps embedded subtitles)",
+      "container": "mkv",
+      "resolution": 1080,
+      "videoCodec": "libx264",
+      "crf": 18,
+      "audioCodec": "aac",
+      "audioBitrate": "256k",
+      "preset": "medium",
+      "naming": "plex"
+    },
+    "tv1080-mkv": {
+      "type": "tv",
+      "label": "TV 1080p H.264 MKV (keeps embedded subtitles)",
+      "container": "mkv",
+      "resolution": 1080,
+      "videoCodec": "libx264",
+      "crf": 20,
+      "audioCodec": "aac",
+      "audioBitrate": "192k",
+      "preset": "medium",
+      "naming": "plex"
     }
   },
   "searchSources": {

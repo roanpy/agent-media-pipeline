@@ -44,6 +44,22 @@ def make_video(path: Path, seconds: int = 3):
     ])
 
 
+def make_subtitled_video(path: Path, seconds: int = 3):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subtitle = path.with_name(f".{path.stem}.srt")
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:02,000\n保留字幕\n", encoding="utf-8")
+    run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12",
+        "-f", "lavfi", "-i", "sine=frequency=1000",
+        "-i", str(subtitle),
+        "-t", str(seconds), "-map", "0:v", "-map", "1:a", "-map", "2:s",
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-c:s", "srt",
+        str(path),
+    ])
+    subtitle.unlink()
+
+
 def make_image(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=80x120", "-frames:v", "1", str(path)])
@@ -116,6 +132,7 @@ def config(root: Path, port: int) -> Path:
         "profiles": {
             "tv": {"type": "tv", "container": "mp4", "resolution": 90, "videoCodec": "libx264", "crf": 28, "audioCodec": "aac", "audioBitrate": "64k", "preset": "ultrafast", "target": "tv"},
             "movie": {"type": "movie", "container": "mp4", "resolution": 90, "videoCodec": "libx264", "crf": 28, "audioCodec": "aac", "audioBitrate": "64k", "preset": "ultrafast", "target": "movie"},
+            "movie-mkv": {"type": "movie", "container": "mkv", "resolution": 90, "videoCodec": "libx264", "crf": 28, "audioCodec": "aac", "audioBitrate": "64k", "preset": "ultrafast", "target": "movie"},
         },
         "searchSources": {
             "jackett": {"type": "jackett", "enabled": True, "url": f"http://127.0.0.1:{port}", "indexer": "all", "apiKeyEnv": "TEST_JACKETT_KEY"},
@@ -239,6 +256,7 @@ def assert_tmdb_auth_modes():
             return {"episodes": [{
                 "id": 999, "season_number": 2, "episode_number": 3, "name": "第三集",
                 "overview": "剧情", "air_date": "2020-01-03", "runtime": 45, "vote_average": 8.2,
+                "still_path": "/stub-still.jpg",
             }]}
         return {"id": 42, "name": "Stub", "first_air_date": "2020-01-01"}
 
@@ -255,6 +273,7 @@ def assert_tmdb_auth_modes():
         assert calls[2][2].get("Authorization") == "Bearer eyJhbGciOiJIUzI1NiJ9.stub.sig", calls
         assert fetched["episodes"][0]["title"] == "第三集"
         assert fetched["episodes"][0]["ids"]["tmdb"] == 999
+        assert fetched["episodes"][0]["thumbUrl"].endswith("/stub-still.jpg")
         calls.clear()
         # v3 key 保持 api_key 参数，不带 Authorization header
         os.environ["TEST_TMDB_AUTH_KEY"] = "v3-api-key-123"
@@ -313,6 +332,11 @@ def assert_path_and_naming_guards(module, root: Path):
     command = module.ffmpeg_command({"profile": {"container": "mp4", "videoCodec": "libx264", "audioCodec": "aac", "resolution": 720}}, Path("input.mkv"), Path("output.mp4"))
     assert command[command.index("-map_metadata") + 1] == "-1"
     assert command[command.index("-map_chapters") + 1] == "-1"
+    assert "-sn" in command and "-c:s" not in command
+    mkv_command = module.ffmpeg_command({"profile": {"container": "mkv", "videoCodec": "libx264", "audioCodec": "aac", "resolution": 720}}, Path("input.mkv"), Path("output.mkv"))
+    assert "-sn" not in mkv_command
+    assert mkv_command[mkv_command.index("0:s?") - 1] == "-map"
+    assert mkv_command[mkv_command.index("-c:s") + 1] == "copy"
     playlist_args = type("Args", (), {"copy_original": True, "season": 3, "episode": 5, "playlist": True})()
     playlist_root = root / "playlist"
     playlist_root.mkdir()
@@ -411,6 +435,13 @@ def assert_path_and_naming_guards(module, root: Path):
         assert "--format 无效" in str(exc)
     else:
         raise AssertionError("yt-dlp format control characters must be rejected")
+    try:
+        module.validate_subtitle_languages("zh-CN,en")
+        module.validate_subtitle_languages("zh-CN\n--exec=x")
+    except ValueError as exc:
+        assert "字幕语言代码无效" in str(exc)
+    else:
+        raise AssertionError("invalid subtitle language codes must be rejected")
     playlist_probe = module.probe_summary({"id": "p", "title": "Playlist", "entries": [
         {"id": "a", "title": "One", "playlist_index": 1},
         {"id": "b", "title": "Two", "playlist_index": 2},
@@ -434,7 +465,7 @@ def assert_path_and_naming_guards(module, root: Path):
             "sourceRoot": web_source,
             "workRoot": web_work,
             "config": {"timeoutHours": 1},
-            "args": type("Args", (), {"playlist": True, "format": "bv*[height<=720]+ba/b", "cookies": "chrome"})(),
+            "args": type("Args", (), {"playlist": True, "format": "bv*[height<=720]+ba/b", "cookies": "chrome", "write_subs": True, "sub_langs": "zh-CN,en"})(),
         }, "https://example.test/playlist", "yt-dlp")
         assert acquired == [web_media]
         command = captured[0]
@@ -442,6 +473,9 @@ def assert_path_and_naming_guards(module, root: Path):
         assert command[command.index("--format") + 1] == "bv*[height<=720]+ba/b", command
         assert command[command.index("--cookies-from-browser") + 1] == "chrome", command
         assert "--yes-playlist" in command
+        assert "--write-subs" in command and "--write-auto-subs" in command
+        assert command[command.index("--sub-format") + 1] == "srt/best"
+        assert command[command.index("--sub-langs") + 1] == "zh-CN,en"
     finally:
         module.log, module.run_child = original_log, original_run_child
         module.shutil.which, module.ytdlp_supports_no_remote_components = original_which, original_remote_check
@@ -556,7 +590,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.3.0 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.0 (config schema 1)"
         module = assert_atomic_copy_never_overwrites(root)
         assert_path_and_naming_guards(module, root)
         assert_tmdb_auth_modes()
@@ -566,6 +600,7 @@ def main():
         make_video(root / "source" / "Film.mkv")
         make_video(root / "source" / "Organize.Show.S04E05.mkv")
         make_video(root / "source" / "Organize.Movie.mkv")
+        make_subtitled_video(root / "source" / "Subtitled.Movie.mkv")
         make_video(root / "http" / "Remote.S01E01.mp4")
         make_image(root / "source" / "poster.png")
         (root / "source" / "Example.S02E03.zh.forced.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
@@ -594,7 +629,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.3.0"
+            assert doctor_payload["version"] == "0.4.0"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -683,7 +718,7 @@ def main():
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
-            assert delivery_plan["version"] == "0.3.0" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.0" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
@@ -897,7 +932,10 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             titled_metadata = root / "titled-metadata.json"
             titled_metadata.write_text(json.dumps({
                 "title": "标题剧", "year": 2026,
-                "episodes": [{"season": 2, "episode": 3, "title": "可靠的单集标题", "ids": {"tmdb": 1003}}],
+                "episodes": [{
+                    "season": 2, "episode": 3, "title": "可靠的单集标题", "ids": {"tmdb": 1003},
+                    "thumbPath": str(root / "source" / "poster.png"),
+                }],
             }, ensure_ascii=False), encoding="utf-8")
             titled_command = [
                 sys.executable, str(SCRIPT), "organize", "标题剧", str(root / "source" / "Example.S02E03.mkv"),
@@ -909,6 +947,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert titled_episode.is_file()
             assert_xml(titled_episode.with_suffix(".nfo"), "<title>可靠的单集标题</title>")
             assert_xml(titled_episode.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">1003</uniqueid>")
+            assert titled_episode.with_name(f"{titled_episode.stem}-thumb.jpg").is_file()
 
             # 存量库修复默认只预览；仅可靠标题改名，Season 0/字幕/NFO 一起处理，未知标题保留原名。
             repair_library = root / "repair-library"
@@ -1010,6 +1049,15 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert organized_movie.read_bytes() == organize_movie_source.read_bytes()
             assert (organized_movie.parent / "movie.nfo").is_file()
             assert not organized_movie.with_suffix(".mp4").exists()
+
+            # MKV 转码保留原有内嵌字幕流；MP4 转码仍按兼容性丢弃内嵌字幕（外挂字幕不受影响）。
+            run([sys.executable, str(SCRIPT), "adopt", "带字幕电影", str(root / "source" / "Subtitled.Movie.mkv"), "--type", "movie", "--profile", "movie-mkv", "--target", "movie", "--offline"], env=env)
+            mkv_movie = root / "movie" / "带字幕电影" / "带字幕电影.mkv"
+            assert mkv_movie.is_file()
+            subtitle_probe = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(mkv_movie)])
+            assert "subtitle" in subtitle_probe.stdout, subtitle_probe.stdout
+            local_subs = run([sys.executable, str(SCRIPT), "adopt", "字幕本地", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--write-subs", "--offline"], env=env, expect=1)
+            assert "--write-subs 只适用于" in local_subs.stderr
 
             source_conflict = root / "source" / "Conflict.S01E01.mkv"
             make_video(source_conflict)

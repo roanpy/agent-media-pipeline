@@ -23,7 +23,7 @@ It works without a NAS, a media server, Docker, or an `*Arr` stack. Archive targ
 | Agent-guided discovery | Jackett, generic Torznab/Prowlarr, reusable web search templates, and browser-assisted public-source discovery |
 | Multiple acquisition paths | Local files, magnet links, torrent files, HTTP(S) links, and yt-dlp-supported pages including YouTube and Bilibili |
 | Explicit processing choices | TV/movie defaults with per-task transcode, organize, playlist, source-quality, authenticated-session, and archive overrides |
-| Plex-ready output | Movie and TV naming (including optional episode titles), per-show/per-episode NFO, subtitles, poster, fanart, banner, and clear logo assets |
+| Plex-ready output | Movie and TV naming (including optional episode titles), per-show/per-episode NFO, subtitles, episode thumbnails, poster, fanart, banner, and clear logo assets |
 | Safe existing-library repair | Preview one show's folder, then repair episode names and per-episode NFO from reliable metadata without clobbering conflicts |
 | Local delivery or archival | Deliver finished Plex folders to `downloadDir`, or preflight and atomically merge/archive them into an existing library target |
 | Safety and recovery | Private configuration, redacted sources, task locks, resumable workspaces, no-clobber archival, SHA-256 checks, safe stop, and mounted-volume checks |
@@ -117,6 +117,10 @@ Secrets stay in environment variables such as `TMDB_API_KEY`, `JACKETT_API_KEY`,
 ./run.sh adopt "Show Name" "/path/to/Show.S01E01.mkv" \
   --type tv --transcode --target tv-library --merge
 
+# Download provider subtitles with a web playlist when the source offers them
+./run.sh ingest "Course Name" "PLAYLIST_URL" --type tv --downloader yt-dlp \
+  --playlist --write-subs --sub-langs "zh-CN,en"
+
 # Preserve the original container and organize only
 ./run.sh organize "Movie Name" "/path/to/Movie.mkv" \
   --type movie --target movie-library
@@ -130,7 +134,11 @@ Secrets stay in environment variables such as `TMDB_API_KEY`, `JACKETT_API_KEY`,
 
 Transcoding removes inherited global and chapter metadata by default, then relies on normalized filenames, NFO, and local artwork. Organize/no-transcode mode preserves the media bytes and therefore does not alter embedded metadata.
 
+The default transcode container comes from the profile that `defaultProfiles.tv|movie` selects (MP4 in the example). A profile with `container: "mkv"` keeps the source's embedded subtitle streams unchanged during transcode (no re-encode); MP4 still drops embedded subtitles for compatibility, while same-stem external subtitle files survive both modes. The example includes `movie1080-mkv` and `tv1080-mkv` profiles for explicit or default use.
+
 For yt-dlp sources, omit `--format` for the best available streams or set a ceiling such as `--format "bv*[height<=720]+ba/b[height<=720]"`. This controls source selection only. The default transcode profile determines the final MP4 output; `--no-transcode` preserves yt-dlp's downloaded codecs and container. Playlists and Bilibili multi-part collections require `--type tv --playlist` and are mapped in confirmed playlist order from `--season`/`--episode`.
+
+`--write-subs` is valid only for yt-dlp sources. It downloads manual/auto external subtitle tracks, prefers `srt`, and carries them through organize/transcode as same-stem sidecar files; sources without subtitles are skipped silently. `--sub-langs` takes comma-separated codes (e.g. `zh-CN,en`) and defaults to the metadata language or `zh-CN`. No third-party subtitle provider is contacted.
 
 The default Plex TV template appends a verified per-episode title when available: `Show - S01E03 - Episode title.ext`. With no reliable title it keeps `Show - S01E03.ext`. The same title and episode-specific provider ID are written to the sibling episode NFO; `tvshow.nfo` remains show-level and does not embed the episode catalogue. TMDB, TVMaze fallback, Jackett, and Prowlarr are optional; missing credentials do not block direct/local/web ingest.
 
@@ -153,6 +161,8 @@ The default Plex TV template appends a verified per-episode title when available
 ## Plex compatibility
 
 The default naming preset follows Plex's recommended movie and season/episode layout. Local assets include `poster`, `fanart`, `banner`, and `clearlogo`; movie, show, and episode NFO files are generated for the Plex NFO Agent. The official NFO Agent requires Plex Media Server 1.43.1 or newer. Enable local assets in the Plex library settings when using local artwork.
+
+Episode thumbnails use the Plex/Kodi `-thumb.jpg` convention: an agent-supplied `thumbPath`/`thumbUrl` takes precedence, then TMDB's episode `still_path`. A missing episode still is only a warning and never fails a task.
 
 Ordinary channel uploads, clips, and unmatched web videos may fit a separate Plex “Other Videos” library better than a movie or TV library. This project does not automatically disguise arbitrary web content as catalogued film or television.
 

@@ -29,7 +29,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 CONFIG_SCHEMA_VERSION = 1
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
@@ -590,6 +590,7 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None, seas
                     "directors": [person.get("name") for person in episode_crew if person.get("job") == "Director" and person.get("name")],
                     "writers": [person.get("name") for person in episode_crew if person.get("department") == "Writing" and person.get("name")],
                     "ids": {"tmdb": episode.get("id")},
+                    "thumbUrl": f"https://image.tmdb.org/t/p/original{episode.get('still_path')}" if episode.get("still_path") else "",
                 })
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             print(f"警告: TMDB 第 {season} 季分集详情查询失败: {exc}", file=sys.stderr)
@@ -1075,6 +1076,14 @@ def validate_ytdlp_format(value: str | None) -> str | None:
     return value
 
 
+def validate_subtitle_languages(value: str) -> str:
+    codes = [item.strip() for item in str(value).split(",") if item.strip()]
+    for code in codes:
+        if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*", code):
+            raise ValueError(f"字幕语言代码无效: {code}")
+    return ",".join(codes)
+
+
 def probe_summary(data: dict, playlist: bool) -> dict:
     if playlist:
         entries = data.get("entries") if isinstance(data.get("entries"), list) else []
@@ -1416,6 +1425,18 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
         selected_format = validate_ytdlp_format(ctx["args"].format)
         if selected_format:
             command += ["--format", selected_format]
+        if ctx["args"].write_subs:
+            language = (
+                ctx["args"].sub_langs
+                or ctx["config"].get("metadata", {}).get("subtitleLanguages")
+                or ctx["config"].get("metadata", {}).get("language")
+                or "zh-CN"
+            )
+            command += [
+                "--write-subs", "--write-auto-subs",
+                "--sub-format", "srt/best",
+                "--sub-langs", validate_subtitle_languages(language),
+            ]
         command += [
             playlist_flag, "--continue",
             "--no-overwrites", "--newline",
@@ -1565,7 +1586,12 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path) -> list[str]:
     profile = ctx["profile"]
     codec = str(profile.get("videoCodec", "libx264"))
     audio_codec = str(profile.get("audioCodec", "aac"))
-    command = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-dn", "-sn"]
+    command = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-dn"]
+    if profile["container"] == "mkv":
+        # MKV 支持字幕流原样保留（不重编码）；MP4 兼容性差，继续丢弃内嵌字幕，外挂字幕由 copy_sidecars 保留。
+        command += ["-map", "0:s?", "-c:s", "copy"]
+    else:
+        command += ["-sn"]
     if codec == "copy":
         command += ["-c:v", "copy"]
     else:
@@ -1811,6 +1837,19 @@ def write_artwork(ctx: dict, plans: list[dict]) -> None:
             if required and kind == "poster":
                 raise
             log(ctx, f"警告: {kind} 获取失败: {exc}")
+    # Plex/Kodi 单集缩略图：优先 metadata 提供的 thumbPath/thumbUrl，其次 TMDB 分集 still_path（thumbUrl）。
+    if ctx["mediaType"] == "tv":
+        for plan in plans:
+            details = episode_metadata(metadata, plan["season"], plan["episode"])
+            thumb = details.get("thumbPath") or details.get("thumbUrl")
+            if not thumb:
+                continue
+            try:
+                download_image(str(thumb), plan["output"].parent / f"{plan['output'].stem}-thumb.jpg", ctx)
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                log(ctx, f"警告: S{plan['season']:02d}E{plan['episode']:02d} 剧照获取失败: {exc}")
 
 
 def missing_episode_report(ctx: dict, plans: list[dict]) -> str | None:
@@ -2247,8 +2286,8 @@ def pipeline(args) -> int:
     downloader = classify_downloader(source, requested_downloader)
     if args.playlist and args.media_type != "tv":
         raise RuntimeError("--playlist 必须使用 --type tv，才能按播放顺序映射季集")
-    if (args.format or args.cookies) and downloader != "yt-dlp":
-        raise RuntimeError("--format/--cookies 只适用于 yt-dlp 网页来源")
+    if (args.format or args.cookies or args.write_subs) and downloader != "yt-dlp":
+        raise RuntimeError("--format/--cookies/--write-subs 只适用于 yt-dlp 网页来源")
     if downloader == "yt-dlp":
         validate_ytdlp_format(args.format)
         ytdlp_auth_args(args.cookies)
@@ -2263,6 +2302,7 @@ def pipeline(args) -> int:
         "merge": args.merge,
         "playlist": args.playlist,
         "format": args.format or "best available",
+        "subs": bool(args.write_subs),
         "authenticated": bool(args.cookies),
         "downloader": downloader,
         "targetPath": str(ctx["targetShow"]), "source": redacted_source(source),
@@ -2477,6 +2517,8 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--playlist", action="store_true", help="Explicitly download a whole YouTube/Bilibili playlist; TV maps episodes in playlist order")
     parser.add_argument("--format", help="yt-dlp format selector (e.g. bv*[height<=720]+ba/b[height<=720])")
     parser.add_argument("--cookies", help="Browser name for --cookies-from-browser (e.g. chrome) or path to a cookies.txt for --cookies")
+    parser.add_argument("--write-subs", action="store_true", help="Download external subtitles when the yt-dlp source provides them; unavailable subtitles are skipped")
+    parser.add_argument("--sub-langs", help="Comma-separated subtitle language codes (e.g. zh-CN,en); defaults to the metadata language or zh-CN")
     parser.add_argument("--no-archive", action="store_true", help="Skip archive transfer; deliver to downloadDir if configured, else keep output in the workspace")
     parser.add_argument("--no-deliver", action="store_true", help="Do not archive or deliver; keep Plex-ready output in the owned workspace")
     parser.add_argument("--keep-work", action="store_true", help="Keep the download cache/workspace after completion (cleaned by default after delivery/archive)")

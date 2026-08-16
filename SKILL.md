@@ -35,6 +35,7 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
 4. Compare title, season/episode, year, resolution, codec, size, publication time, seeders, and source trust. Do not select by seed count alone.
 5. After authorization, run `ingest`. Use `--candidate` for cached structured results and a URL for web/direct sources.
    - For YouTube/Bilibili, issue one `ingest --playlist` command. Never run raw yt-dlp and then manually schedule `adopt`; the pipeline must continue through processing, NFO/artwork, delivery/archive, and cleanup under one task/status record.
+   - Add `--write-subs` (optionally `--sub-langs "zh-CN,en"`) only for yt-dlp web sources that provide subtitles. Unavailable subtitle tracks are skipped; no third-party subtitle service is contacted.
    - A TV file without a season/episode token requires explicit `--season`/`--episode`.
    - Split unsupported multi-episode files before processing.
    - When separate tasks add episodes to the same existing TV show, use `--merge`. It keeps existing different show-level artwork and `tvshow.nfo`, but still rejects different media, subtitles, and episode NFO files.
@@ -86,6 +87,10 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
 # Select source quality and use the user's authorized browser session when the site requires login
 ./run.sh ingest "Course Name" "PLAYLIST_URL" --type tv --downloader yt-dlp \
   --playlist --format "bv*[height<=720]+ba/b[height<=720]" --cookies chrome
+
+# Download provider subtitles with a web playlist when the source offers them
+./run.sh ingest "Course Name" "PLAYLIST_URL" --type tv --downloader yt-dlp \
+  --playlist --write-subs --sub-langs "zh-CN,en"
 
 # Process locally without any target configuration or archive transfer
 ./run.sh ingest "Course Name" "VIDEO_URL" --type tv --downloader yt-dlp \
@@ -143,6 +148,7 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 - Omit `--format` for yt-dlp's best available selection. Use a selector such as `bv*[height<=720]+ba/b[height<=720]` for a ceiling, or exact format IDs reported by `probe`. A source selector does not decide pipeline transcoding.
 - Default `transcode` profiles produce final MP4 regardless of the downloaded container. `--no-transcode` preserves the downloaded codecs/container; if MP4 is mandatory, use the MP4 transcode profile rather than assuming a web source provides MP4.
 - `--cookies` takes a supported browser spec (`chrome`, `firefox`, `edge`, `safari`, `brave`, `chromium`, `opera`, `vivaldi`, `whale`) or a current-user-owned `0600` Netscape cookies.txt path. Use it only for the user's authorized session when YouTube bot checks or Bilibili login/quality restrictions require authentication. Do not export, log, copy, or commit cookies, and do not attempt to bypass DRM, CAPTCHA, membership, or regional controls.
+- `--write-subs` downloads external manual/auto subtitle tracks with the yt-dlp media, prefers `srt`, and carries them through organize/transcode as same-stem sidecar files. `--sub-langs` takes comma-separated codes and defaults to the metadata language or `zh-CN`. No subtitles are ever fetched from third-party subtitle providers, so a source without subtitle tracks simply stays unsubtitled.
 - `--no-archive` needs no library target or NAS. Transcoding/organization, NFO, and artwork still run. With `downloadDir`, output is validated and copied to `downloadDir/<Plex folder>` before the owned cache is removed; `--keep-work` retains it. Without `downloadDir`, the Plex-ready folder remains in the owned workspace for backward compatibility. Status `targetPath` always identifies the final output.
 - `--no-deliver` implies `--no-archive`, ignores configured `downloadDir` for that task, and retains the Plex-ready folder/workspace. Use it only when the user explicitly wants no transfer and no cleanup of that task workspace.
 
@@ -152,6 +158,8 @@ Try TMDB through `TMDB_API_KEY`; TV may fall back to TVMaze. Both providers are 
 
 Supported root artwork names are `poster`, `fanart`, `banner`, and `clearlogo`. With no TMDB key, still generate minimal valid NFO. If `metadata.requireArtwork=true` but neither a key nor supplied poster exists, warn and downgrade artwork to optional.
 
+Per-episode thumbnails use the Plex/Kodi `-thumb.jpg` convention. The pipeline prefers an agent-supplied `thumbPath`/`thumbUrl` on the episode record, then TMDB's episode `still_path`. A missing episode still is a warning only and never fails a task.
+
 For TV, the Plex preset may use `{episodeTitleSuffix}`. When a matched metadata episode (or an explicitly confirmed web-playlist item) has a title, name it `Show - S01E03 - Episode title.ext`; otherwise keep `Show - S01E03.ext`. Write that same title to the sibling episode NFO. Keep `tvshow.nfo` show-level only; never duplicate the whole episode catalogue into it.
 
 `repair` uses the same rule for existing libraries: no reliable episode title means no rename. It supports Season 0, moves same-stem subtitles/images/NFO with the episode, refuses duplicate SxxEyy media and existing destinations, and copies plus verifies every new path before removing an old path. It does not remove empty legacy directories. Multi-episode files such as `S01E01-E02` remain intentionally unsupported; split them before ingest or repair.
@@ -160,13 +168,15 @@ Verified `metadata.title` controls canonical naming and task identity while stat
 
 Transcoding defaults to MP4 profiles and removes inherited global and chapter metadata. Normalized filenames, NFO, and artwork carry library metadata. `--no-transcode` promises byte-preserving media organization and therefore does not alter embedded metadata.
 
+When a profile uses `container: "mkv"`, transcoding keeps the source's embedded subtitle streams unchanged (`-c:s copy`). MP4 containers still drop embedded subtitles for compatibility; same-stem external subtitle files always survive both modes. The default container is whatever the configured default profile declares; nothing forces MP4.
+
 ## Configuration
 
 Run `cp config.example.json config.json && chmod 600 config.json`. The example uses `$HOME/MediaDownloader`, delivers `--no-archive` output to `$HOME/MediaDownloader/Incoming`, defines no archive targets, and requires no NAS.
 
 - `searchSources`: optional Jackett, generic Torznab/Prowlarr, or web templates; `apiKeyEnv` names an environment variable. Missing keys appear as `optional-missing` in doctor and fail only when that source is actually searched.
 - `btStopTimeoutSeconds`: aria2 sustained-zero-traffic limit; default `600`, set `0` only to disable it deliberately.
-- `profiles`: container, resolution, codec, CRF/bitrate, optional target, and naming. Default profiles produce MP4.
+- `profiles`: container, resolution, codec, CRF/bitrate, optional target, and naming. The example defaults produce MP4; `mkv` profiles also preserve embedded subtitle streams during transcode.
 - `defaultProfiles.tv|movie`: default compression profiles.
 - `defaultModes.tv|movie`: `transcode` or `organize`; omitted values remain backward-compatible as `transcode`.
 - `downloadDir`: final local destination for `--no-archive`; it is created when its parent is writable, may equal or sit inside `baseDir`, but must never sit inside `.media-downloader-work`.

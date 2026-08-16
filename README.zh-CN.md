@@ -23,7 +23,7 @@
 | Agent 辅助发现 | Jackett、通用 Torznab/Prowlarr、可复用网页搜索模板，以及浏览器辅助的公开来源发现 |
 | 多种获取方式 | 本地文件、magnet、torrent 文件、HTTP(S) 链接，以及 YouTube/Bilibili 等 yt-dlp 支持的网站 |
 | 明确的处理选择 | TV/电影默认模式，以及逐任务转码、免转码、播放列表、来源质量、登录会话和归档开关 |
-| Plex 友好输出 | 电影/剧集命名（可带可靠单集标题）、剧集级/单集级 NFO、字幕、海报、背景图、横幅和透明 Logo |
+| Plex 友好输出 | 电影/剧集命名（可带可靠单集标题）、剧集级/单集级 NFO、字幕、单集剧照、海报、背景图、横幅和透明 Logo |
 | 存量库安全修复 | 对单部剧目录先预览、再按可靠分集标题修复文件名和单集 NFO；不覆盖冲突文件 |
 | 本地交付或归档 | 成品可交付到 `downloadDir`，也可预检后增量合并/原子归档到已有媒体库目标 |
 | 安全与恢复 | 私有配置、来源脱敏、任务锁、失败工作区恢复、防覆盖、SHA-256、停止和挂载检查 |
@@ -117,6 +117,10 @@ brew install ffmpeg aria2 yt-dlp
 ./run.sh adopt "剧名" "/path/to/Show.S01E01.mkv" \
   --type tv --transcode --target tv-library --merge
 
+# 网页来源提供字幕时，随播放列表一起下载外挂字幕
+./run.sh ingest "课程名称" "PLAYLIST_URL" --type tv --downloader yt-dlp \
+  --playlist --write-subs --sub-langs "zh-CN,en"
+
 # 保留原容器，只整理和归档
 ./run.sh organize "电影名" "/path/to/Movie.mkv" \
   --type movie --target movie-library
@@ -130,7 +134,11 @@ brew install ffmpeg aria2 yt-dlp
 
 转码默认清理继承的全局和章节内嵌元数据，再由规范文件名、NFO 和本地图片提供 Plex 资料。免转码整理保持媒体字节不变，因此不会修改内嵌元数据。
 
+默认转换容器由 `defaultProfiles.tv|movie` 指向的 profile 决定（示例为 MP4）。使用 `container: "mkv"` 的 profile 转码时会原样保留源的内嵌字幕流（不重编码）；MP4 为兼容性仍丢弃内嵌字幕，同名字幕文件在两种模式下都会跟随。示例配置提供 `movie1080-mkv`、`tv1080-mkv` 可直接指定或设为默认。
+
 yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时可使用 `--format "bv*[height<=720]+ba/b[height<=720]"`。它只控制下载源，不决定流水线是否转码：默认转码 profile 决定最终 MP4，`--no-transcode` 则保留 yt-dlp 下载后的编码和容器。播放列表及 Bilibili 分 P/合集必须使用 `--type tv --playlist`，并在核实顺序后从 `--season`/`--episode` 开始映射。
+
+`--write-subs` 只对 yt-dlp 来源生效：优先下载 `srt` 格式的手动/自动外挂字幕并随媒体一起整理，源没有字幕时静默跳过；`--sub-langs` 用逗号分隔语言代码（如 `zh-CN,en`），默认取元数据语言或 `zh-CN`。项目不接入任何第三方字幕库。
 
 默认 Plex 电视剧模板在取得可靠单集标题时命名为 `剧名 - S01E03 - 单集标题.ext`；没有标题则保持 `剧名 - S01E03.ext`。同一个标题和该集自己的来源 ID 写入单集 NFO；`tvshow.nfo` 只保存整部剧资料，不重复塞入全季集数清单。TMDB、TVMaze fallback、Jackett 和 Prowlarr 都是可选项，缺少凭据不会阻塞直链、本地文件或网页媒体主流程。
 
@@ -153,6 +161,8 @@ yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时�
 ## Plex 兼容性
 
 默认命名 preset 遵循 Plex 推荐的电影目录和电视剧季/集结构。本地资源包括 `poster`、`fanart`、`banner` 和 `clearlogo`；同时生成电影、剧集和单集 NFO，供 Plex NFO Agent 使用。官方 NFO Agent 要求 Plex Media Server 1.43.1 或更高版本。使用本地图片时需在 Plex 媒体库设置中启用本地资源。
+
+每集剧照按 Plex/Kodi 惯例写为 `剧集文件名-thumb.jpg`：优先使用 Agent 提供的 `thumbPath`/`thumbUrl`，其次用 TMDB 分集 `still_path`；缺失剧照只告警，不阻塞任务。
 
 普通频道视频、短片或无法匹配影视数据库的网络内容，通常更适合独立的 Plex “Other Videos” 库。本项目不会自动把任意网页视频伪装成正式电影或电视剧。
 
