@@ -9,6 +9,7 @@ import http.server
 import importlib.util
 import json
 import os
+import signal
 import socketserver
 import stat
 import subprocess
@@ -315,6 +316,7 @@ def assert_path_and_naming_guards(module, root: Path):
         }, long_magnet, "auto")
         assert acquired == [fake_media]
         assert any(arg.startswith("--input-file=") for arg in captured[0]), captured
+        assert "--bt-stop-timeout=600" in captured[0], captured
     finally:
         module.log, module.run_child, module.shutil.which = original_log, original_run_child, original_which
 
@@ -354,6 +356,39 @@ def assert_path_and_naming_guards(module, root: Path):
     assert module.missing_episode_report(report_ctx, [{"season": 1, "episode": 1}, {"season": 1, "episode": 2}]) == {"S01": [5, 6]}
     report_ctx["args"] = type("Args", (), {"playlist": True})()
     assert module.missing_episode_report(report_ctx, plans) is None
+
+    # 两个分集任务同时争写共享 fanart 时，--merge 的后写者保留先写结果并继续。
+    race_target_root = (root / "merge-race-target").resolve()
+    race_target_show = race_target_root / "Show"
+    race_output = root / "merge-race-output"
+    race_target_show.mkdir(parents=True)
+    race_output.mkdir()
+    (race_output / "fanart.jpg").write_bytes(b"incoming")
+    race_logs = []
+    original_atomic, original_log, original_status = module.atomic_copy, module.log, module.status_update
+    try:
+        def race_atomic(_source, target, _minimum):
+            target.write_bytes(b"other task")
+            raise RuntimeError("simulated concurrent writer")
+
+        module.atomic_copy = race_atomic
+        module.log = lambda _ctx, message: race_logs.append(message)
+        module.status_update = lambda *_args, **_kwargs: {}
+        archived = module.archive({
+            "outputRoot": race_output,
+            "targetRoot": race_target_root,
+            "targetIdentity": module.directory_identity(race_target_root),
+            "targetShow": race_target_show,
+            "mediaType": "tv",
+            "config": {"minMediaDurationSeconds": 0},
+            "args": type("Args", (), {"merge": True, "update_nfo": False})(),
+            "id": "merge-race",
+        })
+        assert archived == [str(race_target_show / "fanart.jpg")]
+        assert (race_target_show / "fanart.jpg").read_bytes() == b"other task"
+        assert any("并发合并" in message for message in race_logs), race_logs
+    finally:
+        module.atomic_copy, module.log, module.status_update = original_atomic, original_log, original_status
 
     args = type("Args", (), {"copy_original": True, "season": 1, "episode": None})()
     duplicate_root = root / "duplicate-episodes"
@@ -573,11 +608,54 @@ def main():
             finally:
                 launch_log.unlink(missing_ok=True)
 
+            # stop 必须等待父任务和 aria2 进程组退出，并把最终状态写成 stopped。
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            fake_aria2 = fake_bin / "aria2c"
+            fake_aria2.write_text("#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n", encoding="utf-8")
+            fake_aria2.chmod(0o700)
+            stop_env = {**env, "PATH": f"{fake_bin}:{env.get('PATH', '')}"}
+            stop_title = "停止测试"
+            stop_process = subprocess.Popen([
+                sys.executable, str(SCRIPT), "ingest", stop_title,
+                "magnet:?xt=urn:btih:ABCDEF0123456789&dn=stop-test",
+                "--type", "movie", "--target", "movie", "--offline", "--no-transcode",
+            ], cwd=PROJECT, env=stop_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stop_child_pid = None
+            try:
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    states = json.loads((root / "status.json").read_text(encoding="utf-8")) if (root / "status.json").exists() else {}
+                    stop_state = next((item for item in states.values() if item.get("requestedTitle") == stop_title), {})
+                    if stop_state.get("phase") == "downloading" and isinstance(stop_state.get("childPid"), int):
+                        stop_child_pid = stop_state["childPid"]
+                        break
+                    time.sleep(0.1)
+                assert stop_child_pid, stop_state
+                stopped = run([sys.executable, str(SCRIPT), "stop", stop_title], env=stop_env)
+                assert "已发送停止信号" in stopped.stdout
+                stop_process.wait(timeout=15)
+                states = json.loads((root / "status.json").read_text(encoding="utf-8"))
+                stop_state = next(item for item in states.values() if item.get("requestedTitle") == stop_title)
+                assert stop_state["phase"] == "stopped", stop_state
+                assert subprocess.run(["ps", "-p", str(stop_child_pid)], capture_output=True).returncode != 0
+            finally:
+                if stop_process.poll() is None:
+                    stop_process.kill()
+                    stop_process.wait(timeout=5)
+                if stop_child_pid:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(stop_child_pid, signal.SIGKILL)
+
             searched = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--type", "tv"], env=env)
             payload = json.loads(searched.stdout)
             assert len(payload["candidates"]) == 1
             assert "downloadUrl" not in payload["candidates"][0]
             assert Handler.last_query["apikey"] == ["secret-key"]
+            searched_override = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--type", "tv", "--timeout", "90"], env=env)
+            assert len(json.loads(searched_override.stdout)["candidates"]) == 1
+            invalid_search_timeout = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--timeout", "301"], env=env, expect=1)
+            assert "1-300" in invalid_search_timeout.stderr
             candidate = payload["candidates"][0]["candidateId"]
             generic = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "prowlarr", "--type", "tv"], env=env)
             assert len(json.loads(generic.stdout)["candidates"]) == 1
@@ -603,6 +681,31 @@ def main():
             assert_xml(episode.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">123</uniqueid>")
             episode_digest = episode.read_bytes()
             poster_digest = (show / "poster.jpg").read_bytes()
+
+            # 分集并行归档：冲突先预检，普通模式不得产生部分视频；--merge 只跳过节目级共享文件。
+            increment_source = root / "source" / "Increment.S02E04.mkv"
+            make_video(increment_source)
+            increment_metadata = root / "increment-metadata.json"
+            increment_metadata.write_text(json.dumps({
+                "title": "增量剧", "year": 2026, "fanartPath": str(root / "source" / "poster.png"),
+                "episodes": [{"season": 2, "episode": 4, "title": "第四集"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            increment_show = root / "tv" / "增量剧 (2026)"
+            increment_show.mkdir()
+            (increment_show / "fanart.jpg").write_bytes(b"existing fanart")
+            (increment_show / "tvshow.nfo").write_bytes(b"existing nfo")
+            increment_command = [sys.executable, str(SCRIPT), "adopt", "增量剧", str(increment_source), "--type", "tv", "--year", "2026", "--target", "tv", "--metadata", str(increment_metadata), "--offline"]
+            refused_merge = run(increment_command, env=env, expect=1)
+            assert "拒绝覆盖" in refused_merge.stderr
+            increment_episode = increment_show / "Season 02" / "增量剧 (2026) - S02E04.mp4"
+            assert not increment_episode.exists(), "archive preflight must prevent partial media delivery"
+            merged = run([*increment_command, "--merge"], env=env)
+            assert "合并跳过已有共享文件" in merged.stdout
+            assert increment_episode.is_file()
+            assert increment_episode.with_suffix(".nfo").is_file()
+            assert (increment_show / "fanart.jpg").read_bytes() == b"existing fanart"
+            assert (increment_show / "tvshow.nfo").read_bytes() == b"existing nfo"
+
             metadata.write_text(json.dumps({
                 "title": "示例剧", "originalTitle": "Example Show", "year": 2026,
                 "plot": "更新后的剧集简介", "ids": {"tmdb": 123}, "posterPath": str(root / "source" / "poster.png"),
@@ -635,7 +738,7 @@ def main():
             conflict_target = root / "tv" / "Conflict" / "Season 01" / "Conflict - S01E01.mp4"
             conflict_target.parent.mkdir(parents=True)
             conflict_target.write_bytes(b"different")
-            conflict = run([sys.executable, str(SCRIPT), "adopt", "Conflict", str(source_conflict), "--type", "tv", "--target", "tv", "--offline"], env=env, expect=1)
+            conflict = run([sys.executable, str(SCRIPT), "adopt", "Conflict", str(source_conflict), "--type", "tv", "--target", "tv", "--offline", "--merge"], env=env, expect=1)
             assert "拒绝覆盖" in conflict.stderr
             assert source_conflict.is_file()
             failed_states = json.loads((root / "status.json").read_text(encoding="utf-8"))
@@ -726,7 +829,7 @@ def main():
             assert "metadata.genres" in invalid_metadata.stderr
 
             statuses = json.loads((root / "status.json").read_text(encoding="utf-8"))
-            assert {item["phase"] for item in statuses.values()} == {"done", "failed"}
+            assert {item["phase"] for item in statuses.values()} == {"done", "failed", "stopped"}
 
     print("integration test passed")
 

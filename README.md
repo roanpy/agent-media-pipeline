@@ -24,7 +24,7 @@ It works without a NAS, a media server, Docker, or an `*Arr` stack. Archive targ
 | Multiple acquisition paths | Local files, magnet links, torrent files, HTTP(S) links, and yt-dlp-supported pages including YouTube and Bilibili |
 | Explicit processing choices | TV/movie defaults with per-task `--transcode`, `--no-transcode`, playlist, and archive overrides |
 | Plex-ready output | Movie and TV naming, NFO, subtitles, poster, fanart, banner, and clear logo assets |
-| Local delivery or archival | Deliver finished Plex folders to `downloadDir` and clean the cache, or validate and atomically copy them to a configured library target |
+| Local delivery or archival | Deliver finished Plex folders to `downloadDir`, or preflight and atomically merge/archive them into an existing library target |
 | Safety and recovery | Private configuration, redacted sources, task locks, resumable workspaces, no-clobber archival, SHA-256 checks, safe stop, and mounted-volume checks |
 
 This project only handles sources the user is authorized to access and download. It does not bypass DRM, paywalls, authentication controls, CAPTCHAs, or site restrictions.
@@ -91,7 +91,7 @@ Secrets stay in environment variables such as `TMDB_API_KEY`, `JACKETT_API_KEY`,
 ./run.sh sources
 
 # Search configured structured sources; download URLs remain private
-./run.sh search "Show Name S01" --source jackett --type tv
+./run.sh search "Show Name S01" --source jackett --type tv --timeout 90
 
 # Add a reusable public search template after reviewing it
 ./run.sh add-source public-site \
@@ -104,7 +104,7 @@ Secrets stay in environment variables such as `TMDB_API_KEY`, `JACKETT_API_KEY`,
 
 # Transcode to the default MP4 profile and archive to a configured target
 ./run.sh adopt "Show Name" "/path/to/Show.S01E01.mkv" \
-  --type tv --transcode --target tv-library
+  --type tv --transcode --target tv-library --merge
 
 # Preserve the original container and organize only
 ./run.sh organize "Movie Name" "/path/to/Movie.mkv" \
@@ -119,6 +119,8 @@ Transcoding removes inherited global and chapter metadata by default, then relie
 - Signed or tokenized URLs can be supplied through a user-owned `0600` file with `--source-file`.
 - `config.json`, runtime state, logs, and caches are Git-ignored; private JSON files are written as `0600`.
 - Existing different files are never overwritten. Matching files are verified before being accepted.
+- Archive conflict preflight prevents a late artwork conflict from leaving a task partially delivered. For incremental TV episodes, `--merge` keeps existing different show-level artwork/`tvshow.nfo` while media conflicts still fail.
+- aria2 stops after the configured sustained-zero-traffic interval (`btStopTimeoutSeconds`, default 600 seconds); source fallback remains an explicit agent/user decision.
 - Delivery/archive cleanup runs only after size, SHA-256, media, and target-identity checks succeed. Use `--keep-work` to retain the task cache for debugging.
 - `--reset-work` removes only a verified task-owned workspace and must be used deliberately.
 - Newly discovered reusable websites are saved only after user confirmation and only to private `config.json`.
@@ -131,7 +133,7 @@ Ordinary channel uploads, clips, and unmatched web videos may fit a separate Ple
 
 ## Project status
 
-The source is **beta**. The core local-file, HTTP, yt-dlp, transcode, organize, metadata, optional-target, archive, resume, stop, and safety paths are covered by a dependency-free integration test. Real indexers, public websites, downloader versions, network mounts, and long-running stop races remain environment-dependent.
+The source is **beta**. The core local-file, HTTP, yt-dlp, transcode, organize, metadata, incremental archive, resume, owned-child stop, and safety paths are covered by a dependency-free integration test. Real indexers, public websites, downloader versions, and network mounts remain environment-dependent.
 
 qBittorrent and Transmission are not built-in download clients. aria2 handles the current torrent/direct-link path; generic Torznab already supports Prowlarr-compatible discovery. A future client adapter should only be added with isolated download directories, authenticated API handling, completion polling, and explicit cleanup semantics.
 

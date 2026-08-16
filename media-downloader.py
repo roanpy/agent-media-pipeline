@@ -33,6 +33,7 @@ VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", "
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
 ARCHIVE_EXTS = VIDEO_EXTS | SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
+TV_SHARED_MERGE_FILES = {"tvshow.nfo", "poster.jpg", "fanart.jpg", "banner.jpg", "clearlogo.png"}
 MAX_COMPONENT_BYTES = 200
 ACTIVE_CHILD: subprocess.Popen | None = None
 STOP_REQUESTED = False
@@ -118,10 +119,11 @@ def validate_config(data: dict) -> None:
     try:
         timeout_hours = float(data.get("timeoutHours", 24))
         minimum_duration = float(data.get("minMediaDurationSeconds", 120))
+        bt_stop_timeout = int(data.get("btStopTimeoutSeconds", 600))
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("timeoutHours/minMediaDurationSeconds 必须是数字") from exc
-    if timeout_hours <= 0 or minimum_duration < 0:
-        raise RuntimeError("timeoutHours 必须大于 0，minMediaDurationSeconds 不得小于 0")
+        raise RuntimeError("timeoutHours/minMediaDurationSeconds/btStopTimeoutSeconds 必须是数字") from exc
+    if timeout_hours <= 0 or minimum_duration < 0 or not 0 <= bt_stop_timeout <= 86400:
+        raise RuntimeError("timeoutHours 必须大于 0，minMediaDurationSeconds 不得小于 0，btStopTimeoutSeconds 必须在 0-86400 秒")
     download_dir = data.get("downloadDir")
     if download_dir not in (None, "") and (not isinstance(download_dir, str) or not download_dir.strip()):
         raise RuntimeError("downloadDir 必须是非空路径字符串")
@@ -176,6 +178,12 @@ def validate_config(data: dict) -> None:
     for name, source in sources.items():
         if not isinstance(source, dict) or source.get("type") not in {"jackett", "torznab", "web"}:
             raise RuntimeError(f"搜索源无效: {name}")
+        try:
+            search_timeout = int(source.get("timeoutSeconds", 90))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"搜索源 {name} timeoutSeconds 必须是整数") from exc
+        if not 1 <= search_timeout <= 300:
+            raise RuntimeError(f"搜索源 {name} timeoutSeconds 必须在 1-300 秒")
         if source["type"] == "jackett":
             value = str(source.get("url", ""))
             parsed = urllib.parse.urlsplit(validate_public_source_url(value))
@@ -929,6 +937,8 @@ def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: in
         ACTIVE_CHILD = None
         scrub_log(ctx["logPath"], redactions or [])
     status_update(ctx["id"], childPid=None)
+    if STOP_REQUESTED:
+        raise InterruptedError("任务已停止")
     if code != 0:
         raise RuntimeError(f"{operation} 失败，退出码 {code}，日志: {ctx['logPath']}")
 
@@ -980,7 +990,7 @@ def torznab_attr(item: ET.Element, name: str):
     return None
 
 
-def torznab_search(name: str, source: dict, query: str, media_type: str, limit: int) -> list[dict]:
+def torznab_search(name: str, source: dict, query: str, media_type: str, limit: int, timeout: int | None = None) -> list[dict]:
     key_env = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
     api_key = os.environ.get(key_env)
     if not api_key:
@@ -999,7 +1009,7 @@ def torznab_search(name: str, source: dict, query: str, media_type: str, limit: 
         params["cat"] = ",".join(str(value) for value in source["categories"])
     request = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers={"User-Agent": "media-downloader/2.0"})
     try:
-        with urllib.request.urlopen(request, timeout=int(source.get("timeoutSeconds", 30))) as response:
+        with urllib.request.urlopen(request, timeout=timeout or int(source.get("timeoutSeconds", 90))) as response:
             root = ET.fromstring(read_response(response, 10 * 1024 * 1024, f"Torznab {name}"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Torznab {name} 返回 HTTP {exc.code}") from exc
@@ -1038,6 +1048,8 @@ def torznab_search(name: str, source: dict, query: str, media_type: str, limit: 
 
 def command_search(args) -> int:
     config = load_config()
+    if args.timeout is not None and not 1 <= args.timeout <= 300:
+        raise ValueError("timeout 必须在 1-300 秒之间")
     sources = config.get("searchSources", {})
     if not isinstance(sources, dict):
         raise RuntimeError("searchSources 必须是对象")
@@ -1054,7 +1066,7 @@ def command_search(args) -> int:
         try:
             kind = source.get("type")
             if kind in {"jackett", "torznab"}:
-                candidates.extend(torznab_search(name, source, args.query, args.media_type, limit))
+                candidates.extend(torznab_search(name, source, args.query, args.media_type, limit, args.timeout))
             elif kind == "web":
                 template = str(source.get("urlTemplate", ""))
                 if not template:
@@ -1171,6 +1183,9 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
             "--auto-file-renaming=false", "--allow-overwrite=false", "--file-allocation=none",
             "--check-integrity=true", "--seed-time=0", "--summary-interval=10",
         ]
+        bt_stop_timeout = int(ctx["config"].get("btStopTimeoutSeconds", 600))
+        if bt_stop_timeout:
+            command.append(f"--bt-stop-timeout={bt_stop_timeout}")
         input_file = None
         local_source = Path(source).expanduser() if is_plausible_path(source) else None
         if local_source is not None and local_source.exists():
@@ -1675,6 +1690,25 @@ def atomic_replace_nfo(source: Path, target: Path) -> None:
         temp.unlink(missing_ok=True)
 
 
+def archive_existing_action(ctx: dict, source: Path, target: Path, relative: Path, minimum: float) -> str:
+    if target.is_symlink():
+        raise RuntimeError(f"目标是符号链接，拒绝归档: {target}")
+    if not target.exists():
+        return "copy"
+    if existing_matches(source, target, minimum):
+        return "keep"
+    if source.suffix.lower() == ".nfo" and ctx["args"].update_nfo:
+        return "replace"
+    if (
+        ctx["args"].merge
+        and ctx["mediaType"] == "tv"
+        and len(relative.parts) == 1
+        and relative.name.casefold() in TV_SHARED_MERGE_FILES
+    ):
+        return "skip"
+    raise RuntimeError(f"目标已存在且内容不同，拒绝覆盖: {target}")
+
+
 def archive(ctx: dict, phase: str = "archiving", action: str = "归档") -> list[str]:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     output_root = ctx["outputRoot"].resolve()
@@ -1686,27 +1720,41 @@ def archive(ctx: dict, phase: str = "archiving", action: str = "归档") -> list
     )
     if not files:
         raise RuntimeError("没有可归档文件")
-    archived = []
+    prepared = []
     for source in files:
-        if STOP_REQUESTED:
-            raise InterruptedError("任务已停止")
         relative = source.relative_to(output_root)
         target = ctx["targetShow"] / relative
         if not target.resolve(strict=False).is_relative_to(ctx["targetRoot"]):
             raise RuntimeError("归档目标逃逸")
+        prepared.append((source, relative, target, archive_existing_action(ctx, source, target, relative, minimum)))
+    archived = []
+    for source, relative, target, prepared_action in prepared:
+        if STOP_REQUESTED:
+            raise InterruptedError("任务已停止")
         ensure_target_parent(ctx, target.parent)
-        if target.exists():
-            if not existing_matches(source, target, minimum):
-                if source.suffix.lower() == ".nfo" and ctx["args"].update_nfo:
-                    log(ctx, f"更新 NFO: {relative}")
-                    atomic_replace_nfo(source, target)
-                else:
-                    raise RuntimeError(f"目标已存在且内容不同，拒绝覆盖: {target}")
-        else:
+        current_action = archive_existing_action(ctx, source, target, relative, minimum)
+        if current_action == "replace":
+            log(ctx, f"更新 NFO: {relative}")
+            atomic_replace_nfo(source, target)
+        elif current_action == "skip":
+            log(ctx, f"合并跳过已有共享文件: {relative}")
+        elif current_action == "copy":
             log(ctx, f"{action}: {relative}")
-            atomic_copy(source, target, minimum)
-            if not target.is_file() or source.stat().st_size != target.stat().st_size:
+            copied = True
+            try:
+                atomic_copy(source, target, minimum)
+            except RuntimeError:
+                race_action = archive_existing_action(ctx, source, target, relative, minimum)
+                if race_action not in {"keep", "skip"}:
+                    raise
+                copied = False
+                log(ctx, f"并发合并保留已有共享文件: {relative}" if race_action == "skip" else f"其他任务已写入相同文件: {relative}")
+            if copied and (not target.is_file() or source.stat().st_size != target.stat().st_size):
                 raise RuntimeError(f"{action}校验失败: {target}")
+        elif prepared_action == "copy" and current_action == "keep":
+            log(ctx, f"其他任务已写入相同文件: {relative}")
+        else:
+            assert current_action == "keep"
         archived.append(str(target))
         status_update(ctx["id"], phase=phase, currentFile=str(relative), archivedFiles=archived)
     require_target_root(ctx["targetRoot"])
@@ -1728,6 +1776,7 @@ def pipeline(args) -> int:
         "naming": ctx["namingName"],
         "mode": "organize" if args.copy_original else "transcode",
         "archive": not args.no_archive,
+        "merge": args.merge,
         "targetPath": str(ctx["targetShow"]), "source": redacted_source(source),
     }
     if args.dry_run:
@@ -1740,7 +1789,7 @@ def pipeline(args) -> int:
         status_update(
             ctx["id"], **plan, phase="starting", pid=os.getpid(), childPid=None,
             currentOperation="starting", currentFile="", startedAt=now(), finishedAt=None,
-            lastError="", archivedFiles=[], logPath=str(ctx["logPath"]),
+            lastError="", archivedFiles=[], logPath=str(ctx["logPath"]), workPath=str(ctx["workRoot"]),
         )
         try:
             sources = acquire(ctx, source, requested_downloader)
@@ -1802,7 +1851,26 @@ def process_matches(pid: int, title: str) -> bool:
     return result.returncode == 0 and "media-downloader.py" in result.stdout and title in result.stdout
 
 
+def owned_child_matches(pid: int, work_path: str) -> bool:
+    result = subprocess.run(["ps", "-p", str(pid), "-o", "pgid=,command="], capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    fields = result.stdout.strip().split(maxsplit=1)
+    if len(fields) != 2 or not fields[0].isdigit():
+        return False
+    executables = {os.path.basename(token) for token in fields[1].split()[:3]}
+    return int(fields[0]) == pid and bool(executables & {"aria2c", "ffmpeg", "yt-dlp"}) and work_path in fields[1]
+
+
+def signal_owned_child(pid: int, work_path: str, sig: signal.Signals) -> None:
+    if owned_child_matches(pid, work_path):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pid, sig)
+
+
 def command_stop(args) -> int:
+    config = load_config()
+    base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
     matches = []
     for identifier, state in status_read().items():
         names = {str(state.get("title", "")).casefold(), str(state.get("requestedTitle", "")).casefold()}
@@ -1813,15 +1881,42 @@ def command_stop(args) -> int:
         return 1
     for identifier, state in matches:
         pid = state.get("pid")
+        child_pid = state.get("childPid")
         process_title = str(state.get("requestedTitle") or state.get("title", ""))
+        work_path = str(state.get("workPath") or (base_root / ".media-downloader-work" / identifier))
         if isinstance(pid, int) and process_matches(pid, process_title):
             try:
                 os.kill(pid, signal.SIGTERM)
                 print(f"已发送停止信号: {state.get('title')} pid={pid}")
             except ProcessLookupError:
-                status_update(identifier, phase="stopped", lastError="stale process", pid=None, childPid=None)
-        else:
-            status_update(identifier, phase="stopped", lastError="stale process", pid=None, childPid=None)
+                pass
+            grace = time.monotonic() + 2
+            while time.monotonic() < grace and process_matches(pid, process_title):
+                time.sleep(0.1)
+        if isinstance(child_pid, int):
+            signal_owned_child(child_pid, work_path, signal.SIGTERM)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            parent_running = isinstance(pid, int) and process_matches(pid, process_title)
+            child_running = isinstance(child_pid, int) and owned_child_matches(child_pid, work_path)
+            if not parent_running and not child_running:
+                break
+            time.sleep(0.1)
+        if isinstance(child_pid, int):
+            signal_owned_child(child_pid, work_path, signal.SIGKILL)
+        if isinstance(pid, int) and process_matches(pid, process_title):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        final_deadline = time.monotonic() + 2
+        while time.monotonic() < final_deadline:
+            parent_running = isinstance(pid, int) and process_matches(pid, process_title)
+            child_running = isinstance(child_pid, int) and owned_child_matches(child_pid, work_path)
+            if not parent_running and not child_running:
+                break
+            time.sleep(0.1)
+        if (isinstance(pid, int) and process_matches(pid, process_title)) or (isinstance(child_pid, int) and owned_child_matches(child_pid, work_path)):
+            raise RuntimeError(f"停止任务失败，进程仍在运行: {state.get('title')}")
+        status_update(identifier, phase="stopped", currentOperation="stopped", lastError="任务已停止", pid=None, childPid=None, finishedAt=now())
     return 0
 
 
@@ -1896,6 +1991,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--keep-work", action="store_true", help="Keep the download cache/workspace after completion (cleaned by default after delivery/archive)")
     parser.add_argument("--reset-work", action="store_true")
     parser.add_argument("--update-nfo", action="store_true", help="Atomically update existing NFO only; never overwrites media, subtitles, or artwork")
+    parser.add_argument("--merge", action="store_true", help="For incremental TV archives, keep existing different show-level artwork/tvshow.nfo; media conflicts still fail")
     if mode_override:
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--transcode", dest="copy_original", action="store_false", help="Override the default mode and transcode")
@@ -1913,6 +2009,7 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--source", action="append")
     search.add_argument("--type", dest="media_type", choices=("tv", "movie"), default="tv")
     search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--timeout", type=int, help="Override this search request timeout in seconds (1-300)")
     search.set_defaults(handler=command_search)
     sources = commands.add_parser("sources", help="List search sources in the private config")
     sources.set_defaults(handler=command_sources)

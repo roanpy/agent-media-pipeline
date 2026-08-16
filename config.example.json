@@ -3,6 +3,7 @@
   "stateDir": "$HOME/MediaDownloader/.state",
   "downloadDir": "$HOME/MediaDownloader/Incoming",
   "timeoutHours": 24,
+  "btStopTimeoutSeconds": 600,
   "minMediaDurationSeconds": 120,
   "defaultProfiles": {
     "tv": "tv1080",
@@ -85,7 +86,7 @@
       "indexer": "all",
       "apiKeyEnv": "JACKETT_API_KEY",
       "categories": [],
-      "timeoutSeconds": 30
+      "timeoutSeconds": 90
     },
     "prowlarr": {
       "type": "torznab",
@@ -93,7 +94,7 @@
       "url": "http://127.0.0.1:9696/1/api",
       "apiKeyEnv": "PROWLARR_API_KEY",
       "categories": [],
-      "timeoutSeconds": 30
+      "timeoutSeconds": 90
     },
     "web": {
       "type": "web",

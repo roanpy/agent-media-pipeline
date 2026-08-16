@@ -27,7 +27,7 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
    - If the user only supplies media and does not specify type, transcode mode, or archive choice, explain the relevant defaults and ask for the missing decisions.
 3. Discover sources.
    - Run `./run.sh sources` to inspect configured sources.
-   - Jackett/Torznab: `./run.sh search "query" --source NAME --type tv|movie`.
+   - Jackett/Torznab: `./run.sh search "query" --source NAME --type tv|movie --timeout 90` for slow aggregate indexers.
    - Web sources return a `browseUrl`; inspect the public page and extract only an authorized final URL.
    - Accept an explicit local path, magnet, `.torrent`, HTTP(S) direct link, or supported web-media URL.
    - The agent may use browser search for one-off public discovery. Before saving a reusable site, show its name, domain, type, URL template, and credential requirements. Save it with `add-source` only after explicit confirmation. Never silently add sites or secrets to `SKILL.md`, code, or `config.example.json`.
@@ -35,6 +35,8 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
 5. After authorization, run `ingest`. Use `--candidate` for cached structured results and a URL for web/direct sources.
    - A TV file without a season/episode token requires explicit `--season`/`--episode`.
    - Split unsupported multi-episode files before processing.
+   - When separate tasks add episodes to the same existing TV show, use `--merge`. It keeps existing different show-level artwork and `tvshow.nfo`, but still rejects different media, subtitles, and episode NFO files.
+   - If aria2 stops after sustained zero traffic, report the stalled candidate and use another reviewed candidate only when the user already authorized fallback or confirms it now.
 6. Run `check` until `done` or `failed`. After `stop`, run `check` again.
 7. Report the output/archive path, actual mode/profile/naming/target, file count, and unmet requirements.
 
@@ -62,9 +64,9 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
   --api-key-env PROWLARR_API_KEY
 
 # Search and use a cached structured candidate
-./run.sh search "Show Name S01" --source jackett --type tv
+./run.sh search "Show Name S01" --source jackett --type tv --timeout 90
 ./run.sh ingest "Show Name" --candidate CANDIDATE_ID --type tv --year 2026 \
-  --profile tv1080 --target tv-library --naming plex
+  --profile tv1080 --target tv-library --naming plex --merge
 
 # Use a final web-media URL
 ./run.sh ingest "Movie Name" "https://authorized.example/video" --type movie \
@@ -106,6 +108,8 @@ chmod 600 /private/tmp/source-url
 
 `resume` and `download` alias `ingest`; `process` aliases `adopt`. `organize` skips profile transcoding but still uses profile naming and an optional default target. Long-running commands launch in the background by default; add `--foreground` while debugging.
 
+Archive performs a complete conflict preflight before copying. `--merge` is intentionally narrow: for TV only, existing different root `poster`, `fanart`, `banner`, `clearlogo`, and `tvshow.nfo` are logged and kept. It never weakens no-clobber protection for episode media, subtitles, or episode NFO. `stop` waits for the owned task and downloader/transcoder process group to exit.
+
 ## Source behavior
 
 - `auto` selects local for regular local files/directories, aria2 for magnet/`.torrent`/clear direct-media URLs, and yt-dlp for other HTTP(S) pages.
@@ -131,6 +135,7 @@ Transcoding defaults to MP4 profiles and removes inherited global and chapter me
 Run `cp config.example.json config.json && chmod 600 config.json`. The example uses `$HOME/MediaDownloader`, delivers `--no-archive` output to `$HOME/MediaDownloader/Incoming`, defines no archive targets, and requires no NAS.
 
 - `searchSources`: Jackett, generic Torznab/Prowlarr, or web templates; `apiKeyEnv` names an environment variable.
+- `btStopTimeoutSeconds`: aria2 sustained-zero-traffic limit; default `600`, set `0` only to disable it deliberately.
 - `profiles`: container, resolution, codec, CRF/bitrate, optional target, and naming. Default profiles produce MP4.
 - `defaultProfiles.tv|movie`: default compression profiles.
 - `defaultModes.tv|movie`: `transcode` or `organize`; omitted values remain backward-compatible as `transcode`.

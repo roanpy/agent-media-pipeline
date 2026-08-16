@@ -24,7 +24,7 @@
 | 多种获取方式 | 本地文件、magnet、torrent 文件、HTTP(S) 链接，以及 YouTube/Bilibili 等 yt-dlp 支持的网站 |
 | 明确的处理选择 | TV/电影默认模式，以及逐任务转码、免转码、播放列表和归档开关 |
 | Plex 友好输出 | 电影/剧集命名、NFO、字幕、海报、背景图、横幅和透明 Logo |
-| 本地交付或归档 | 成品可交付到 `downloadDir` 并清理缓存，也可校验后原子复制到预设媒体库目标 |
+| 本地交付或归档 | 成品可交付到 `downloadDir`，也可预检后增量合并/原子归档到已有媒体库目标 |
 | 安全与恢复 | 私有配置、来源脱敏、任务锁、失败工作区恢复、防覆盖、SHA-256、停止和挂载检查 |
 
 项目只处理用户有权访问和下载的来源，不绕过 DRM、付费墙、认证控制、验证码或站点限制。
@@ -91,7 +91,7 @@ brew install ffmpeg aria2 yt-dlp
 ./run.sh sources
 
 # 搜索结构化来源；真实下载 URL 不对外显示
-./run.sh search "剧名 S01" --source jackett --type tv
+./run.sh search "剧名 S01" --source jackett --type tv --timeout 90
 
 # 用户审查确认后添加公开网页搜索模板
 ./run.sh add-source public-site \
@@ -104,7 +104,7 @@ brew install ffmpeg aria2 yt-dlp
 
 # 使用默认 MP4 profile 转码并归档
 ./run.sh adopt "剧名" "/path/to/Show.S01E01.mkv" \
-  --type tv --transcode --target tv-library
+  --type tv --transcode --target tv-library --merge
 
 # 保留原容器，只整理和归档
 ./run.sh organize "电影名" "/path/to/Movie.mkv" \
@@ -119,6 +119,8 @@ brew install ffmpeg aria2 yt-dlp
 - 带签名或 token 的 URL 通过当前用户拥有的 `0600` 文件配合 `--source-file` 传入。
 - `config.json`、运行状态、日志和缓存都被 Git 忽略；私有 JSON 文件按 `0600` 写入。
 - 已存在且内容不同的目标文件永不覆盖。
+- 归档会先完成冲突预检，避免最后因图片冲突而留下“部分成功”。电视剧分集增量归档可用 `--merge` 保留已有节目级图片和 `tvshow.nfo`，不同视频仍拒绝写入。
+- aria2 连续零流量达到 `btStopTimeoutSeconds`（默认 600 秒）后停止；是否换源仍由 Agent 与用户明确决定。
 - 只有大小、SHA-256、媒体有效性和目标身份校验全部通过后才清理工作区；调试时可用 `--keep-work` 保留任务缓存。
 - `--reset-work` 只删除验证过所有权的任务工作区，必须明确使用。
 - Agent 发现的新网站只有在用户确认后才会保存，并且只写入私有 `config.json`。
@@ -131,7 +133,7 @@ brew install ffmpeg aria2 yt-dlp
 
 ## 项目状态
 
-当前源码处于 **Beta**。本地文件、HTTP、yt-dlp、转码、免转码整理、元数据、可选目标、归档、恢复、停止和主要安全路径已由无第三方 Python 依赖的集成测试覆盖。真实索引器、公开网站、下载器版本、网络挂载和超长任务停止竞态仍取决于运行环境。
+当前源码处于 **Beta**。本地文件、HTTP、yt-dlp、转码、免转码整理、元数据、增量归档、恢复、子进程停止和主要安全路径已由无第三方 Python 依赖的集成测试覆盖。真实索引器、公开网站、下载器版本和网络挂载仍取决于运行环境。
 
 暂未内置 qBittorrent 和 Transmission 下载客户端。当前 aria2 覆盖种子/直链下载，通用 Torznab 已覆盖 Prowlarr 类型的来源发现。未来只有在具备隔离下载目录、认证处理、完成轮询和明确清理语义时才应加入常驻下载器适配器。
 

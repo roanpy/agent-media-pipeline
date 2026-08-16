@@ -21,6 +21,9 @@ Audience: an AI agent (Hermes) running verification. Work in a clone or the repo
 8. **--keep-work**: with it, the delivered copy exists AND the work area is retained.
 9. **Safety negatives**: `--source-file` with 0644 perms is rejected; a `downloadDir` inside `.media-downloader-work` is rejected.
 10. **doctor**: `./run.sh doctor` returns valid JSON; `download:output` is `ok` when `downloadDir` is set.
+11. **Incremental TV merge**: pre-create a different root `fanart.jpg`/`tvshow.nfo`, then add an S02 episode. Without `--merge`, expect failure before any episode is copied. Re-run the same task with `--merge`; expect the new episode/NFO, unchanged shared files, and a `合并跳过已有共享文件` log. A different existing episode media file must still fail under `--merge`.
+12. **Search/stall controls**: `search --timeout 90` succeeds against the stub; values outside 1-300 fail. Capture fake aria2 arguments and require `--bt-stop-timeout=600` by default.
+13. **Stop closure**: run a fake long-lived aria2 child in its own process group, call `stop`, and require parent + child exit and final `phase: stopped` with no leftover process.
 
 ## Report format
 
