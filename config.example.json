@@ -130,6 +130,7 @@
     "provider": "tmdb",
     "apiKeyEnv": "TMDB_API_KEY",
     "language": "zh-CN",
+    "subtitleLanguages": "zh-CN,en",
     "tvFallback": "tvmaze",
     "requireArtwork": true
   },

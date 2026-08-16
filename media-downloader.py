@@ -29,7 +29,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 CONFIG_SCHEMA_VERSION = 1
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
@@ -215,6 +215,11 @@ def validate_config(data: dict) -> None:
             parsed = urllib.parse.urlsplit(validate_public_source_url(template, template=True).replace("{query}", "test"))
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise RuntimeError(f"搜索源 URL 无效: {name}")
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise RuntimeError("metadata 必须是对象")
+    if metadata.get("subtitleLanguages") is not None:
+        validate_subtitle_languages(metadata["subtitleLanguages"])
     words = data.get("customWords", {})
     if not isinstance(words, dict):
         raise RuntimeError("customWords 必须是对象")
@@ -571,12 +576,15 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None, seas
     crew = credits.get("crew", []) if isinstance(credits.get("crew"), list) else []
     countries = detail.get("production_countries", []) if isinstance(detail.get("production_countries"), list) else []
     episodes = []
+    season_poster_url = ""
     if kind == "tv" and season is not None:
         try:
             season_detail = http_json(
                 f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}",
                 {**auth_params, "language": language}, auth,
             )
+            if season_detail.get("poster_path"):
+                season_poster_url = f"https://image.tmdb.org/t/p/original{season_detail['poster_path']}"
             for episode in season_detail.get("episodes", []) if isinstance(season_detail, dict) else []:
                 episode_crew = episode.get("crew", []) if isinstance(episode.get("crew"), list) else []
                 episodes.append({
@@ -615,6 +623,8 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None, seas
         "ids": {"tmdb": tmdb_id, "imdb": externals.get("imdb_id"), "tvdb": externals.get("tvdb_id")},
         "posterUrl": f"https://image.tmdb.org/t/p/original{detail.get('poster_path')}" if detail.get("poster_path") else "",
         "fanartUrl": f"https://image.tmdb.org/t/p/original{detail.get('backdrop_path')}" if detail.get("backdrop_path") else "",
+        "seasonNumber": season,
+        "seasonPosterUrl": season_poster_url,
         "episodes": episodes,
     }
 
@@ -818,6 +828,10 @@ def source_fingerprint(ctx: dict, source: str) -> str:
         "season": ctx["args"].season,
         "episode": ctx["args"].episode,
         "playlist": ctx["args"].playlist,
+        "format": getattr(ctx["args"], "format", None),
+        "cookies": getattr(ctx["args"], "cookies", None),
+        "writeSubs": bool(getattr(ctx["args"], "write_subs", False)),
+        "subtitleLanguages": subtitle_languages(ctx["config"], ctx["args"]),
     }
     value = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(value.encode()).hexdigest()
@@ -1078,10 +1092,24 @@ def validate_ytdlp_format(value: str | None) -> str | None:
 
 def validate_subtitle_languages(value: str) -> str:
     codes = [item.strip() for item in str(value).split(",") if item.strip()]
+    if not codes:
+        raise ValueError("字幕语言不能为空")
     for code in codes:
         if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*", code):
             raise ValueError(f"字幕语言代码无效: {code}")
     return ",".join(codes)
+
+
+def subtitle_languages(config: dict, args) -> str | None:
+    if not getattr(args, "write_subs", False):
+        return None
+    value = (
+        getattr(args, "sub_langs", None)
+        or config.get("metadata", {}).get("subtitleLanguages")
+        or config.get("metadata", {}).get("language")
+        or "zh-CN"
+    )
+    return validate_subtitle_languages(value)
 
 
 def probe_summary(data: dict, playlist: bool) -> dict:
@@ -1426,16 +1454,11 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
         if selected_format:
             command += ["--format", selected_format]
         if ctx["args"].write_subs:
-            language = (
-                ctx["args"].sub_langs
-                or ctx["config"].get("metadata", {}).get("subtitleLanguages")
-                or ctx["config"].get("metadata", {}).get("language")
-                or "zh-CN"
-            )
             command += [
                 "--write-subs", "--write-auto-subs",
                 "--sub-format", "srt/best",
-                "--sub-langs", validate_subtitle_languages(language),
+                "--sub-langs", subtitle_languages(ctx["config"], ctx["args"]),
+                "--convert-subs", "srt",
             ]
         command += [
             playlist_flag, "--continue",
@@ -1837,7 +1860,7 @@ def write_artwork(ctx: dict, plans: list[dict]) -> None:
             if required and kind == "poster":
                 raise
             log(ctx, f"警告: {kind} 获取失败: {exc}")
-    # Plex/Kodi 单集缩略图：优先 metadata 提供的 thumbPath/thumbUrl，其次 TMDB 分集 still_path（thumbUrl）。
+    # Plex 单集图片必须与视频同名，只替换图片扩展名。
     if ctx["mediaType"] == "tv":
         for plan in plans:
             details = episode_metadata(metadata, plan["season"], plan["episode"])
@@ -1845,11 +1868,23 @@ def write_artwork(ctx: dict, plans: list[dict]) -> None:
             if not thumb:
                 continue
             try:
-                download_image(str(thumb), plan["output"].parent / f"{plan['output'].stem}-thumb.jpg", ctx)
+                download_image(str(thumb), plan["output"].with_suffix(".jpg"), ctx)
             except InterruptedError:
                 raise
             except Exception as exc:
                 log(ctx, f"警告: S{plan['season']:02d}E{plan['episode']:02d} 剧照获取失败: {exc}")
+        season_poster = metadata.get("seasonPosterPath") or metadata.get("seasonPosterUrl")
+        season = metadata.get("seasonNumber")
+        season = int(season) if season is not None else None
+        season_plan = next((plan for plan in plans if plan["season"] == season), None)
+        if season_poster and season_plan:
+            filename = "season-specials-poster.jpg" if season == 0 else f"Season{season:02d}.jpg"
+            try:
+                download_image(str(season_poster), season_plan["output"].parent / filename, ctx)
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                log(ctx, f"警告: S{season:02d} 季海报获取失败: {exc}")
 
 
 def missing_episode_report(ctx: dict, plans: list[dict]) -> str | None:
@@ -1887,7 +1922,7 @@ def repair_sidecars(root: Path, video: Path) -> list[Path]:
     return sorted(
         path for path in video.parent.iterdir()
         if path != video
-        and path.name.startswith(f"{video.stem}.")
+        and (path.name.startswith(f"{video.stem}.") or path.stem == f"{video.stem}-thumb")
         and path.suffix.lower() in REPAIR_SIDECAR_EXTS
         and is_safe_file(root, path)
     )
@@ -1962,7 +1997,7 @@ def build_repair_plan(config: dict, args) -> dict:
             if source == video:
                 target = target_video
             else:
-                tag = source.name[len(video.stem):-len(source.suffix)]
+                tag = "" if source.stem == f"{video.stem}-thumb" else source.name[len(video.stem):-len(source.suffix)]
                 target = target_video.with_name(f"{target_video.stem}{tag}{source.suffix.lower()}")
             if source == target:
                 continue
@@ -2277,6 +2312,8 @@ def archive(ctx: dict, phase: str = "archiving", action: str = "归档") -> list
 
 def pipeline(args) -> int:
     config = load_config()
+    if args.sub_langs is not None and not args.write_subs:
+        raise RuntimeError("--sub-langs 必须与 --write-subs 一起使用")
     if args.no_deliver:
         args.no_archive = True
     if args.copy_original is None:
@@ -2286,11 +2323,13 @@ def pipeline(args) -> int:
     downloader = classify_downloader(source, requested_downloader)
     if args.playlist and args.media_type != "tv":
         raise RuntimeError("--playlist 必须使用 --type tv，才能按播放顺序映射季集")
-    if (args.format or args.cookies or args.write_subs) and downloader != "yt-dlp":
-        raise RuntimeError("--format/--cookies/--write-subs 只适用于 yt-dlp 网页来源")
+    if (args.format or args.cookies or args.write_subs or args.sub_langs is not None) and downloader != "yt-dlp":
+        raise RuntimeError("--format/--cookies/--write-subs/--sub-langs 只适用于 yt-dlp 网页来源")
+    selected_subtitles = None
     if downloader == "yt-dlp":
         validate_ytdlp_format(args.format)
         ytdlp_auth_args(args.cookies)
+        selected_subtitles = subtitle_languages(config, args)
     plan = {
         "version": VERSION, "configSchemaVersion": CONFIG_SCHEMA_VERSION,
         "taskId": ctx["id"], "title": ctx["canonical"], "mediaType": ctx["mediaType"],
@@ -2303,6 +2342,7 @@ def pipeline(args) -> int:
         "playlist": args.playlist,
         "format": args.format or "best available",
         "subs": bool(args.write_subs),
+        "subtitleLanguages": selected_subtitles,
         "authenticated": bool(args.cookies),
         "downloader": downloader,
         "targetPath": str(ctx["targetShow"]), "source": redacted_source(source),

@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Media Pipeline"
-  short_description: "Discover, process, repair, and deliver Plex-ready media safely"
-  default_prompt: "Use $agent-media-pipeline to inspect or process authorized media, or preview a safe existing-TV-library repair before applying it."
+  short_description: "Build Plex-ready media with subtitles and safe repair"
+  default_prompt: "Use $agent-media-pipeline to inspect or process authorized media with the configured quality, subtitle, artwork, and delivery policy."
