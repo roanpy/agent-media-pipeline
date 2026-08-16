@@ -9,6 +9,7 @@ import http.server
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import socketserver
 import stat
@@ -160,7 +161,7 @@ def assert_atomic_copy_never_overwrites(root: Path):
 
     fallback = root / "atomic-fallback.txt"
 
-    def unsupported_link(_source_path, _target_path):
+    def unsupported_link(_source_path, _target_path, **_kwargs):
         raise OSError(module.errno.EOPNOTSUPP, "hard links unavailable")
 
     module.os.link = unsupported_link
@@ -194,6 +195,28 @@ def assert_atomic_copy_never_overwrites(root: Path):
         module.os.link = original_link
         module.file_digest = original_digest
     assert not failed_fallback.exists()
+
+    repair_root = (root / "repair-copy-fallback").resolve()
+    repair_root.mkdir()
+    repair_source = repair_root / "old.srt"
+    repair_target = repair_root / "new.srt"
+    repair_source.write_text("subtitle", encoding="utf-8")
+    repair_stat = repair_source.stat()
+    module.os.link = unsupported_link
+    try:
+        module.apply_repair_plan({"stateDir": str(root / "repair-state")}, {
+            "root": repair_root,
+            "rootIdentity": module.directory_identity(repair_root),
+            "moves": [{
+                "source": repair_source,
+                "target": repair_target,
+                "identity": (repair_stat.st_dev, repair_stat.st_ino, repair_stat.st_size, repair_stat.st_mtime_ns),
+            }],
+            "nfoUpdates": [],
+        })
+    finally:
+        module.os.link = original_link
+    assert repair_target.read_text(encoding="utf-8") == "subtitle" and not repair_source.exists()
 
     symlink_target = root / "atomic-symlink.txt"
     symlink_target.symlink_to(source)
@@ -533,7 +556,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.2.1 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.3.0 (config schema 1)"
         module = assert_atomic_copy_never_overwrites(root)
         assert_path_and_naming_guards(module, root)
         assert_tmdb_auth_modes()
@@ -571,7 +594,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.2.1"
+            assert doctor_payload["version"] == "0.3.0"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -660,7 +683,7 @@ def main():
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
-            assert delivery_plan["version"] == "0.2.1" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.3.0" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
@@ -886,6 +909,49 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert titled_episode.is_file()
             assert_xml(titled_episode.with_suffix(".nfo"), "<title>可靠的单集标题</title>")
             assert_xml(titled_episode.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">1003</uniqueid>")
+
+            # 存量库修复默认只预览；仅可靠标题改名，Season 0/字幕/NFO 一起处理，未知标题保留原名。
+            repair_library = root / "repair-library"
+            repair_show = repair_library / "存量剧 (2026)"
+            repair_season = repair_show / "Season 00"
+            repair_season.mkdir(parents=True)
+            repair_tvshow = repair_show / "tvshow.nfo"
+            repair_tvshow.write_bytes(b"existing show nfo")
+            repair_old = repair_season / "Legacy.S00E01.mkv"
+            repair_untitled = repair_season / "Legacy.S00E02.mkv"
+            shutil.copy2(root / "source" / "Example.S02E03.mkv", repair_old)
+            shutil.copy2(root / "source" / "Example.S02E03.mkv", repair_untitled)
+            repair_old.with_name(f"{repair_old.stem}.zh.srt").write_text("subtitle", encoding="utf-8")
+            repair_old.with_suffix(".nfo").write_text("old episode nfo", encoding="utf-8")
+            repair_metadata = root / "repair-metadata.json"
+            repair_metadata.write_text(json.dumps({
+                "title": "存量剧", "year": 2026,
+                "episodes": [{"season": 0, "episode": 1, "title": "特别篇", "plot": "特别剧情", "ids": {"tmdb": 7001}}],
+            }, ensure_ascii=False), encoding="utf-8")
+            repair_command = [
+                sys.executable, str(SCRIPT), "repair", "存量剧", str(repair_show), "--year", "2026", "--season", "0",
+                "--naming", "plex-title", "--metadata", str(repair_metadata), "--offline", "--update-nfo",
+            ]
+            repair_preview = json.loads(run(repair_command, env=env).stdout)
+            assert repair_preview["mode"] == "preview" and repair_preview["renameCount"] == 3
+            assert repair_old.is_file() and repair_untitled.is_file(), "preview must not modify the library"
+            broad_repair = run([
+                sys.executable, str(SCRIPT), "repair", "存量剧", str(repair_library), "--year", "2026", "--season", "0",
+                "--metadata", str(repair_metadata), "--offline",
+            ], env=env, expect=1)
+            assert "单部剧目录" in broad_repair.stderr
+            repair_applied = json.loads(run([*repair_command, "--apply"], env=env).stdout)
+            assert repair_applied["mode"] == "apply"
+            repaired = repair_season / "存量剧 (2026) - S00E01 - 特别篇.mkv"
+            assert repaired.is_file() and not repair_old.exists()
+            assert repaired.with_name(f"{repaired.stem}.zh.srt").read_text(encoding="utf-8") == "subtitle"
+            assert_xml(repaired.with_suffix(".nfo"), "<title>特别篇</title>")
+            assert_xml(repaired.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">7001</uniqueid>")
+            assert repair_untitled.is_file(), "episodes without reliable titles must keep their original paths"
+            assert repair_tvshow.read_bytes() == b"existing show nfo"
+            repair_repeat = json.loads(run(repair_command, env=env).stdout)
+            assert repair_repeat["renameCount"] == 0 and repair_repeat["nfoUpdateCount"] == 1
+
             titled_metadata.write_text(json.dumps({
                 "title": "标题剧", "year": 2026,
                 "episodes": [{"season": 2, "episode": 3, "title": "后来修改的标题", "ids": {"tmdb": 1003}}],

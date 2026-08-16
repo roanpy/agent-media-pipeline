@@ -24,6 +24,7 @@ It works without a NAS, a media server, Docker, or an `*Arr` stack. Archive targ
 | Multiple acquisition paths | Local files, magnet links, torrent files, HTTP(S) links, and yt-dlp-supported pages including YouTube and Bilibili |
 | Explicit processing choices | TV/movie defaults with per-task transcode, organize, playlist, source-quality, authenticated-session, and archive overrides |
 | Plex-ready output | Movie and TV naming (including optional episode titles), per-show/per-episode NFO, subtitles, poster, fanart, banner, and clear logo assets |
+| Safe existing-library repair | Preview one show's folder, then repair episode names and per-episode NFO from reliable metadata without clobbering conflicts |
 | Local delivery or archival | Deliver finished Plex folders to `downloadDir`, or preflight and atomically merge/archive them into an existing library target |
 | Safety and recovery | Private configuration, redacted sources, task locks, resumable workspaces, no-clobber archival, SHA-256 checks, safe stop, and mounted-volume checks |
 
@@ -119,6 +120,12 @@ Secrets stay in environment variables such as `TMDB_API_KEY`, `JACKETT_API_KEY`,
 # Preserve the original container and organize only
 ./run.sh organize "Movie Name" "/path/to/Movie.mkv" \
   --type movie --target movie-library
+
+# Preview one existing show, then apply the reviewed episode-name/NFO repair
+./run.sh repair "Show Name" "/path/to/Show Name (2026)" --year 2026 --season 1 \
+  --metadata "/path/to/metadata.json"
+./run.sh repair "Show Name" "/path/to/Show Name (2026)" --year 2026 --season 1 \
+  --metadata "/path/to/metadata.json" --update-nfo --apply
 ```
 
 Transcoding removes inherited global and chapter metadata by default, then relies on normalized filenames, NFO, and local artwork. Organize/no-transcode mode preserves the media bytes and therefore does not alter embedded metadata.
@@ -127,6 +134,8 @@ For yt-dlp sources, omit `--format` for the best available streams or set a ceil
 
 The default Plex TV template appends a verified per-episode title when available: `Show - S01E03 - Episode title.ext`. With no reliable title it keeps `Show - S01E03.ext`. The same title and episode-specific provider ID are written to the sibling episode NFO; `tvshow.nfo` remains show-level and does not embed the episode catalogue. TMDB, TVMaze fallback, Jackett, and Prowlarr are optional; missing credentials do not block direct/local/web ingest.
 
+`repair` accepts exactly one existing show folder and emits a JSON preview by default; only explicit `--apply` changes files. It supports Season 0 and carries same-stem subtitles, episode images, and NFO with the media. Missing reliable titles preserve original paths, and `tvshow.nfo` is never changed. Every new path is copied and byte-verified before the old path is removed, so interruption can leave duplicates but not lose media. Multi-episode files such as `S01E01-E02` must still be split first.
+
 ## Safety and privacy
 
 - Search results expose review fields and candidate IDs, not stored download URLs.
@@ -134,6 +143,7 @@ The default Plex TV template appends a verified per-episode title when available
 - Signed or tokenized URLs can be supplied through a user-owned `0600` file with `--source-file`.
 - `config.json`, runtime state, logs, and caches are Git-ignored; private JSON files are written as `0600`.
 - Existing different files are never overwritten. Matching files are verified before being accepted.
+- Existing-library repair rejects library/category roots, duplicate SxxEyy media, and existing destinations; it previews by default and leaves legacy empty directories alone.
 - Archive conflict preflight prevents a late artwork conflict from leaving a task partially delivered. For incremental TV episodes, `--merge` keeps existing different show-level artwork/`tvshow.nfo` while media conflicts still fail.
 - aria2 stops after the configured sustained-zero-traffic interval (`btStopTimeoutSeconds`, default 600 seconds); source fallback remains an explicit agent/user decision.
 - Delivery/archive cleanup runs only after size, SHA-256, media, and target-identity checks succeed. Use `--keep-work` to retain the task cache for debugging.

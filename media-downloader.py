@@ -29,12 +29,13 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 CONFIG_SCHEMA_VERSION = 1
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
 ARCHIVE_EXTS = VIDEO_EXTS | SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
+REPAIR_SIDECAR_EXTS = SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
 TV_SHARED_MERGE_FILES = {"tvshow.nfo", "poster.jpg", "fanart.jpg", "banner.jpg", "clearlogo.png"}
 YTDLP_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 MAX_COMPONENT_BYTES = 200
@@ -1653,6 +1654,33 @@ def write_xml(path: Path, root: ET.Element) -> None:
     os.replace(temp, path)
 
 
+def episode_metadata(metadata: dict, season: int, episode: int) -> dict:
+    return next((
+        item for item in metadata.get("episodes", [])
+        if item.get("season") == season and item.get("episode") == episode
+    ), {})
+
+
+def episode_nfo_root(season: int, episode: int, title: str | None, details: dict) -> ET.Element:
+    root = ET.Element("episodedetails")
+    xml_text(root, "title", title or f"Episode {episode}")
+    xml_text(root, "season", season)
+    xml_text(root, "episode", episode)
+    xml_text(root, "aired", details.get("aired"))
+    xml_text(root, "plot", details.get("plot"))
+    xml_text(root, "runtime", details.get("runtime"))
+    xml_text(root, "rating", details.get("rating"))
+    for director in details.get("directors", []):
+        xml_text(root, "director", director)
+    for writer in details.get("writers", []):
+        xml_text(root, "credits", writer)
+    ids = details.get("ids", {}) if isinstance(details.get("ids"), dict) else {}
+    for id_type, value in ids.items():
+        if value:
+            ET.SubElement(root, "uniqueid", {"type": str(id_type)}).text = str(value)
+    return root
+
+
 def write_nfo(ctx: dict, plans: list[dict]) -> None:
     require_mounted_volume(ctx["baseRoot"], "工作目录")
     metadata = ctx["metadata"]
@@ -1702,27 +1730,13 @@ def write_nfo(ctx: dict, plans: list[dict]) -> None:
             first = False
     write_xml(ctx["outputRoot"] / f"{root_name}.nfo", root)
     if ctx["mediaType"] == "tv":
-        episode_items = metadata["episodes"]
         for plan in plans:
-            details = next((item for item in episode_items if item["season"] == plan["season"] and item["episode"] == plan["episode"]), {})
-            episode_root = ET.Element("episodedetails")
-            xml_text(episode_root, "title", plan.get("episodeTitle") or f"Episode {plan['episode']}")
-            xml_text(episode_root, "season", plan["season"])
-            xml_text(episode_root, "episode", plan["episode"])
-            xml_text(episode_root, "aired", details.get("aired"))
-            xml_text(episode_root, "plot", details.get("plot"))
-            xml_text(episode_root, "runtime", details.get("runtime"))
-            xml_text(episode_root, "rating", details.get("rating"))
-            for director in details.get("directors", []):
-                xml_text(episode_root, "director", director)
-            for writer in details.get("writers", []):
-                xml_text(episode_root, "credits", writer)
+            details = episode_metadata(metadata, plan["season"], plan["episode"])
             # 单集使用分集自身 ID；剧集 ID 只留在 tvshow.nfo，避免把整部剧误标成某一集。
-            episode_ids = details.get("ids", {}) if isinstance(details.get("ids"), dict) else {}
-            for id_type, value in episode_ids.items():
-                if value:
-                    ET.SubElement(episode_root, "uniqueid", {"type": str(id_type)}).text = str(value)
-            write_xml(plan["output"].with_suffix(".nfo"), episode_root)
+            write_xml(
+                plan["output"].with_suffix(".nfo"),
+                episode_nfo_root(plan["season"], plan["episode"], plan.get("episodeTitle"), details),
+            )
 
 
 def download_image(source: str, destination: Path, ctx: dict) -> None:
@@ -1815,6 +1829,217 @@ def missing_episode_report(ctx: dict, plans: list[dict]) -> str | None:
         if gaps:
             missing[f"S{season:02d}"] = gaps
     return missing or None
+
+
+def repair_root(value: str, apply: bool) -> Path:
+    raw = Path(os.path.expandvars(value)).expanduser()
+    if raw.is_symlink():
+        raise RuntimeError(f"修复目录不得是符号链接: {raw}")
+    root = raw.resolve()
+    if root in {Path("/"), Path.home().resolve(), Path("/Volumes")} or not root.is_dir():
+        raise RuntimeError(f"请指定一个已存在的单部剧目录: {root}")
+    require_mounted_volume(root, "修复目录")
+    if apply and not os.access(root, os.W_OK):
+        raise RuntimeError(f"修复目录不可写: {root}")
+    return root
+
+
+def repair_sidecars(root: Path, video: Path) -> list[Path]:
+    return sorted(
+        path for path in video.parent.iterdir()
+        if path != video
+        and path.name.startswith(f"{video.stem}.")
+        and path.suffix.lower() in REPAIR_SIDECAR_EXTS
+        and is_safe_file(root, path)
+    )
+
+
+def build_repair_plan(config: dict, args) -> dict:
+    if args.season < 0:
+        raise ValueError("--season 不得小于 0")
+    root = repair_root(args.root, args.apply)
+    metadata = resolve_metadata(config, args)
+    _profile_name, profile = select_profile(config, "tv", args.profile)
+    naming_name, naming = select_naming(config, profile, "tv", args.naming)
+    canonical = canonical_name(metadata.get("title") or args.title, metadata.get("year"))
+    videos = media_files(root)
+    if not videos:
+        raise RuntimeError(f"修复目录没有媒体文件: {root}")
+    looks_like_show = (root / "tvshow.nfo").is_file() or any(
+        len(path.relative_to(root).parts) == 1
+        or re.fullmatch(r"(?i)(?:season|s)\s*\d+|第\s*\d+\s*季", path.relative_to(root).parts[0])
+        for path in videos
+    )
+    if not looks_like_show:
+        raise RuntimeError(f"修复只接受单部剧目录，不能直接传媒体库或分类根目录: {root}")
+
+    base_fields = {
+        "title": sanitize_component(metadata.get("title") or args.title),
+        "canonical": canonical,
+        "year": metadata.get("year") or "",
+    }
+    seen_episodes = set()
+    seen_sources = set()
+    seen_targets = set()
+    moves = []
+    nfo_updates = []
+    items = []
+    for video in videos:
+        parsed = episode_from_name(video, args.season, getattr(args, "episode_offset", 0))
+        if not parsed:
+            items.append({"source": str(video), "action": "keep", "reason": "unrecognized-episode"})
+            continue
+        season, episode = parsed
+        if (season, episode) in seen_episodes:
+            raise RuntimeError(f"同一季集存在多个媒体文件，拒绝修复: S{season:02d}E{episode:02d}")
+        seen_episodes.add((season, episode))
+        details = episode_metadata(metadata, season, episode)
+        raw_title = details.get("title")
+        if not raw_title:
+            items.append({
+                "source": str(video), "action": "keep", "reason": "no-reliable-title",
+                "season": season, "episode": episode,
+            })
+            continue
+        episode_title = sanitize_component(str(raw_title))
+        fields = {
+            **base_fields,
+            "season": season,
+            "episode": episode,
+            "episodeTitle": episode_title,
+            "episodeTitleSuffix": f" - {episode_title}",
+            "ext": video.suffix.lower().lstrip("."),
+        }
+        relative = render_path(naming["seasonDir"], fields) / render_path(naming["episodeFile"], fields)
+        target_video = root / relative
+        if not target_video.resolve(strict=False).is_relative_to(root):
+            raise RuntimeError(f"修复目标逃逸: {target_video}")
+        action = "keep" if target_video == video else "rename"
+        items.append({
+            "source": str(video), "target": str(target_video), "action": action,
+            "season": season, "episode": episode, "title": episode_title,
+        })
+        for source in [video, *repair_sidecars(root, video)]:
+            if source == video:
+                target = target_video
+            else:
+                tag = source.name[len(video.stem):-len(source.suffix)]
+                target = target_video.with_name(f"{target_video.stem}{tag}{source.suffix.lower()}")
+            if source == target:
+                continue
+            if source in seen_sources or target in seen_targets:
+                raise RuntimeError(f"修复映射重复: {source} -> {target}")
+            if target.exists():
+                raise RuntimeError(f"修复目标已存在，拒绝覆盖: {target}")
+            stat_info = source.stat()
+            seen_sources.add(source)
+            seen_targets.add(target)
+            moves.append({
+                "source": source, "target": target,
+                "identity": (stat_info.st_dev, stat_info.st_ino, stat_info.st_size, stat_info.st_mtime_ns),
+            })
+        if args.update_nfo:
+            nfo_target = target_video.with_suffix(".nfo")
+            if nfo_target.is_symlink():
+                raise RuntimeError(f"NFO 目标不安全: {nfo_target}")
+            nfo_updates.append({
+                "target": nfo_target,
+                "root": episode_nfo_root(season, episode, episode_title, details),
+            })
+
+    return {
+        "version": VERSION,
+        "configSchemaVersion": CONFIG_SCHEMA_VERSION,
+        "mode": "apply" if args.apply else "preview",
+        "root": root,
+        "rootIdentity": directory_identity(root),
+        "canonical": canonical,
+        "naming": naming_name,
+        "moves": moves,
+        "nfoUpdates": nfo_updates,
+        "items": items,
+    }
+
+
+def apply_repair_plan(config: dict, plan: dict) -> None:
+    root = plan["root"]
+    state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (RUNTIME_DIR / "repair"))
+    require_work_root(state_root, "状态目录")
+    lock_name = hashlib.sha256(str(root).encode()).hexdigest()[:16]
+    with json_lock(state_root / f"repair-{lock_name}.json"):
+        require_mounted_volume(root, "修复目录")
+        if directory_identity(root) != plan["rootIdentity"]:
+            raise RuntimeError(f"修复目录在预览后发生变化: {root}")
+        for move in plan["moves"]:
+            source, target = move["source"], move["target"]
+            if not is_safe_file(root, source):
+                raise RuntimeError(f"修复来源不安全或已变化: {source}")
+            stat_info = source.stat()
+            identity = (stat_info.st_dev, stat_info.st_ino, stat_info.st_size, stat_info.st_mtime_ns)
+            if identity != move["identity"]:
+                raise RuntimeError(f"修复来源在预览后发生变化: {source}")
+            if target.exists() or target.is_symlink():
+                raise RuntimeError(f"修复目标已存在，拒绝覆盖: {target}")
+            if not target.resolve(strict=False).is_relative_to(root):
+                raise RuntimeError(f"修复目标逃逸: {target}")
+
+        for move in plan["moves"]:
+            target = move["target"]
+            ensure_target_parent({"targetRoot": root, "targetIdentity": plan["rootIdentity"]}, target.parent)
+            try:
+                os.link(move["source"], target, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise RuntimeError(f"修复目标已存在，拒绝覆盖: {target}") from exc
+            except OSError as exc:
+                if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}:
+                    raise
+                # ponytail: SMB and some filesystems lack hard links; verified copy is the safe fallback.
+                atomic_copy(move["source"], target, 0)
+
+        if directory_identity(root) != plan["rootIdentity"]:
+            raise RuntimeError(f"修复目录在执行期间发生变化: {root}")
+        for move in plan["moves"]:
+            source, target = move["source"], move["target"]
+            if not existing_matches(source, target, 0):
+                raise RuntimeError(f"修复副本校验失败，保留原文件: {target}")
+        # 所有新路径都完成逐字节校验后才移除旧路径；中途失败最多留下副本，不会丢失媒体。
+        for move in plan["moves"]:
+            move["source"].unlink()
+
+        for update in plan["nfoUpdates"]:
+            target = update["target"]
+            if not target.resolve(strict=False).is_relative_to(root):
+                raise RuntimeError(f"NFO 目标逃逸: {target}")
+            if target.is_symlink():
+                raise RuntimeError(f"NFO 目标不安全: {target}")
+            ensure_target_parent({"targetRoot": root, "targetIdentity": plan["rootIdentity"]}, target.parent)
+            descriptor, temp_name = tempfile.mkstemp(prefix="repair-nfo-", suffix=".nfo", dir=state_root)
+            os.close(descriptor)
+            temp = Path(temp_name)
+            try:
+                write_xml(temp, update["root"])
+                if target.exists():
+                    atomic_replace_nfo(temp, target)
+                else:
+                    atomic_copy(temp, target, 0)
+            finally:
+                temp.unlink(missing_ok=True)
+
+
+def command_repair(args) -> int:
+    config = load_config()
+    plan = build_repair_plan(config, args)
+    if args.apply:
+        apply_repair_plan(config, plan)
+    output = {
+        key: value for key, value in plan.items()
+        if key not in {"rootIdentity", "moves", "nfoUpdates"}
+    }
+    output["root"] = str(plan["root"])
+    output["renameCount"] = len(plan["moves"])
+    output["nfoUpdateCount"] = len(plan["nfoUpdates"])
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
 
 
 def file_digest(path: Path) -> str:
@@ -2296,6 +2521,18 @@ def parser() -> argparse.ArgumentParser:
     add_source.add_argument("--timeout", type=int, default=30)
     add_source.add_argument("--replace", action="store_true")
     add_source.set_defaults(handler=command_add_source)
+    repair = commands.add_parser("repair", help="Preview or apply safe in-place TV episode naming/NFO repair")
+    repair.add_argument("title")
+    repair.add_argument("root", help="Exact existing TV show folder; never pass a whole library root")
+    repair.add_argument("--year", type=int)
+    repair.add_argument("--season", type=int, default=1, help="Season to query from the metadata provider; Season 0 is supported")
+    repair.add_argument("--profile")
+    repair.add_argument("--naming")
+    repair.add_argument("--metadata", help="Agent-provided metadata JSON")
+    repair.add_argument("--offline", action="store_true")
+    repair.add_argument("--update-nfo", action="store_true", help="Update per-episode NFO only when reliable episode metadata is available")
+    repair.add_argument("--apply", action="store_true", help="Apply the displayed repair plan; preview is the default")
+    repair.set_defaults(handler=command_repair, media_type="tv")
     for name in ("ingest", "resume", "download"):
         add_pipeline_arguments(commands.add_parser(name, help="Acquire, transcode, organize, and archive/deliver"), source_required=False)
     for name in ("adopt", "process"):

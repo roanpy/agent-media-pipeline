@@ -1,6 +1,6 @@
 ---
 name: agent-media-pipeline
-description: Discover authorized media through Jackett, Torznab/Prowlarr, or public web sources; review candidates; acquire local files, torrents, direct links, YouTube/Bilibili videos, or playlists; transcode with TV/movie defaults or preserve the original container; generate Plex-compatible naming, NFO, and artwork; deliver locally with cache cleanup; and optionally archive to a local folder, external drive, or NAS. Use for agent-guided media search, download, organization, metadata, status, resume, and safe stop workflows.
+description: Discover authorized media through Jackett, Torznab/Prowlarr, or public web sources; review candidates; acquire local files, torrents, direct links, YouTube/Bilibili videos, or playlists; transcode with TV/movie defaults or preserve the original container; generate Plex-compatible naming, NFO, and artwork; safely preview or repair existing TV episode names/NFO; deliver locally with cache cleanup; and optionally archive to a local folder, external drive, or NAS. Use for agent-guided media search, download, organization, metadata, library repair, status, resume, and safe stop workflows.
 ---
 
 # Agent Media Pipeline
@@ -41,6 +41,8 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
    - If aria2 stops after sustained zero traffic, report the stalled candidate and use another reviewed candidate only when the user already authorized fallback or confirms it now.
 6. Run `check` until `done` or `failed`. After `stop`, run `check` again.
 7. Report the output/archive path, actual mode/profile/naming/target, file count, and unmet requirements.
+
+For an existing TV show folder, run `repair` without `--apply` first and show the complete plan. Pass exactly one show folder, never a TV library/category root. Apply only after approval. Rename only episodes with reliable provider/supplied titles; preserve original paths when titles are missing. Add `--update-nfo` only when the same reliable episode metadata should replace per-episode NFO. `tvshow.nfo` remains untouched.
 
 ## Natural-language examples
 
@@ -109,6 +111,12 @@ chmod 600 /private/tmp/source-url
 ./run.sh adopt "Show Name" "/path/to/Show.S01E02.mkv" --type tv --year 2026 \
   --metadata "/path/to/metadata.json" --update-nfo
 
+# Preview an existing single-show folder, then apply the reviewed episode-title/NFO repair
+./run.sh repair "Show Name" "/path/to/Show Name (2026)" --year 2026 --season 1 \
+  --metadata "/path/to/metadata.json" --naming plex
+./run.sh repair "Show Name" "/path/to/Show Name (2026)" --year 2026 --season 1 \
+  --metadata "/path/to/metadata.json" --naming plex --update-nfo --apply
+
 # Organize without transcoding; preserve the original container
 ./run.sh organize "Show Name" "/path/to/Show.S01E02.mkv" --type tv \
   --metadata "/path/to/metadata.json" --target tv-library
@@ -119,7 +127,7 @@ chmod 600 /private/tmp/source-url
 ./run.sh stop "Show Name (2026)"
 ```
 
-`resume` and `download` alias `ingest`; `process` aliases `adopt`. `organize` skips profile transcoding but still uses profile naming and an optional default target. Long-running commands launch in the background by default; add `--foreground` while debugging.
+`resume` and `download` alias `ingest`; `process` aliases `adopt`. `organize` skips profile transcoding but still uses profile naming and an optional default target. `repair` is foreground and preview-only unless `--apply` is explicit. Long-running pipeline commands launch in the background by default; add `--foreground` while debugging.
 
 Archive performs a complete conflict preflight before copying. `--merge` is intentionally narrow: for TV only, existing different root `poster`, `fanart`, `banner`, `clearlogo`, and `tvshow.nfo` are logged and kept. It never weakens no-clobber protection for episode media, subtitles, or episode NFO. `stop` waits for the owned task and downloader/transcoder process group to exit.
 
@@ -145,6 +153,8 @@ Try TMDB through `TMDB_API_KEY`; TV may fall back to TVMaze. Both providers are 
 Supported root artwork names are `poster`, `fanart`, `banner`, and `clearlogo`. With no TMDB key, still generate minimal valid NFO. If `metadata.requireArtwork=true` but neither a key nor supplied poster exists, warn and downgrade artwork to optional.
 
 For TV, the Plex preset may use `{episodeTitleSuffix}`. When a matched metadata episode (or an explicitly confirmed web-playlist item) has a title, name it `Show - S01E03 - Episode title.ext`; otherwise keep `Show - S01E03.ext`. Write that same title to the sibling episode NFO. Keep `tvshow.nfo` show-level only; never duplicate the whole episode catalogue into it.
+
+`repair` uses the same rule for existing libraries: no reliable episode title means no rename. It supports Season 0, moves same-stem subtitles/images/NFO with the episode, refuses duplicate SxxEyy media and existing destinations, and copies plus verifies every new path before removing an old path. It does not remove empty legacy directories. Multi-episode files such as `S01E01-E02` remain intentionally unsupported; split them before ingest or repair.
 
 Verified `metadata.title` controls canonical naming and task identity while status retains the requested title. Enable “Use local Assets” in Plex for local artwork and select Plex NFO Agent on Plex Media Server 1.43.1 or newer. Use the Plex preset for catalogued movies and TV. Prefer a separate Plex “Other Videos” library for unmatched clips or ordinary channel uploads rather than disguising them as film/TV.
 

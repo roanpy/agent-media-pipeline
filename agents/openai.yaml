@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Media Pipeline"
-  short_description: "Discover authorized media and build Plex-ready output safely"
-  default_prompt: "Use $agent-media-pipeline to inspect or process authorized media; confirm type, playlist order, quality/login needs, transcode mode, and delivery/archive choice first."
+  short_description: "Discover, process, repair, and deliver Plex-ready media safely"
+  default_prompt: "Use $agent-media-pipeline to inspect or process authorized media, or preview a safe existing-TV-library repair before applying it."
