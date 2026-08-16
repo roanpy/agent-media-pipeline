@@ -29,13 +29,14 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 CONFIG_SCHEMA_VERSION = 1
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
 ARCHIVE_EXTS = VIDEO_EXTS | SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
 TV_SHARED_MERGE_FILES = {"tvshow.nfo", "poster.jpg", "fanart.jpg", "banner.jpg", "clearlogo.png"}
+YTDLP_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 MAX_COMPONENT_BYTES = 200
 ACTIVE_CHILD: subprocess.Popen | None = None
 STOP_REQUESTED = False
@@ -93,13 +94,29 @@ def write_private_text(path: Path, value: str) -> None:
         handle.write(value)
 
 
-def read_private_text(path: Path) -> str:
+def open_private_input(path: Path, label: str, max_size: int) -> int:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     info = os.fstat(descriptor)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 64 * 1024:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) & 0o077
+        or info.st_size > max_size
+    ):
         os.close(descriptor)
-        raise RuntimeError("--source-file 必须是当前用户拥有、无组/其他权限且不超过 64KB 的普通文件")
+        raise RuntimeError(f"{label}：必须是当前用户拥有、单硬链接、无组/其他权限且不超过 {max_size // 1024}KB 的普通文件")
+    return descriptor
+
+
+def require_private_input(path: Path, label: str, max_size: int) -> Path:
+    os.close(open_private_input(path, label, max_size))
+    return path
+
+
+def read_private_text(path: Path) -> str:
+    descriptor = open_private_input(path, "--source-file", 64 * 1024)
     with os.fdopen(descriptor, encoding="utf-8") as handle:
         return handle.read().strip()
 
@@ -901,15 +918,30 @@ def signal_handler(_signum, _frame):
     STOP_REQUESTED = True
 
 
+def scrub_source_text(text: str, source: str) -> str:
+    text = text.replace(source, redacted_source(source))
+    parsed = urllib.parse.urlsplit(source)
+    if parsed.scheme in {"http", "https"}:
+        parts = {parsed.query, urllib.parse.unquote(parsed.query), parsed.fragment, urllib.parse.unquote(parsed.fragment)}
+        path = parsed.path.lstrip("/")
+        if len(path) > 1:
+            parts.update({path, urllib.parse.unquote(path)})
+        parts.update(value for _key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if len(value) > 2)
+        for part in sorted((part for part in parts if part), key=len, reverse=True):
+            text = text.replace(part, "…")
+        text = re.sub(r"https?://[^\s\"']+", lambda match: redacted_source(match.group(0)), text)
+    return text
+
+
 def scrub_log(path: Path, secrets: list[str]) -> None:
-    replacements = [(value, redacted_source(value)) for value in secrets if value]
-    if not replacements or not path.exists():
+    secrets = [value for value in secrets if value]
+    if not secrets or not path.exists():
         return
     temp = path.with_name(f".{path.name}.{os.getpid()}.scrub")
     with open(path, "r", encoding="utf-8", errors="replace") as source, open(temp, "w", encoding="utf-8") as target:
         for line in source:
-            for secret, replacement in replacements:
-                line = line.replace(secret, replacement)
+            for secret in secrets:
+                line = scrub_source_text(line, secret)
             target.write(line)
     os.chmod(temp, 0o600)
     os.replace(temp, path)
@@ -971,6 +1003,74 @@ def ytdlp_supports_no_remote_components() -> bool:
     except Exception:
         pass
     return False
+
+
+def ytdlp_auth_args(value: str | None) -> list[str]:
+    if not value:
+        return []
+    if value != value.strip() or any(ord(char) < 32 for char in value):
+        raise RuntimeError("--cookies 包含不安全控制字符")
+    browser = re.split(r"[+:]", value, maxsplit=1)[0].casefold()
+    if browser in YTDLP_BROWSERS:
+        return ["--cookies-from-browser", value]
+    expanded = os.path.expandvars(str(Path(value).expanduser()))
+    path = Path(os.path.abspath(expanded))
+    try:
+        require_private_input(path, "--cookies 文件", 10 * 1024 * 1024)
+    except OSError as exc:
+        raise RuntimeError(f"--cookies 文件无法安全读取: {path}") from exc
+    return ["--cookies", str(path)]
+
+
+def ytdlp_base_command(cookies: str | None = None) -> list[str]:
+    command = ["yt-dlp", "--ignore-config"]
+    if ytdlp_supports_no_remote_components():
+        command.append("--no-remote-components")
+    return command + ytdlp_auth_args(cookies)
+
+
+def validate_ytdlp_format(value: str | None) -> str | None:
+    if value and (value != value.strip() or len(value) > 2048 or any(ord(char) < 32 for char in value)):
+        raise RuntimeError("--format 无效")
+    return value
+
+
+def probe_summary(data: dict, playlist: bool) -> dict:
+    if playlist:
+        entries = data.get("entries") if isinstance(data.get("entries"), list) else []
+        return {
+            "kind": "playlist",
+            "id": data.get("id"),
+            "title": data.get("title"),
+            "entryCount": len(entries),
+            "entries": [
+                {
+                    "index": item.get("playlist_index") or position,
+                    "id": item.get("id"),
+                    "title": item.get("title"),
+                    "duration": item.get("duration"),
+                }
+                for position, item in enumerate(entries, 1)
+                if isinstance(item, dict)
+            ],
+        }
+    formats = data.get("formats") if isinstance(data.get("formats"), list) else []
+    return {
+        "kind": "video",
+        "id": data.get("id"),
+        "title": data.get("title"),
+        "duration": data.get("duration"),
+        "extractor": data.get("extractor_key") or data.get("extractor"),
+        "formats": [
+            {
+                key: item.get(key)
+                for key in ("format_id", "ext", "resolution", "fps", "vcodec", "acodec", "filesize", "filesize_approx", "tbr", "protocol")
+                if item.get(key) is not None
+            }
+            for item in formats
+            if isinstance(item, dict)
+        ],
+    }
 
 
 def is_safe_file(root: Path, path: Path) -> bool:
@@ -1112,6 +1212,52 @@ def command_sources(_args) -> int:
     return 0
 
 
+def command_probe(args) -> int:
+    if not shutil.which("yt-dlp"):
+        raise RuntimeError("网页媒体探测需要 yt-dlp；请先运行 doctor")
+    if bool(args.source) == bool(args.source_file):
+        raise RuntimeError("请且仅提供一个来源：位置参数或 --source-file")
+    source = args.source
+    if args.source_file:
+        expanded = os.path.expandvars(str(Path(args.source_file).expanduser()))
+        try:
+            source = read_private_text(Path(os.path.abspath(expanded)))
+        except OSError as exc:
+            raise RuntimeError("--source-file 无法安全读取") from exc
+    source = validate_source(source, allow_local=False)
+    if not 1 <= args.timeout <= 300:
+        raise RuntimeError("--timeout 必须在 1-300 秒之间")
+    descriptor, batch_name = tempfile.mkstemp(prefix="agent-media-probe-", suffix=".txt")
+    batch_path = Path(batch_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(source + "\n")
+        command = ytdlp_base_command(args.cookies) + [
+            "--simulate", "--dump-single-json",
+            "--flat-playlist" if args.playlist else "--no-playlist",
+            "--batch-file", str(batch_path),
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"yt-dlp 探测超过 {args.timeout} 秒") from exc
+    finally:
+        batch_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        detail = scrub_source_text((result.stderr or result.stdout or "yt-dlp 探测失败").strip()[-2000:], source)
+        raise RuntimeError(detail)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("yt-dlp 返回了无效 JSON") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("yt-dlp 返回的 JSON 结构无效")
+    output = {"source": redacted_source(source), "authenticated": bool(args.cookies), **probe_summary(data, args.playlist)}
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_add_source(args) -> int:
     path = config_file()
     if not path.is_file():
@@ -1226,21 +1372,15 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
         playlist_flag = "--yes-playlist" if ctx["args"].playlist else "--no-playlist"
         input_file = ctx["workRoot"] / ".yt-dlp-input.txt"
         write_private_text(input_file, source + "\n")
-        command = ["yt-dlp", "--ignore-config"]
-        if ytdlp_supports_no_remote_components():
-            command.append("--no-remote-components")
-        if ctx["args"].format:
-            command += ["--format", ctx["args"].format]
-        if ctx["args"].cookies:
-            if re.match(r"^(chrome|chromium|firefox|edge|safari|brave|opera|vivaldi)(:|$)", ctx["args"].cookies, re.IGNORECASE):
-                command += ["--cookies-from-browser", ctx["args"].cookies]
-            else:
-                command += ["--cookies", ctx["args"].cookies]
+        command = ytdlp_base_command(ctx["args"].cookies)
+        selected_format = validate_ytdlp_format(ctx["args"].format)
+        if selected_format:
+            command += ["--format", selected_format]
         command += [
             playlist_flag, "--continue",
             "--no-overwrites", "--newline",
             "--paths", str(ctx["sourceRoot"]),
-            "--output", "%(playlist_index|autonumber)03d %(title).180B [%(id)s].%(ext)s", "--batch-file", str(input_file),
+            "--output", "%(playlist_index,autonumber)03d %(title).180B [%(id)s].%(ext)s", "--batch-file", str(input_file),
         ]
         try:
             run_child(ctx, command, "downloading", task_timeout_seconds(ctx["config"]), [source])
@@ -1320,6 +1460,17 @@ def validate_video(path: Path, minimum_duration: float) -> dict:
     return info
 
 
+def resolved_episode_title(ctx: dict, source: Path, season: int, episode: int) -> str | None:
+    details = next((
+        item for item in ctx.get("metadata", {}).get("episodes", [])
+        if item.get("season") == season and item.get("episode") == episode
+    ), {})
+    title = details.get("title")
+    if not title and getattr(ctx["args"], "playlist", False):
+        title = re.sub(r"^\d+\s+|\s+\[[^]]+\]$", "", source.stem)
+    return sanitize_component(str(title)) if title else None
+
+
 def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
     media_type = ctx["mediaType"]
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
@@ -1349,13 +1500,24 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
             if (season, episode) in seen_episodes:
                 raise RuntimeError(f"多个来源映射到同一集: S{season:02d}E{episode:02d}")
             seen_episodes.add((season, episode))
-            episode_fields = {**fields, "season": season, "episode": episode}
+            episode_title = resolved_episode_title(ctx, source, season, episode)
+            episode_fields = {
+                **fields,
+                "season": season,
+                "episode": episode,
+                "episodeTitle": episode_title or "",
+                "episodeTitleSuffix": f" - {episode_title}" if episode_title else "",
+            }
             relative = render_path(ctx["naming"]["seasonDir"], episode_fields) / render_path(ctx["naming"]["episodeFile"], episode_fields)
         if relative in seen:
             raise RuntimeError(f"多个来源映射到同一输出: {relative}")
         seen.add(relative)
         stat = source.stat()
-        plans.append({"source": source, "sourceInfo": source_info, "sourceSize": stat.st_size, "sourceMtimeNs": stat.st_mtime_ns, "relative": relative, "season": season, "episode": episode})
+        plans.append({
+            "source": source, "sourceInfo": source_info, "sourceSize": stat.st_size, "sourceMtimeNs": stat.st_mtime_ns,
+            "relative": relative, "season": season, "episode": episode,
+            "episodeTitle": episode_title if media_type == "tv" else None,
+        })
     return plans
 
 
@@ -1505,8 +1667,7 @@ def write_nfo(ctx: dict, plans: list[dict]) -> None:
         for plan in plans:
             details = next((item for item in episode_items if item["season"] == plan["season"] and item["episode"] == plan["episode"]), {})
             episode_root = ET.Element("episodedetails")
-            playlist_title = re.sub(r"^\d+\s+|\s+\[[^]]+\]$", "", plan["source"].stem)
-            xml_text(episode_root, "title", details.get("title") or (playlist_title if ctx["args"].playlist else f"Episode {plan['episode']}"))
+            xml_text(episode_root, "title", plan.get("episodeTitle") or f"Episode {plan['episode']}")
             xml_text(episode_root, "season", plan["season"])
             xml_text(episode_root, "episode", plan["episode"])
             xml_text(episode_root, "aired", details.get("aired"))
@@ -1736,6 +1897,25 @@ def archive_existing_action(ctx: dict, source: Path, target: Path, relative: Pat
     raise RuntimeError(f"目标已存在且内容不同，拒绝覆盖: {target}")
 
 
+def reject_existing_episode_alias(ctx: dict, target: Path, relative: Path) -> None:
+    if ctx["mediaType"] != "tv" or relative.suffix.lower() not in VIDEO_EXTS or not target.parent.is_dir():
+        return
+    marker = re.search(r"(?i)S\d{2}E\d{2,3}", relative.name)
+    if not marker:
+        return
+    for existing in target.parent.iterdir():
+        existing_marker = re.search(r"(?i)S\d{2}E\d{2,3}", existing.name)
+        if (
+            existing != target
+            and existing.is_file()
+            and not existing.is_symlink()
+            and existing.suffix.lower() in VIDEO_EXTS
+            and existing_marker
+            and existing_marker.group().casefold() == marker.group().casefold()
+        ):
+            raise RuntimeError(f"同一季集已存在，拒绝创建重复文件: {existing}")
+
+
 def archive(ctx: dict, phase: str = "archiving", action: str = "归档") -> list[str]:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
     output_root = ctx["outputRoot"].resolve()
@@ -1753,6 +1933,7 @@ def archive(ctx: dict, phase: str = "archiving", action: str = "归档") -> list
         target = ctx["targetShow"] / relative
         if not target.resolve(strict=False).is_relative_to(ctx["targetRoot"]):
             raise RuntimeError("归档目标逃逸")
+        reject_existing_episode_alias(ctx, target, relative)
         prepared.append((source, relative, target, archive_existing_action(ctx, source, target, relative, minimum)))
     archived = []
     for source, relative, target, prepared_action in prepared:
@@ -1796,6 +1977,14 @@ def pipeline(args) -> int:
         args.copy_original = config.get("defaultModes", {}).get(args.media_type, "transcode") == "organize"
     ctx = build_context(config, args)
     source, requested_downloader = resolve_source(args)
+    downloader = classify_downloader(source, requested_downloader)
+    if args.playlist and args.media_type != "tv":
+        raise RuntimeError("--playlist 必须使用 --type tv，才能按播放顺序映射季集")
+    if (args.format or args.cookies) and downloader != "yt-dlp":
+        raise RuntimeError("--format/--cookies 只适用于 yt-dlp 网页来源")
+    if downloader == "yt-dlp":
+        validate_ytdlp_format(args.format)
+        ytdlp_auth_args(args.cookies)
     plan = {
         "version": VERSION, "configSchemaVersion": CONFIG_SCHEMA_VERSION,
         "taskId": ctx["id"], "title": ctx["canonical"], "mediaType": ctx["mediaType"],
@@ -1805,6 +1994,10 @@ def pipeline(args) -> int:
         "mode": "organize" if args.copy_original else "transcode",
         "archive": not args.no_archive,
         "merge": args.merge,
+        "playlist": args.playlist,
+        "format": args.format or "best available",
+        "authenticated": bool(args.cookies),
+        "downloader": downloader,
         "targetPath": str(ctx["targetShow"]), "source": redacted_source(source),
     }
     if args.dry_run:
@@ -2044,6 +2237,13 @@ def parser() -> argparse.ArgumentParser:
     search.set_defaults(handler=command_search)
     sources = commands.add_parser("sources", help="List search sources in the private config")
     sources.set_defaults(handler=command_sources)
+    probe = commands.add_parser("probe", help="Inspect a YouTube/Bilibili video or playlist and list available quality formats")
+    probe.add_argument("source", nargs="?")
+    probe.add_argument("--source-file", help="Private 0600 file holding exactly one URL")
+    probe.add_argument("--playlist", action="store_true", help="Inspect playlist structure and ordering instead of one video")
+    probe.add_argument("--cookies", help="Browser name or private cookies.txt path")
+    probe.add_argument("--timeout", type=int, default=120)
+    probe.set_defaults(handler=command_probe)
     add_source = commands.add_parser("add-source", help="Add a user-confirmed search source to private config.json")
     add_source.add_argument("name")
     add_source.add_argument("url")

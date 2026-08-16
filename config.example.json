@@ -20,7 +20,7 @@
       "tv": {
         "showDir": "{canonical}",
         "seasonDir": "Season {season:02d}",
-        "episodeFile": "{canonical} - S{season:02d}E{episode:02d}.{ext}"
+        "episodeFile": "{canonical} - S{season:02d}E{episode:02d}{episodeTitleSuffix}.{ext}"
       },
       "movie": {
         "showDir": "{canonical}",

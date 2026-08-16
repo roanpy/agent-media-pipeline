@@ -106,7 +106,11 @@ def config(root: Path, port: int) -> Path:
             "plex": {
                 "tv": {"showDir": "{canonical}", "seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}.{ext}"},
                 "movie": {"showDir": "{canonical}", "movieFile": "{canonical}.{ext}"},
-            }
+            },
+            "plex-title": {
+                "tv": {"showDir": "{canonical}", "seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}{episodeTitleSuffix}.{ext}"},
+                "movie": {"showDir": "{canonical}", "movieFile": "{canonical}.{ext}"},
+            },
         },
         "profiles": {
             "tv": {"type": "tv", "container": "mp4", "resolution": 90, "videoCodec": "libx264", "crf": 28, "audioCodec": "aac", "audioBitrate": "64k", "preset": "ultrafast", "target": "tv"},
@@ -254,6 +258,19 @@ def assert_path_and_naming_guards(module, root: Path):
     else:
         raise AssertionError("replaced target roots must be rejected")
 
+    episode_dir = root / "episode-alias" / "Season 02"
+    episode_dir.mkdir(parents=True)
+    existing_episode = episode_dir / "Show - S02E03 - Old title.mkv"
+    existing_episode.write_bytes(b"old")
+    try:
+        module.reject_existing_episode_alias(
+            {"mediaType": "tv"}, episode_dir / "Show - S02E03 - New title.mkv", Path("Season 02/Show - S02E03 - New title.mkv")
+        )
+    except RuntimeError as exc:
+        assert "同一季集已存在" in str(exc)
+    else:
+        raise AssertionError("different names for the same episode must not create duplicates")
+
     canonical_id = module.task_id("movie", "测试电影 (2025)", root / "movie")
     assert canonical_id == module.task_id("movie", "测试电影 (2025)", root / "movie")
     assert canonical_id != module.task_id("movie", "测试电影 (2025)", root / "other-movie")
@@ -277,9 +294,28 @@ def assert_path_and_naming_guards(module, root: Path):
         plans = module.planned_outputs({
             "mediaType": "tv", "config": {"minMediaDurationSeconds": 0}, "args": playlist_args,
             "namingFields": {"canonical": "课程", "ext": "mkv"},
-            "naming": {"seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}.{ext}"},
+            "naming": {"seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}{episodeTitleSuffix}.{ext}"},
         }, playlist_files)
         assert [(plan["season"], plan["episode"]) for plan in plans] == [(3, 5), (3, 6)]
+        assert plans[0]["relative"].name == "课程 - S03E05 - 开场.mkv"
+        titled = playlist_root / "Show.S02E03.mkv"
+        untitled = playlist_root / "Show.S02E04.mkv"
+        titled.write_bytes(b"x")
+        untitled.write_bytes(b"x")
+        naming = {"seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}{episodeTitleSuffix}.{ext}"}
+        titled_plan = module.planned_outputs({
+            "mediaType": "tv", "config": {"minMediaDurationSeconds": 0},
+            "args": type("Args", (), {"copy_original": True, "season": 1, "episode": None, "playlist": False})(),
+            "metadata": {"episodes": [{"season": 2, "episode": 3, "title": "单集/标题"}]},
+            "namingFields": {"canonical": "剧名", "ext": "mkv"}, "naming": naming,
+        }, [titled])[0]
+        assert titled_plan["relative"].name == "剧名 - S02E03 - 单集 标题.mkv"
+        untitled_plan = module.planned_outputs({
+            "mediaType": "tv", "config": {"minMediaDurationSeconds": 0},
+            "args": type("Args", (), {"copy_original": True, "season": 1, "episode": None, "playlist": False})(),
+            "metadata": {"episodes": []}, "namingFields": {"canonical": "剧名", "ext": "mkv"}, "naming": naming,
+        }, [untitled])[0]
+        assert untitled_plan["relative"].name == "剧名 - S02E04.mkv"
     finally:
         module.validate_video = original_validate
     try:
@@ -296,6 +332,9 @@ def assert_path_and_naming_guards(module, root: Path):
     assert module.classify_downloader(long_magnet, "auto") == "aria2"
     assert module.is_plausible_path(long_magnet) is False
     assert module.is_plausible_path("https://example.test/video.mp4") is False
+    signed = "https://example.test/private/video?token=DO_NOT_LEAK&expires=123"
+    scrubbed = module.scrub_source_text(f"failed private/video?token=DO_NOT_LEAK&expires=123 from {signed}", signed)
+    assert "DO_NOT_LEAK" not in scrubbed and "expires=123" not in scrubbed, scrubbed
     # 回归实际 acquire 分支：长 magnet 必须写入 aria2 input-file，不能进入 Path.exists()。
     magnet_work = root / "magnet-work"
     magnet_source = magnet_work / "source"
@@ -319,6 +358,62 @@ def assert_path_and_naming_guards(module, root: Path):
         assert "--bt-stop-timeout=600" in captured[0], captured
     finally:
         module.log, module.run_child, module.shutil.which = original_log, original_run_child, original_which
+
+    # yt-dlp：格式、登录、播放列表顺序和输出模板必须显式且可审计。
+    cookie_file = root / "cookies.txt"
+    cookie_file.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    cookie_file.chmod(0o600)
+    assert module.ytdlp_auth_args("chrome") == ["--cookies-from-browser", "chrome"]
+    assert module.ytdlp_auth_args("whale:Default") == ["--cookies-from-browser", "whale:Default"]
+    assert module.ytdlp_auth_args(str(cookie_file)) == ["--cookies", str(cookie_file)]
+    cookie_file.chmod(0o644)
+    try:
+        module.ytdlp_auth_args(str(cookie_file))
+    except RuntimeError as exc:
+        assert "--cookies 文件：必须" in str(exc)
+    else:
+        raise AssertionError("insecure cookies files must be rejected")
+    cookie_file.chmod(0o600)
+    try:
+        module.validate_ytdlp_format("best\n--exec=x")
+    except RuntimeError as exc:
+        assert "--format 无效" in str(exc)
+    else:
+        raise AssertionError("yt-dlp format control characters must be rejected")
+    playlist_probe = module.probe_summary({"id": "p", "title": "Playlist", "entries": [
+        {"id": "a", "title": "One", "playlist_index": 1},
+        {"id": "b", "title": "Two", "playlist_index": 2},
+    ]}, True)
+    assert playlist_probe["entryCount"] == 2
+    assert [item["index"] for item in playlist_probe["entries"]] == [1, 2]
+    web_work = root / "yt-work"
+    web_source = web_work / "source"
+    web_source.mkdir(parents=True)
+    web_media = web_source / "001 Example [id].mp4"
+    web_media.write_bytes(b"x")
+    captured = []
+    original_log, original_run_child = module.log, module.run_child
+    original_which, original_remote_check = module.shutil.which, module.ytdlp_supports_no_remote_components
+    try:
+        module.log = lambda *_args: None
+        module.run_child = lambda _ctx, command, *_args: captured.append(command)
+        module.shutil.which = lambda name: f"/fake/{name}"
+        module.ytdlp_supports_no_remote_components = lambda: True
+        acquired = module.acquire({
+            "sourceRoot": web_source,
+            "workRoot": web_work,
+            "config": {"timeoutHours": 1},
+            "args": type("Args", (), {"playlist": True, "format": "bv*[height<=720]+ba/b", "cookies": "chrome"})(),
+        }, "https://example.test/playlist", "yt-dlp")
+        assert acquired == [web_media]
+        command = captured[0]
+        assert command[command.index("--output") + 1].startswith("%(playlist_index,autonumber)03d"), command
+        assert command[command.index("--format") + 1] == "bv*[height<=720]+ba/b", command
+        assert command[command.index("--cookies-from-browser") + 1] == "chrome", command
+        assert "--yes-playlist" in command
+    finally:
+        module.log, module.run_child = original_log, original_run_child
+        module.shutil.which, module.ytdlp_supports_no_remote_components = original_which, original_remote_check
 
     # customWords：屏蔽/替换作用于检索词；偏移按 media_type+清洗后标题匹配
     words_config = {"customWords": {
@@ -430,7 +525,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.2.0 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.2.1 (config schema 1)"
         module = assert_atomic_copy_never_overwrites(root)
         assert_path_and_naming_guards(module, root)
         assert_tmdb_auth_modes()
@@ -468,7 +563,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.2.0"
+            assert doctor_payload["version"] == "0.2.1"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -552,7 +647,7 @@ def main():
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
-            assert delivery_plan["version"] == "0.2.0" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.2.1" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
@@ -564,6 +659,60 @@ def main():
             delivery_state = json.loads((root / "status.json").read_text(encoding="utf-8"))[delivery_plan["taskId"]]
             assert delivery_state["targetPath"] == str(delivery_output.resolve())
             assert all(Path(path).is_relative_to(delivery_output.resolve()) for path in delivery_state["archivedFiles"])
+
+            # 播放列表必须由单条 ingest 自动连续完成：获取 → 整理 → NFO → 交付 → 清缓存。
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            fake_ytdlp = fake_bin / "yt-dlp"
+            fake_ytdlp.write_text("""#!/usr/bin/env python3
+import os, shutil, sys
+from pathlib import Path
+if "--version" in sys.argv:
+    print("2026.07.04")
+    raise SystemExit(0)
+args = sys.argv[1:]
+output = Path(args[args.index("--paths") + 1])
+output.mkdir(parents=True, exist_ok=True)
+for index, title in enumerate(("开端", "相逢", "归途"), 1):
+    shutil.copy2(os.environ["FAKE_YTDLP_MEDIA"], output / f"{index:03d} {title} [id{index}].mp4")
+""", encoding="utf-8")
+            fake_ytdlp.chmod(0o755)
+            playlist_config = dict(delivery_config)
+            playlist_config["namingPresets"] = json.loads(json.dumps(delivery_config["namingPresets"]))
+            playlist_config["namingPresets"]["plex"]["tv"]["episodeFile"] = "{canonical} - S{season:02d}E{episode:02d}{episodeTitleSuffix}.{ext}"
+            playlist_cfg = root / "playlist-config.json"
+            playlist_cfg.write_text(json.dumps(playlist_config, ensure_ascii=False), encoding="utf-8")
+            playlist_metadata = root / "playlist-metadata.json"
+            playlist_metadata.write_text(json.dumps({
+                "title": "列表剧", "year": 2026,
+                "episodes": [
+                    {"season": 1, "episode": 1, "title": "开端"},
+                    {"season": 1, "episode": 2, "title": "相逢"},
+                    {"season": 1, "episode": 3, "title": "归途"},
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            playlist_env = {
+                **delivery_env,
+                "MEDIA_DOWNLOADER_CONFIG": str(playlist_cfg),
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "FAKE_YTDLP_MEDIA": str(root / "http" / "Remote.S01E01.mp4"),
+            }
+            playlist_command = [
+                sys.executable, str(SCRIPT), "ingest", "列表剧", "https://example.test/playlist",
+                "--type", "tv", "--downloader", "yt-dlp", "--playlist", "--season", "1", "--episode", "1",
+                "--metadata", str(playlist_metadata), "--no-transcode", "--no-archive", "--offline",
+            ]
+            playlist_plan = json.loads(run([*playlist_command, "--dry-run"], env=playlist_env).stdout)
+            run(playlist_command, env=playlist_env)
+            playlist_output = delivery_root / "列表剧 (2026)" / "Season 01"
+            for episode_number, title in enumerate(("开端", "相逢", "归途"), 1):
+                media = playlist_output / f"列表剧 (2026) - S01E{episode_number:02d} - {title}.mp4"
+                assert media.is_file() and media.with_suffix(".nfo").is_file()
+                assert_xml(media.with_suffix(".nfo"), f"<title>{title}</title>")
+            assert (delivery_root / "列表剧 (2026)" / "tvshow.nfo").is_file()
+            assert not (root / "work" / ".media-downloader-work" / playlist_plan["taskId"]).exists()
+            playlist_state = json.loads((root / "status.json").read_text(encoding="utf-8"))[playlist_plan["taskId"]]
+            assert playlist_state["phase"] == "done" and len(playlist_state["archivedFiles"]) == 7
 
             # --keep-work 保留缓存和处理产物，同时仍交付下载目录
             keep_command = [sys.executable, str(SCRIPT), "adopt", "保留工作区", str(root / "source" / "Film.mkv"), "--type", "movie", "--no-transcode", "--no-archive", "--offline", "--keep-work"]
@@ -672,6 +821,16 @@ def main():
             assert remote.is_file()
 
             web_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
+            probed = run([sys.executable, str(SCRIPT), "probe", web_url], env=env)
+            probe_payload = json.loads(probed.stdout)
+            assert probe_payload["kind"] == "video"
+            assert probe_payload["source"].startswith("http://127.0.0.1:")
+            assert probe_payload["formats"], probe_payload
+            invalid_movie_playlist = run([
+                sys.executable, str(SCRIPT), "ingest", "Web Playlist", web_url,
+                "--downloader", "yt-dlp", "--type", "movie", "--target", "movie", "--playlist", "--dry-run", "--offline",
+            ], env=env, expect=1)
+            assert "--playlist 必须使用 --type tv" in invalid_movie_playlist.stderr
             run([sys.executable, str(SCRIPT), "ingest", "Web Remote", web_url, "--downloader", "yt-dlp", "--type", "tv", "--target", "tv", "--offline"], env=env)
             web_remote = root / "tv" / "Web Remote" / "Season 01" / "Web Remote - S01E01.mp4"
             assert web_remote.is_file()

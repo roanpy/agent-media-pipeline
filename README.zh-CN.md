@@ -22,8 +22,8 @@
 | --- | --- |
 | Agent 辅助发现 | Jackett、通用 Torznab/Prowlarr、可复用网页搜索模板，以及浏览器辅助的公开来源发现 |
 | 多种获取方式 | 本地文件、magnet、torrent 文件、HTTP(S) 链接，以及 YouTube/Bilibili 等 yt-dlp 支持的网站 |
-| 明确的处理选择 | TV/电影默认模式，以及逐任务转码、免转码、播放列表和归档开关 |
-| Plex 友好输出 | 电影/剧集命名、NFO、字幕、海报、背景图、横幅和透明 Logo |
+| 明确的处理选择 | TV/电影默认模式，以及逐任务转码、免转码、播放列表、来源质量、登录会话和归档开关 |
+| Plex 友好输出 | 电影/剧集命名（可带可靠单集标题）、剧集级/单集级 NFO、字幕、海报、背景图、横幅和透明 Logo |
 | 本地交付或归档 | 成品可交付到 `downloadDir`，也可预检后增量合并/原子归档到已有媒体库目标 |
 | 安全与恢复 | 私有配置、来源脱敏、任务锁、失败工作区恢复、防覆盖、SHA-256、停止和挂载检查 |
 
@@ -58,10 +58,13 @@ chmod 600 config.json
 下载用户有权使用的 YouTube/Bilibili 播放列表，按电视剧整理，不转码也不归档：
 
 ```bash
+./run.sh probe "PLAYLIST_URL" --playlist
 ./run.sh ingest "课程名称" "PLAYLIST_URL" \
   --type tv --downloader yt-dlp --playlist \
   --season 1 --episode 1 --no-transcode --no-archive
 ```
+
+`probe URL` 会列出单个视频的可用格式；`probe URL --playlist` 返回脱敏后的播放列表数量和顺序。仅当用户自己的 YouTube/Bilibili 会话确实需要登录时，才在探测和下载中同时加入 `--cookies chrome`，或传入当前用户拥有且权限为 `0600` 的 Netscape cookies.txt。
 
 运行 `./run.sh --help`、`./run.sh ingest --help`，或直接调用 [`agent-media-pipeline` Skill](SKILL.md) 用自然语言描述任务。
 
@@ -91,6 +94,10 @@ brew install ffmpeg aria2 yt-dlp
 ./run.sh profiles
 ./run.sh sources
 
+# 查看单视频可用质量，或核实播放列表数量与顺序
+./run.sh probe "VIDEO_URL"
+./run.sh probe "PLAYLIST_URL" --playlist --cookies chrome
+
 # 搜索结构化来源；真实下载 URL 不对外显示
 ./run.sh search "剧名 S01" --source jackett --type tv --timeout 90
 
@@ -113,6 +120,10 @@ brew install ffmpeg aria2 yt-dlp
 ```
 
 转码默认清理继承的全局和章节内嵌元数据，再由规范文件名、NFO 和本地图片提供 Plex 资料。免转码整理保持媒体字节不变，因此不会修改内嵌元数据。
+
+yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时可使用 `--format "bv*[height<=720]+ba/b[height<=720]"`。它只控制下载源，不决定流水线是否转码：默认转码 profile 决定最终 MP4，`--no-transcode` 则保留 yt-dlp 下载后的编码和容器。播放列表及 Bilibili 分 P/合集必须使用 `--type tv --playlist`，并在核实顺序后从 `--season`/`--episode` 开始映射。
+
+默认 Plex 电视剧模板在取得可靠单集标题时命名为 `剧名 - S01E03 - 单集标题.ext`；没有标题则保持 `剧名 - S01E03.ext`。同一个标题写入该集旁边的单集 NFO；`tvshow.nfo` 只保存整部剧资料，不重复塞入全季集数清单。
 
 ## 安全与隐私
 

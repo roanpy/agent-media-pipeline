@@ -25,6 +25,7 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
    - Run `profiles` to inspect `defaultModes.tv|movie`.
    - If the user says “use the default,” apply it directly.
    - If the user only supplies media and does not specify type, transcode mode, or archive choice, explain the relevant defaults and ask for the missing decisions.
+   - For YouTube/Bilibili, run `probe` before acquisition when the item count, ordering, login requirement, or available quality is uncertain.
 3. Discover sources.
    - Run `./run.sh sources` to inspect configured sources.
    - Jackett/Torznab: `./run.sh search "query" --source NAME --type tv|movie --timeout 90` for slow aggregate indexers.
@@ -70,14 +71,16 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
   --profile tv1080 --target tv-library --naming plex --merge
 
 # Use a final web-media URL
+./run.sh probe "https://authorized.example/video"
 ./run.sh ingest "Movie Name" "https://authorized.example/video" --type movie \
   --downloader yt-dlp --profile movie1080 --target movie-library
 
-# Map an explicitly approved YouTube/Bilibili playlist to sequential TV episodes
+# Inspect and map an explicitly approved YouTube/Bilibili playlist to sequential TV episodes
+./run.sh probe "PLAYLIST_URL" --playlist
 ./run.sh ingest "Course Name" "PLAYLIST_URL" --type tv --downloader yt-dlp \
   --playlist --season 1 --episode 1 --no-transcode
 
-# Select yt-dlp format (decides whether transcoding is needed) and login for member-only/high-quality content
+# Select source quality and use the user's authorized browser session when the site requires login
 ./run.sh ingest "Course Name" "PLAYLIST_URL" --type tv --downloader yt-dlp \
   --playlist --format "bv*[height<=720]+ba/b[height<=720]" --cookies chrome
 
@@ -122,9 +125,11 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 - Structured candidates expire after seven days. The agent sees review fields and `candidateId`; the private `0600` cache retains the real download URL.
 - Put signed/tokenized URLs in a user-owned regular `0600` `--source-file` rather than a command argument.
 - Playlists are disabled by default. Add `--playlist` only after the user explicitly requests the whole list.
-- For TV playlists without recognizable episode tokens, assign episodes in playlist order starting from `--season` (default 1) and `--episode` (default 1). Confirm ordering first.
-- `--format` passes a yt-dlp format selector (e.g. `bv*[height<=720]+ba/b[height<=720]`) and decides whether the downloaded stream needs transcoding; confirm the user's quality requirement first.
-- `--cookies` takes a browser name for `--cookies-from-browser` (`chrome`, `firefox`, `edge`, `safari`, `brave`, `opera`, `vivaldi`) or a path to a Netscape cookies.txt for `--cookies`. Required for Bilibili 1080P+ and member-only content; without login those streams fail or fall back to lower quality.
+- Use `probe URL` for a single item's formats; use `probe URL --playlist` for the title, count, and ordered entry list. Add the same `--cookies` value when anonymous probing is blocked. Probe output excludes media URLs and cookies.
+- Use `--type tv --playlist` for a playlist or Bilibili multi-part collection. For items without recognizable episode tokens, assign episodes in playlist order starting from `--season` (default 1) and `--episode` (default 1). Confirm count and ordering first.
+- Omit `--format` for yt-dlp's best available selection. Use a selector such as `bv*[height<=720]+ba/b[height<=720]` for a ceiling, or exact format IDs reported by `probe`. A source selector does not decide pipeline transcoding.
+- Default `transcode` profiles produce final MP4 regardless of the downloaded container. `--no-transcode` preserves the downloaded codecs/container; if MP4 is mandatory, use the MP4 transcode profile rather than assuming a web source provides MP4.
+- `--cookies` takes a supported browser spec (`chrome`, `firefox`, `edge`, `safari`, `brave`, `chromium`, `opera`, `vivaldi`, `whale`) or a current-user-owned `0600` Netscape cookies.txt path. Use it only for the user's authorized session when YouTube bot checks or Bilibili login/quality restrictions require authentication. Do not export, log, copy, or commit cookies, and do not attempt to bypass DRM, CAPTCHA, membership, or regional controls.
 - `--no-archive` needs no library target or NAS. Transcoding/organization, NFO, and artwork still run. With `downloadDir`, output is validated and copied to `downloadDir/<Plex folder>` before the owned cache is removed; `--keep-work` retains it. Without `downloadDir`, the Plex-ready folder remains in the owned workspace for backward compatibility. Status `targetPath` always identifies the final output.
 
 ## Metadata and Plex
@@ -132,6 +137,8 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 Try TMDB through `TMDB_API_KEY`; TV may fall back to TVMaze. A metadata JSON may override or supplement title, original/sort title, year, premiere date, plot, tagline, content rating, rating, runtime, status, genres, countries, tags, studio, directors, writers, actors, external IDs, episode details, and artwork URLs/paths.
 
 Supported root artwork names are `poster`, `fanart`, `banner`, and `clearlogo`. With no TMDB key, still generate minimal valid NFO. If `metadata.requireArtwork=true` but neither a key nor supplied poster exists, warn and downgrade artwork to optional.
+
+For TV, the Plex preset may use `{episodeTitleSuffix}`. When a matched metadata episode (or an explicitly confirmed web-playlist item) has a title, name it `Show - S01E03 - Episode title.ext`; otherwise keep `Show - S01E03.ext`. Write that same title to the sibling episode NFO. Keep `tvshow.nfo` show-level only; never duplicate the whole episode catalogue into it.
 
 Verified `metadata.title` controls canonical naming and task identity while status retains the requested title. Enable “Use local Assets” in Plex for local artwork and select Plex NFO Agent on Plex Media Server 1.43.1 or newer. Use the Plex preset for catalogued movies and TV. Prefer a separate Plex “Other Videos” library for unmatched clips or ordinary channel uploads rather than disguising them as film/TV.
 
@@ -148,7 +155,7 @@ Run `cp config.example.json config.json && chmod 600 config.json`. The example u
 - `defaultModes.tv|movie`: `transcode` or `organize`; omitted values remain backward-compatible as `transcode`.
 - `downloadDir`: final local destination for `--no-archive`; it is created when its parent is writable, may equal or sit inside `baseDir`, but must never sit inside `.media-downloader-work`.
 - `targets`: optional local directory, external-drive, or NAS presets; keep `{}` for local-only use.
-- `namingPresets`: TV/movie path templates; `plex` is the default.
+- `namingPresets`: TV/movie path templates; `plex` is the default. TV templates can use `{episodeTitle}` or the optional separator-aware `{episodeTitleSuffix}`.
 - `metadata`: TMDB, TVMaze fallback, and artwork requirements.
 - `customWords`: pre-recognition word handling with three arrays. `ignore` removes noise tokens (e.g. `全39集`, `更新至`) from the metadata query; `replace` rewrites tokens (`{"from": "第12话", "to": "E12"}`) before episode parsing; `episodeOffset` shifts episode numbers for split-season/continuous numbering (`{"pattern": "(?i)show-name", "offset": 50}`), where `pattern` matches against `<media_type>:<cleaned title>`. Cleaning affects lookup only; the stored `metadata.title` keeps the supplied title.
 

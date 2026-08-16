@@ -22,8 +22,8 @@ It works without a NAS, a media server, Docker, or an `*Arr` stack. Archive targ
 | --- | --- |
 | Agent-guided discovery | Jackett, generic Torznab/Prowlarr, reusable web search templates, and browser-assisted public-source discovery |
 | Multiple acquisition paths | Local files, magnet links, torrent files, HTTP(S) links, and yt-dlp-supported pages including YouTube and Bilibili |
-| Explicit processing choices | TV/movie defaults with per-task `--transcode`, `--no-transcode`, playlist, `--format` (yt-dlp selector), `--cookies` (browser or cookies.txt), and archive overrides |
-| Plex-ready output | Movie and TV naming, NFO, subtitles, poster, fanart, banner, and clear logo assets |
+| Explicit processing choices | TV/movie defaults with per-task transcode, organize, playlist, source-quality, authenticated-session, and archive overrides |
+| Plex-ready output | Movie and TV naming (including optional episode titles), per-show/per-episode NFO, subtitles, poster, fanart, banner, and clear logo assets |
 | Local delivery or archival | Deliver finished Plex folders to `downloadDir`, or preflight and atomically merge/archive them into an existing library target |
 | Safety and recovery | Private configuration, redacted sources, task locks, resumable workspaces, no-clobber archival, SHA-256 checks, safe stop, and mounted-volume checks |
 
@@ -58,10 +58,13 @@ The example configuration delivers local output to `$HOME/MediaDownloader/Incomi
 Download an authorized YouTube or Bilibili playlist, organize it as a TV season, keep the original containers, and leave the result locally:
 
 ```bash
+./run.sh probe "PLAYLIST_URL" --playlist
 ./run.sh ingest "Course Name" "PLAYLIST_URL" \
   --type tv --downloader yt-dlp --playlist \
   --season 1 --episode 1 --no-transcode --no-archive
 ```
+
+`probe URL` lists a single video's available formats. `probe URL --playlist` returns a redacted JSON summary of playlist count and order. Add `--cookies chrome` (or a private `0600` Netscape cookies.txt path) to both probe and ingest only when the user's authorized YouTube/Bilibili session is required.
 
 Run `./run.sh --help`, `./run.sh ingest --help`, or invoke the [`agent-media-pipeline` Skill](SKILL.md) and ask the agent in natural language.
 
@@ -91,6 +94,10 @@ Secrets stay in environment variables such as `TMDB_API_KEY`, `JACKETT_API_KEY`,
 ./run.sh profiles
 ./run.sh sources
 
+# Inspect one video's source formats, or a playlist's count and order
+./run.sh probe "VIDEO_URL"
+./run.sh probe "PLAYLIST_URL" --playlist --cookies chrome
+
 # Search configured structured sources; download URLs remain private
 ./run.sh search "Show Name S01" --source jackett --type tv --timeout 90
 
@@ -113,6 +120,10 @@ Secrets stay in environment variables such as `TMDB_API_KEY`, `JACKETT_API_KEY`,
 ```
 
 Transcoding removes inherited global and chapter metadata by default, then relies on normalized filenames, NFO, and local artwork. Organize/no-transcode mode preserves the media bytes and therefore does not alter embedded metadata.
+
+For yt-dlp sources, omit `--format` for the best available streams or set a ceiling such as `--format "bv*[height<=720]+ba/b[height<=720]"`. This controls source selection only. The default transcode profile determines the final MP4 output; `--no-transcode` preserves yt-dlp's downloaded codecs and container. Playlists and Bilibili multi-part collections require `--type tv --playlist` and are mapped in confirmed playlist order from `--season`/`--episode`.
+
+The default Plex TV template appends a verified per-episode title when available: `Show - S01E03 - Episode title.ext`. With no reliable title it keeps `Show - S01E03.ext`. The same title is written to the sibling episode NFO; `tvshow.nfo` remains show-level and does not embed the episode catalogue.
 
 ## Safety and privacy
 
