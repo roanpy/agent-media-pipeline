@@ -958,6 +958,21 @@ def stop_child(process: subprocess.Popen) -> None:
         process.wait()
 
 
+def ytdlp_supports_no_remote_components() -> bool:
+    # --no-remote-components 从 yt-dlp 2025.11 才有；旧版（含最后一个支持 Python 3.9 的 2025.10）不认识会 exit 2。
+    # 旧版没有远程组件机制，不加该参数本身即安全。
+    try:
+        output = subprocess.run(
+            ["yt-dlp", "--version"], capture_output=True, text=True, timeout=10, check=True
+        ).stdout.strip()
+        parts = output.split(".")
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            return (int(parts[0]), int(parts[1])) >= (2025, 11)
+    except Exception:
+        pass
+    return False
+
+
 def is_safe_file(root: Path, path: Path) -> bool:
     return path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(root.resolve())
 
@@ -1211,8 +1226,11 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
         playlist_flag = "--yes-playlist" if ctx["args"].playlist else "--no-playlist"
         input_file = ctx["workRoot"] / ".yt-dlp-input.txt"
         write_private_text(input_file, source + "\n")
-        command = [
-            "yt-dlp", "--ignore-config", "--no-remote-components", playlist_flag, "--continue",
+        command = ["yt-dlp", "--ignore-config"]
+        if ytdlp_supports_no_remote_components():
+            command.append("--no-remote-components")
+        command += [
+            playlist_flag, "--continue",
             "--no-overwrites", "--newline",
             "--paths", str(ctx["sourceRoot"]),
             "--output", "%(playlist_index|autonumber)03d %(title).180B [%(id)s].%(ext)s", "--batch-file", str(input_file),
