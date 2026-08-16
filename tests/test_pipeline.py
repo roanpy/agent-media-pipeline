@@ -212,6 +212,11 @@ def assert_tmdb_auth_modes():
         calls.append((url, dict(params), dict(headers or {})))
         if "/search/" in url:
             return {"results": [{"id": 42, "name": "Stub", "first_air_date": "2020-01-01"}]}
+        if "/season/" in url:
+            return {"episodes": [{
+                "id": 999, "season_number": 2, "episode_number": 3, "name": "第三集",
+                "overview": "剧情", "air_date": "2020-01-03", "runtime": 45, "vote_average": 8.2,
+            }]}
         return {"id": 42, "name": "Stub", "first_air_date": "2020-01-01"}
 
     original = module.http_json
@@ -220,14 +225,17 @@ def assert_tmdb_auth_modes():
         config = {"metadata": {"apiKeyEnv": "TEST_TMDB_AUTH_KEY"}}
         # v4 JWT（eyJ 开头）必须走 Bearer header，且不出现 api_key 参数
         os.environ["TEST_TMDB_AUTH_KEY"] = "eyJhbGciOiJIUzI1NiJ9.stub.sig"
-        module.fetch_tmdb(config, "tv", "Stub", None)
+        fetched = module.fetch_tmdb(config, "tv", "Stub", None, 2)
         assert calls[0][2].get("Authorization") == "Bearer eyJhbGciOiJIUzI1NiJ9.stub.sig", calls
         assert "api_key" not in calls[0][1], calls
         assert calls[1][2].get("Authorization") == "Bearer eyJhbGciOiJIUzI1NiJ9.stub.sig", calls
+        assert calls[2][2].get("Authorization") == "Bearer eyJhbGciOiJIUzI1NiJ9.stub.sig", calls
+        assert fetched["episodes"][0]["title"] == "第三集"
+        assert fetched["episodes"][0]["ids"]["tmdb"] == 999
         calls.clear()
         # v3 key 保持 api_key 参数，不带 Authorization header
         os.environ["TEST_TMDB_AUTH_KEY"] = "v3-api-key-123"
-        module.fetch_tmdb(config, "tv", "Stub", None)
+        module.fetch_tmdb(config, "tv", "Stub", None, 2)
         assert calls[0][1].get("api_key") == "v3-api-key-123", calls
         assert not calls[0][2].get("Authorization"), calls
         assert calls[1][1].get("api_key") == "v3-api-key-123", calls
@@ -542,7 +550,7 @@ def main():
         metadata.write_text(json.dumps({
             "title": "示例剧", "originalTitle": "Example Show", "year": 2026,
             "plot": "测试剧情", "ids": {"tmdb": 123}, "posterPath": str(root / "source" / "poster.png"),
-            "episodes": [{"season": 2, "episode": 3, "title": "第三集", "plot": "单集剧情"}],
+            "episodes": [{"season": 2, "episode": 3, "title": "第三集", "plot": "单集剧情", "ids": {"tmdb": 999}}],
         }, ensure_ascii=False), encoding="utf-8")
         movie_metadata = root / "movie-metadata.json"
         movie_metadata.write_text(json.dumps({
@@ -570,6 +578,11 @@ def main():
             assert checks["work:state"] == "ok"
             assert checks["target:tv"] == "ok"
             assert checks["target:movie"] == "unavailable"
+            optional_env = dict(env)
+            optional_env.pop("TEST_JACKETT_KEY", None)
+            optional_doctor = run([sys.executable, str(SCRIPT), "doctor"], env=optional_env)
+            optional_checks = {item["name"]: item["status"] for item in json.loads(optional_doctor.stdout)["checks"]}
+            assert optional_checks["search:jackett"] == "optional-missing"
             (root / "movie").mkdir()
             env_target = run([sys.executable, str(SCRIPT), "doctor"], env={**env, "MEDIA_DOWNLOADER_TARGET_DIR": str(root / "tv")})
             env_checks = {item["name"]: item["status"] for item in json.loads(env_target.stdout)["checks"]}
@@ -660,9 +673,20 @@ def main():
             assert delivery_state["targetPath"] == str(delivery_output.resolve())
             assert all(Path(path).is_relative_to(delivery_output.resolve()) for path in delivery_state["archivedFiles"])
 
+            no_deliver_command = [
+                sys.executable, str(SCRIPT), "adopt", "仅留工作区", str(root / "source" / "Film.mkv"),
+                "--type", "movie", "--no-transcode", "--no-deliver", "--offline",
+            ]
+            no_deliver_plan = json.loads(run([*no_deliver_command, "--dry-run"], env=delivery_env).stdout)
+            assert no_deliver_plan["archive"] is False and no_deliver_plan["target"] == "work"
+            run(no_deliver_command, env=delivery_env)
+            no_deliver_work = root / "work" / ".media-downloader-work" / no_deliver_plan["taskId"]
+            assert (no_deliver_work / "output" / "仅留工作区" / "仅留工作区.mkv").is_file()
+            assert not (delivery_root / "仅留工作区").exists()
+
             # 播放列表必须由单条 ingest 自动连续完成：获取 → 整理 → NFO → 交付 → 清缓存。
             fake_bin = root / "fake-bin"
-            fake_bin.mkdir()
+            fake_bin.mkdir(exist_ok=True)
             fake_ytdlp = fake_bin / "yt-dlp"
             fake_ytdlp.write_text("""#!/usr/bin/env python3
 import os, shutil, sys
@@ -765,7 +789,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
 
             # stop 必须等待父任务和 aria2 进程组退出，并把最终状态写成 stopped。
             fake_bin = root / "fake-bin"
-            fake_bin.mkdir()
+            fake_bin.mkdir(exist_ok=True)
             fake_aria2 = fake_bin / "aria2c"
             fake_aria2.write_text("#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n", encoding="utf-8")
             fake_aria2.chmod(0o700)
@@ -843,9 +867,32 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert (show / "poster.jpg").is_file()
             assert_xml(show / "tvshow.nfo", "<uniqueid type=\"tmdb\" default=\"true\">123</uniqueid>")
             assert_xml(episode.with_suffix(".nfo"), "<title>第三集</title>")
-            assert_xml(episode.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">123</uniqueid>")
+            assert_xml(episode.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">999</uniqueid>")
             episode_digest = episode.read_bytes()
             poster_digest = (show / "poster.jpg").read_bytes()
+
+            titled_metadata = root / "titled-metadata.json"
+            titled_metadata.write_text(json.dumps({
+                "title": "标题剧", "year": 2026,
+                "episodes": [{"season": 2, "episode": 3, "title": "可靠的单集标题", "ids": {"tmdb": 1003}}],
+            }, ensure_ascii=False), encoding="utf-8")
+            titled_command = [
+                sys.executable, str(SCRIPT), "organize", "标题剧", str(root / "source" / "Example.S02E03.mkv"),
+                "--type", "tv", "--year", "2026", "--target", "tv", "--naming", "plex-title",
+                "--metadata", str(titled_metadata), "--offline",
+            ]
+            run(titled_command, env=env)
+            titled_episode = root / "tv" / "标题剧 (2026)" / "Season 02" / "标题剧 (2026) - S02E03 - 可靠的单集标题.mkv"
+            assert titled_episode.is_file()
+            assert_xml(titled_episode.with_suffix(".nfo"), "<title>可靠的单集标题</title>")
+            assert_xml(titled_episode.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">1003</uniqueid>")
+            titled_metadata.write_text(json.dumps({
+                "title": "标题剧", "year": 2026,
+                "episodes": [{"season": 2, "episode": 3, "title": "后来修改的标题", "ids": {"tmdb": 1003}}],
+            }, ensure_ascii=False), encoding="utf-8")
+            duplicate_title = run(titled_command, env=env, expect=1)
+            assert "同一季集已存在" in duplicate_title.stderr
+            assert len(list(titled_episode.parent.glob("*.mkv"))) == 1
 
             # 分集并行归档：冲突先预检，普通模式不得产生部分视频；--merge 只跳过节目级共享文件。
             increment_source = root / "source" / "Increment.S02E04.mkv"
@@ -874,7 +921,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             metadata.write_text(json.dumps({
                 "title": "示例剧", "originalTitle": "Example Show", "year": 2026,
                 "plot": "更新后的剧集简介", "ids": {"tmdb": 123}, "posterPath": str(root / "source" / "poster.png"),
-                "episodes": [{"season": 2, "episode": 3, "title": "修正后的第三集", "plot": "更新后的单集简介"}],
+                "episodes": [{"season": 2, "episode": 3, "title": "修正后的第三集", "plot": "更新后的单集简介", "ids": {"tmdb": 999}}],
             }, ensure_ascii=False), encoding="utf-8")
             refused_nfo = run([sys.executable, str(SCRIPT), "adopt", "示例剧", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--year", "2026", "--target", "tv", "--metadata", str(metadata), "--offline"], env=env, expect=1)
             assert "拒绝覆盖" in refused_nfo.stderr
