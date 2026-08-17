@@ -12,7 +12,7 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
 - Handle only sources the user is authorized to access, download, and archive. Never bypass DRM, paywalls, authentication controls, CAPTCHAs, or site restrictions.
 - Do not provide infringing sources, circumvention instructions, credentials, or keys.
 - Return and compare candidates before downloading unless the user supplied an exact source or explicitly authorized automatic selection.
-- Keep API keys, cookies, tokens, and credential-bearing URLs out of commands, configuration, logs, and responses. Store keys only in environment variables.
+- Keep API keys, cookies, tokens, and credential-bearing URLs out of commands, configuration, logs, and responses. Store keys only in environment variables. The private `config.json` must be owned by the current user, have no group/other permissions, and must not be a symlink.
 - Archival is optional. With `--no-archive`, deliver to configured `downloadDir`; without that setting, retain the Plex-ready folder in the owned workspace for backward compatibility. Archive targets must already exist and be writable; external volumes must be mounted. Never create a fake mount directory.
 - Never overwrite an existing different file. Preserve the owned workspace and source after failure.
 - Remove a Skill-created workspace only after size, SHA-256, media-validity, and delivery/archive-target checks pass.
@@ -142,6 +142,7 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 - `add-source` writes only to private, Git-ignored `config.json`, rejects embedded credentials and duplicate names, and requires `--replace` for a confirmed replacement.
 - Structured candidates expire after seven days. The agent sees review fields and `candidateId`; the private `0600` cache retains the real download URL.
 - Put signed/tokenized URLs in a user-owned regular `0600` `--source-file` rather than a command argument.
+- Failed local-file tasks record a source snapshot (path, inode, size, modification time, and directory/sidecar manifest). If the local source changes before retry, the pipeline refuses to reuse the work area; use `--reset-work` only after confirming the new source.
 - Playlists are disabled by default. Add `--playlist` only after the user explicitly requests the whole list.
 - Use `probe URL` for a single item's formats; use `probe URL --playlist` for the title, count, and ordered entry list. Add the same `--cookies` value when anonymous probing is blocked. Probe output excludes media URLs and cookies.
 - Use `--type tv --playlist` for a playlist or Bilibili multi-part collection. For items without recognizable episode tokens, assign episodes in playlist order starting from `--season` (default 1) and `--episode` (default 1). Confirm count and ordering first.
@@ -149,6 +150,7 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 - Let the configured default profile decide the final container; the example and current deployed defaults use MP4. `--no-transcode` preserves downloaded codecs/container. Run `profiles` before naming a profile because private deployments may not contain every example profile.
 - `--cookies` takes a supported browser spec (`chrome`, `firefox`, `edge`, `safari`, `brave`, `chromium`, `opera`, `vivaldi`, `whale`) or a current-user-owned `0600` Netscape cookies.txt path. Use it only for the user's authorized session when YouTube bot checks or Bilibili login/quality restrictions require authentication. Do not export, log, copy, or commit cookies, and do not attempt to bypass DRM, CAPTCHA, membership, or regional controls.
 - `--write-subs` downloads external manual/auto subtitle tracks with the yt-dlp media, converts them to `srt`, and carries them through organize/transcode as same-stem sidecar files. `--sub-langs` requires `--write-subs`, takes comma-separated codes, and defaults to `metadata.subtitleLanguages`, then metadata language, then `zh-CN`. No third-party subtitle provider is contacted.
+- Metadata and remote artwork requests require DNS-resolved public destinations and reject cross-host or HTTPS downgrade redirects; configured API credentials cannot be forwarded to another host. Direct local artwork paths and explicitly configured local indexers remain supported.
 - `--no-archive` needs no library target or NAS. Transcoding/organization, NFO, and artwork still run. With `downloadDir`, output is validated and copied to `downloadDir/<Plex folder>` before the owned cache is removed; `--keep-work` retains it. Without `downloadDir`, the Plex-ready folder remains in the owned workspace for backward compatibility. Status `targetPath` always identifies the final output.
 - `--no-deliver` implies `--no-archive`, ignores configured `downloadDir` for that task, and retains the Plex-ready folder/workspace. Use it only when the user explicitly wants no transfer and no cleanup of that task workspace.
 

@@ -34,6 +34,12 @@ def run(command, *, env=None, expect=0, cwd=PROJECT):
     return result
 
 
+def write_config(path: Path, data: dict) -> Path:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
 def make_video(path: Path, seconds: int = 3):
     path.parent.mkdir(parents=True, exist_ok=True)
     run([
@@ -148,9 +154,7 @@ def config(root: Path, port: int) -> Path:
         },
         "metadata": {"provider": "none", "tvFallback": "none", "requireArtwork": False},
     }
-    path = root / "config.json"
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    return write_config(root / "config.json", data)
 
 
 def assert_xml(path: Path, expected: str):
@@ -350,6 +354,43 @@ def assert_path_and_naming_guards(module, root: Path):
     first_fingerprint = module.source_fingerprint(fingerprint_ctx, "https://example.test/video")
     fingerprint_args.sub_langs = "en"
     assert first_fingerprint != module.source_fingerprint(fingerprint_ctx, "https://example.test/video")
+    local_file = root / "fingerprint-source.mkv"
+    local_file.write_bytes(b"source-v1")
+    local_first = module.source_fingerprint(fingerprint_ctx, str(local_file))
+    local_file.write_bytes(b"source-v2-with-a-different-size")
+    assert local_first != module.source_fingerprint(fingerprint_ctx, str(local_file))
+    local_dir = root / "fingerprint-directory"
+    local_dir.mkdir()
+    (local_dir / "episode.mkv").write_bytes(b"episode")
+    directory_first = module.source_fingerprint(fingerprint_ctx, str(local_dir))
+    (local_dir / "episode.zh.srt").write_text("subtitle", encoding="utf-8")
+    assert directory_first != module.source_fingerprint(fingerprint_ctx, str(local_dir))
+    assert module.validate_redirect_target("http://example.test/a", "https://example.test/b").endswith("/b")
+    try:
+        module.validate_redirect_target("https://example.test/a", "https://other.test/b")
+    except RuntimeError as exc:
+        assert "跨主机" in str(exc)
+    else:
+        raise AssertionError("cross-host redirects must be rejected")
+    try:
+        module.validate_redirect_target("https://example.test/a", "http://example.test/b")
+    except RuntimeError as exc:
+        assert "HTTPS" in str(exc)
+    else:
+        raise AssertionError("HTTPS downgrade redirects must be rejected")
+    for blocked_url in ("http://127.0.0.1/", "http://10.0.0.1/", "http://[::1]/", "http://[::ffff:127.0.0.1]/"):
+        try:
+            module.validate_public_http_url(blocked_url)
+        except RuntimeError as exc:
+            assert "内网" in str(exc)
+        else:
+            raise AssertionError(f"private HTTP destination must be rejected: {blocked_url}")
+    try:
+        module.validate_public_http_url("https://example.test:bad/")
+    except RuntimeError as exc:
+        assert "URL" in str(exc)
+    else:
+        raise AssertionError("malformed HTTP ports must be rejected")
     command = module.ffmpeg_command({"profile": {"container": "mp4", "videoCodec": "libx264", "audioCodec": "aac", "resolution": 720}}, Path("input.mkv"), Path("output.mp4"))
     assert command[command.index("-map_metadata") + 1] == "-1"
     assert command[command.index("-map_chapters") + 1] == "-1"
@@ -624,7 +665,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.2 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.3 (config schema 1)"
         module = assert_atomic_copy_never_overwrites(root)
         assert_path_and_naming_guards(module, root)
         assert_tmdb_auth_modes()
@@ -660,10 +701,20 @@ def main():
             cfg = config(root, port)
             env = {**os.environ, "MEDIA_DOWNLOADER_CONFIG": str(cfg), "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "status.json"), "MEDIA_DOWNLOADER_CANDIDATE_FILE": str(root / "candidates.json"), "MEDIA_DOWNLOADER_OFFLINE": "1", "TEST_JACKETT_KEY": "secret-key", "TEST_TORZNAB_KEY": "secret-key"}
 
+            insecure_cfg = root / "insecure-config.json"
+            shutil.copy2(cfg, insecure_cfg)
+            insecure_cfg.chmod(0o644)
+            insecure_doctor = run([sys.executable, str(SCRIPT), "doctor"], env={**env, "MEDIA_DOWNLOADER_CONFIG": str(insecure_cfg)}, expect=1)
+            assert "配置文件" in insecure_doctor.stderr and "组/其他权限" in insecure_doctor.stderr
+            linked_cfg = root / "linked-config.json"
+            linked_cfg.symlink_to(cfg)
+            linked_doctor = run([sys.executable, str(SCRIPT), "doctor"], env={**env, "MEDIA_DOWNLOADER_CONFIG": str(linked_cfg)}, expect=1)
+            assert "配置文件无法安全读取" in linked_doctor.stderr
+
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.2"
+            assert doctor_payload["version"] == "0.4.3"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -683,7 +734,7 @@ def main():
             modes = json.loads(cfg.read_text(encoding="utf-8"))
             modes["defaultModes"] = {"tv": "organize", "movie": "transcode"}
             modes_cfg = root / "modes.json"
-            modes_cfg.write_text(json.dumps(modes), encoding="utf-8")
+            write_config(modes_cfg, modes)
             modes_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(modes_cfg)}
             tv_default = run([sys.executable, str(SCRIPT), "adopt", "Mode TV", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--target", "tv", "--offline", "--dry-run"], env=modes_env)
             assert json.loads(tv_default.stdout)["mode"] == "organize"
@@ -695,7 +746,7 @@ def main():
             assert json.loads(movie_override.stdout)["mode"] == "organize"
             modes.pop("defaultModes")
             legacy_cfg = root / "legacy-modes.json"
-            legacy_cfg.write_text(json.dumps(modes), encoding="utf-8")
+            write_config(legacy_cfg, modes)
             legacy_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(legacy_cfg)}
             legacy_default = run([sys.executable, str(SCRIPT), "adopt", "Legacy Mode", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--offline", "--dry-run"], env=legacy_env)
             assert json.loads(legacy_default.stdout)["mode"] == "transcode"
@@ -703,7 +754,7 @@ def main():
             assert json.loads(profiles.stdout)["defaultModes"] == {"tv": "organize", "movie": "transcode"}
 
             source_cfg = root / "source-config.json"
-            source_cfg.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
+            write_config(source_cfg, json.loads(cfg.read_text(encoding="utf-8")))
             source_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(source_cfg)}
             added_web = run([sys.executable, str(SCRIPT), "add-source", "public_web", "https://example.test/search?q={query}", "--type", "web"], env=source_env)
             assert json.loads(added_web.stdout)["saved"] == "public_web"
@@ -721,7 +772,7 @@ def main():
             broken_work = json.loads(cfg.read_text(encoding="utf-8"))
             broken_work["baseDir"] = "/"
             broken_work_cfg = root / "broken-work.json"
-            broken_work_cfg.write_text(json.dumps(broken_work), encoding="utf-8")
+            write_config(broken_work_cfg, broken_work)
             broken_doctor = run([sys.executable, str(SCRIPT), "doctor"], env={**env, "MEDIA_DOWNLOADER_CONFIG": str(broken_work_cfg)}, expect=1)
             broken_checks = {item["name"]: item["status"] for item in json.loads(broken_doctor.stdout)["checks"]}
             assert broken_checks["work:base"] == "error"
@@ -730,7 +781,7 @@ def main():
             no_archive_config = json.loads(cfg.read_text(encoding="utf-8"))
             no_archive_config["targets"] = {}
             no_archive_cfg = root / "no-archive.json"
-            no_archive_cfg.write_text(json.dumps(no_archive_config), encoding="utf-8")
+            write_config(no_archive_cfg, no_archive_config)
             no_archive_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(no_archive_cfg)}
             no_archive_command = [sys.executable, str(SCRIPT), "adopt", "仅处理电影", str(root / "source" / "Film.mkv"), "--type", "movie", "--no-transcode", "--no-archive", "--offline"]
             no_archive_plan = json.loads(run([*no_archive_command, "--dry-run"], env=no_archive_env).stdout)
@@ -745,14 +796,14 @@ def main():
             delivery_root = root / "work" / "Incoming"
             delivery_config["downloadDir"] = str(delivery_root)
             delivery_cfg = root / "delivery.json"
-            delivery_cfg.write_text(json.dumps(delivery_config), encoding="utf-8")
+            write_config(delivery_cfg, delivery_config)
             delivery_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(delivery_cfg)}
             delivery_checks = {item["name"]: item["status"] for item in json.loads(run([sys.executable, str(SCRIPT), "doctor"], env=delivery_env).stdout)["checks"]}
             assert delivery_checks["download:output"] == "ok"
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
-            assert delivery_plan["version"] == "0.4.2" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.3" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
@@ -797,7 +848,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             playlist_config["namingPresets"] = json.loads(json.dumps(delivery_config["namingPresets"]))
             playlist_config["namingPresets"]["plex"]["tv"]["episodeFile"] = "{canonical} - S{season:02d}E{episode:02d}{episodeTitleSuffix}.{ext}"
             playlist_cfg = root / "playlist-config.json"
-            playlist_cfg.write_text(json.dumps(playlist_config, ensure_ascii=False), encoding="utf-8")
+            write_config(playlist_cfg, playlist_config)
             playlist_metadata = root / "playlist-metadata.json"
             playlist_metadata.write_text(json.dumps({
                 "title": "列表剧", "year": 2026,
@@ -843,7 +894,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             unsafe_delivery = dict(delivery_config)
             unsafe_delivery["downloadDir"] = str(root / "work" / ".media-downloader-work" / "Incoming")
             unsafe_delivery_cfg = root / "unsafe-delivery.json"
-            unsafe_delivery_cfg.write_text(json.dumps(unsafe_delivery), encoding="utf-8")
+            write_config(unsafe_delivery_cfg, unsafe_delivery)
             unsafe_delivery_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(unsafe_delivery_cfg)}
             unsafe_result = run([*delivery_command, "--dry-run"], env=unsafe_delivery_env, expect=1)
             assert "不得位于任务工作区内" in unsafe_result.stderr
@@ -852,7 +903,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             artwork = json.loads(cfg.read_text(encoding="utf-8"))
             artwork["metadata"] = {"provider": "tmdb", "apiKeyEnv": "UNSET_TEST_TMDB_KEY", "tvFallback": "none", "requireArtwork": True}
             artwork_cfg = root / "artwork.json"
-            artwork_cfg.write_text(json.dumps(artwork), encoding="utf-8")
+            write_config(artwork_cfg, artwork)
             artwork_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(artwork_cfg)}
             artwork_env.pop("UNSET_TEST_TMDB_KEY", None)
             downgraded = run([sys.executable, str(SCRIPT), "adopt", "降级剧", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--target", "tv", "--offline"], env=artwork_env)
@@ -1181,7 +1232,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             overlap = json.loads(cfg.read_text(encoding="utf-8"))
             overlap["baseDir"] = str(root / "tv")
             overlap_cfg = root / "overlap.json"
-            overlap_cfg.write_text(json.dumps(overlap), encoding="utf-8")
+            write_config(overlap_cfg, overlap)
             bad_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(overlap_cfg)}
             failed = run([sys.executable, str(SCRIPT), "adopt", "Unsafe", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "tv", "--offline"], env=bad_env, expect=1)
             assert "不得重叠" in failed.stderr

@@ -9,11 +9,13 @@ import datetime as dt
 import errno
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -29,7 +31,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 CONFIG_SCHEMA_VERSION = 1
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
@@ -122,8 +124,13 @@ def read_private_text(path: Path) -> str:
         return handle.read().strip()
 
 
+def config_input_file() -> Path:
+    """Keep the unresolved path so load_config can reject symlinked config files."""
+    return Path(os.environ.get("MEDIA_DOWNLOADER_CONFIG", DEFAULT_CONFIG_FILE)).expanduser()
+
+
 def config_file() -> Path:
-    return Path(os.environ.get("MEDIA_DOWNLOADER_CONFIG", DEFAULT_CONFIG_FILE)).expanduser().resolve()
+    return config_input_file().resolve()
 
 
 def validate_config(data: dict) -> None:
@@ -245,9 +252,18 @@ def validate_config(data: dict) -> None:
 
 
 def load_config() -> dict:
-    if not config_file().is_file():
-        raise RuntimeError(f"配置不存在: {config_file()}；请复制 config.example.json 为 config.json")
-    data = read_json(config_file())
+    input_path = config_input_file()
+    display_path = config_file()
+    if not input_path.is_file():
+        raise RuntimeError(f"配置不存在: {display_path}；请复制 config.example.json 为 config.json")
+    try:
+        descriptor = open_private_input(input_path, "配置文件", 10 * 1024 * 1024)
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise RuntimeError(f"配置文件无法安全读取: {display_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"JSON 文件无效: {display_path}: {exc}") from exc
     if not isinstance(data, dict):
         raise RuntimeError("配置根节点必须是对象")
     validate_config(data)
@@ -519,11 +535,104 @@ def read_response(response, limit: int, label: str) -> bytes:
     return payload
 
 
+def _normalized_hostname(hostname: str) -> str:
+    hostname = hostname.rstrip(".")
+    try:
+        address = ipaddress.ip_address(hostname.split("%", 1)[0])
+    except ValueError:
+        try:
+            return hostname.encode("idna").decode("ascii").casefold()
+        except UnicodeError as exc:
+            raise RuntimeError("外部请求主机名无效") from exc
+    return address.compressed.casefold()
+
+
+def _http_endpoint(url: str) -> tuple[str, str, int]:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.casefold()
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("外部请求 URL 无效") from exc
+    if scheme not in {"http", "https"} or not hostname or username or password:
+        raise RuntimeError("外部请求 URL 无效")
+    return scheme, _normalized_hostname(hostname), port or (443 if scheme == "https" else 80)
+
+
+def _is_public_address(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return False
+    if getattr(address, "ipv4_mapped", None) is not None:
+        address = address.ipv4_mapped
+    return bool(address.is_global)
+
+
+def validate_public_http_url(url: str) -> str:
+    """Reject literal or DNS-resolved local/private HTTP(S) destinations."""
+    _scheme, hostname, port = _http_endpoint(url)
+    try:
+        ipaddress.ip_address(hostname)
+        addresses = [hostname]
+    except ValueError:
+        try:
+            resolved = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise RuntimeError("外部请求主机无法解析") from exc
+        addresses = sorted({str(item[4][0]) for item in resolved if item[4]})
+    if not addresses or any(not _is_public_address(address) for address in addresses):
+        raise RuntimeError("外部请求目标不得指向本地或内网地址")
+    return url
+
+
+def validate_redirect_target(original_url: str, target_url: str, *, allow_private: bool = True) -> str:
+    target_url = urllib.parse.urljoin(original_url, target_url)
+    old_scheme, old_host, old_port = _http_endpoint(original_url)
+    new_scheme, new_host, new_port = _http_endpoint(target_url)
+    upgrade_port = old_scheme == "http" and new_scheme == "https" and old_port == 80 and new_port == 443
+    if old_host != new_host or (old_port != new_port and not upgrade_port) or (old_scheme == "https" and new_scheme != "https"):
+        raise RuntimeError("禁止外部请求跨主机或 HTTPS 降级重定向")
+    if not allow_private:
+        validate_public_http_url(target_url)
+    return target_url
+
+
+class SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+
+    def __init__(self, allow_private: bool):
+        super().__init__()
+        self.allow_private = allow_private
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        safe_url = validate_redirect_target(req.full_url, newurl, allow_private=self.allow_private)
+        return super().redirect_request(req, fp, code, msg, headers, safe_url)
+
+
+HTTP_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), SameHostRedirectHandler(allow_private=True)
+)
+PUBLIC_HTTP_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), SameHostRedirectHandler(allow_private=False)
+)
+
+
+def http_open(request, timeout: int, *, allow_private: bool = False):
+    if not allow_private:
+        validate_public_http_url(request.full_url)
+    opener = HTTP_OPENER if allow_private else PUBLIC_HTTP_OPENER
+    return opener.open(request, timeout=timeout)
+
+
 def http_json(url: str, params: dict, headers: dict | None = None, timeout: int = 20):
     query = urllib.parse.urlencode({key: value for key, value in params.items() if value not in (None, "")})
     request = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": "media-downloader/2.0", **(headers or {})})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with http_open(request, timeout=timeout) as response:
             return json.loads(read_response(response, 5 * 1024 * 1024, urllib.parse.urlsplit(url).netloc).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"{urllib.parse.urlsplit(url).netloc} 返回 HTTP {exc.code}") from exc
@@ -814,9 +923,65 @@ def build_context(config: dict, args) -> dict:
     }
 
 
+def local_source_snapshot(source: str) -> dict | None:
+    """Return a cheap, deterministic snapshot for a local source.
+
+    The snapshot deliberately uses inode/size/mtime rather than hashing an entire
+    media file on every retry.  It still catches replacement, truncation, rename,
+    sidecar, and directory-content changes without making a multi-gigabyte local
+    adopt pay an extra full read before processing starts.
+    """
+    if not is_plausible_path(source):
+        return None
+    path = resolve_path(source)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"kind": "missing", "path": str(path)}
+
+    def record(item: Path, relative: str) -> tuple:
+        item_info = item.lstat()
+        mode = stat.S_IMODE(item_info.st_mode)
+        if stat.S_ISLNK(item_info.st_mode):
+            return ("symlink", relative, os.readlink(item), mode)
+        if stat.S_ISREG(item_info.st_mode):
+            return ("file", relative, item_info.st_ino, item_info.st_size, item_info.st_mtime_ns, mode)
+        if stat.S_ISDIR(item_info.st_mode):
+            return ("directory", relative, item_info.st_ino, item_info.st_mtime_ns, mode)
+        return ("other", relative, item_info.st_ino, item_info.st_size, item_info.st_mtime_ns, mode)
+
+    if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return {"kind": "file", "path": str(path), "record": record(path, path.name)}
+    if not stat.S_ISDIR(info.st_mode):
+        return {"kind": "other", "path": str(path), "record": record(path, path.name)}
+
+    records = [record(path, ".")]
+    for current, directories, files in os.walk(path, topdown=True, followlinks=False):
+        current_path = Path(current)
+        kept_directories = []
+        for name in sorted(directories):
+            child = current_path / name
+            if child.is_symlink():
+                records.append(record(child, str(child.relative_to(path))))
+            else:
+                kept_directories.append(name)
+        directories[:] = kept_directories
+        for name in sorted(files):
+            child = current_path / name
+            records.append(record(child, str(child.relative_to(path))))
+    encoded = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return {
+        "kind": "directory",
+        "path": str(path),
+        "entryCount": len(records),
+        "digest": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def source_fingerprint(ctx: dict, source: str) -> str:
     payload = {
         "source": source,
+        "localSource": local_source_snapshot(source),
         "canonical": ctx["canonical"],
         "mediaType": ctx["mediaType"],
         "profile": ctx["profile"],
@@ -1203,7 +1368,7 @@ def torznab_search(name: str, source: dict, query: str, media_type: str, limit: 
         params["cat"] = ",".join(str(value) for value in source["categories"])
     request = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers={"User-Agent": "media-downloader/2.0"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout or int(source.get("timeoutSeconds", 90))) as response:
+        with http_open(request, timeout=timeout or int(source.get("timeoutSeconds", 90)), allow_private=True) as response:
             root = ET.fromstring(read_response(response, 10 * 1024 * 1024, f"Torznab {name}"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Torznab {name} 返回 HTTP {exc.code}") from exc
@@ -1814,7 +1979,7 @@ def download_image(source: str, destination: Path, ctx: dict) -> None:
     if source.startswith(("http://", "https://")):
         request = urllib.request.Request(source, headers={"User-Agent": "media-downloader/2.0"})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response, open(temp_source, "wb") as handle:
+            with http_open(request, timeout=30) as response, open(temp_source, "wb") as handle:
                 remaining = 25 * 1024 * 1024
                 while remaining > 0:
                     if STOP_REQUESTED:
@@ -2582,7 +2747,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--no-archive", action="store_true", help="Skip archive transfer; deliver to downloadDir if configured, else keep output in the workspace")
     parser.add_argument("--no-deliver", action="store_true", help="Do not archive or deliver; keep Plex-ready output in the owned workspace")
     parser.add_argument("--keep-work", action="store_true", help="Keep the download cache/workspace after completion (cleaned by default after delivery/archive)")
-    parser.add_argument("--reset-work", action="store_true")
+    parser.add_argument("--reset-work", action="store_true", help="确认来源已更换后，重建失败任务工作区")
     parser.add_argument("--update-nfo", action="store_true", help="Atomically update existing NFO only; never overwrites media, subtitles, or artwork")
     parser.add_argument("--merge", action="store_true", help="For incremental TV archives, keep existing different show-level artwork/tvshow.nfo; media conflicts still fail")
     if mode_override:
