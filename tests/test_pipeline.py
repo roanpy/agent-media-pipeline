@@ -47,17 +47,24 @@ def make_video(path: Path, seconds: int = 3):
 def make_subtitled_video(path: Path, seconds: int = 3):
     path.parent.mkdir(parents=True, exist_ok=True)
     subtitle = path.with_name(f".{path.stem}.srt")
+    attachment = path.with_name(f".{path.stem}.font.txt")
     subtitle.write_text("1\n00:00:00,000 --> 00:00:02,000\n保留字幕\n", encoding="utf-8")
+    attachment.write_text("subtitle font attachment", encoding="utf-8")
     run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12",
         "-f", "lavfi", "-i", "sine=frequency=1000",
         "-i", str(subtitle),
         "-t", str(seconds), "-map", "0:v", "-map", "1:a", "-map", "2:s",
+        "-metadata", "title=源容器标题",
+        "-metadata:s:v:0", "title=视频轨道", "-metadata:s:a:0", "language=jpn", "-metadata:s:a:0", "title=日语音轨",
+        "-metadata:s:s:0", "language=chi", "-metadata:s:s:0", "title=中文",
+        "-attach", str(attachment), "-metadata:s:t:0", "mimetype=text/plain", "-metadata:s:t:0", "filename=font.txt",
         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-c:s", "srt",
         str(path),
     ])
     subtitle.unlink()
+    attachment.unlink()
 
 
 def make_image(path: Path):
@@ -351,6 +358,12 @@ def assert_path_and_naming_guards(module, root: Path):
     assert "-sn" not in mkv_command
     assert mkv_command[mkv_command.index("0:s?") - 1] == "-map"
     assert mkv_command[mkv_command.index("-c:s") + 1] == "copy"
+    mkv_metadata_command = module.ffmpeg_command({"profile": {"container": "mkv", "videoCodec": "libx264", "audioCodec": "aac", "resolution": 720}}, Path("input.mkv"), Path("output.mkv"), {"videoStreams": 1, "audioStreams": 2, "subtitleStreams": 2, "attachmentStreams": 1})
+    assert mkv_metadata_command[mkv_metadata_command.index("-map_metadata:s:v:0") + 1] == "0:s:v:0"
+    assert mkv_metadata_command[mkv_metadata_command.index("-map_metadata:s:a:1") + 1] == "0:s:a:1"
+    assert mkv_metadata_command[mkv_metadata_command.index("-map_metadata:s:s:1") + 1] == "0:s:s:1"
+    assert mkv_metadata_command[mkv_metadata_command.index("-map_metadata:s:t:0") + 1] == "0:s:t:0"
+    assert mkv_metadata_command[mkv_metadata_command.index("-c:t") + 1] == "copy"
     playlist_args = type("Args", (), {"copy_original": True, "season": 3, "episode": 5, "playlist": True})()
     playlist_root = root / "playlist"
     playlist_root.mkdir()
@@ -611,7 +624,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.1 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.2 (config schema 1)"
         module = assert_atomic_copy_never_overwrites(root)
         assert_path_and_naming_guards(module, root)
         assert_tmdb_auth_modes()
@@ -650,7 +663,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.1"
+            assert doctor_payload["version"] == "0.4.2"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -739,7 +752,7 @@ def main():
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
-            assert delivery_plan["version"] == "0.4.1" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.2" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
@@ -1085,8 +1098,15 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             run([sys.executable, str(SCRIPT), "adopt", "带字幕电影", str(root / "source" / "Subtitled.Movie.mkv"), "--type", "movie", "--profile", "movie-mkv", "--target", "movie", "--offline"], env=env)
             mkv_movie = root / "movie" / "带字幕电影" / "带字幕电影.mkv"
             assert mkv_movie.is_file()
-            subtitle_probe = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(mkv_movie)])
-            assert "subtitle" in subtitle_probe.stdout, subtitle_probe.stdout
+            subtitle_probe = run(["ffprobe", "-v", "error", "-show_entries", "format_tags=title:stream=codec_type:stream_tags=language,title,filename,mimetype", "-of", "json", str(mkv_movie)])
+            subtitle_payload = json.loads(subtitle_probe.stdout)
+            audio_streams = [item for item in subtitle_payload["streams"] if item.get("codec_type") == "audio"]
+            subtitle_streams = [item for item in subtitle_payload["streams"] if item.get("codec_type") == "subtitle"]
+            attachment_streams = [item for item in subtitle_payload["streams"] if item.get("codec_type") == "attachment"]
+            assert "title" not in subtitle_payload.get("format", {}).get("tags", {}), subtitle_payload
+            assert audio_streams and audio_streams[0].get("tags") == {"language": "jpn", "title": "日语音轨"}, subtitle_payload
+            assert subtitle_streams and subtitle_streams[0].get("tags") == {"language": "chi", "title": "中文"}, subtitle_payload
+            assert attachment_streams and attachment_streams[0].get("tags") == {"filename": "font.txt", "mimetype": "text/plain"}, subtitle_payload
             local_subs = run([sys.executable, str(SCRIPT), "adopt", "字幕本地", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--write-subs", "--offline"], env=env, expect=1)
             assert "只适用于 yt-dlp" in local_subs.stderr
             orphan_sub_langs = run([sys.executable, str(SCRIPT), "adopt", "字幕本地", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--sub-langs", "zh-CN", "--offline"], env=env, expect=1)

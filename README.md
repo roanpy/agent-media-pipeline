@@ -132,9 +132,9 @@ Secrets stay in environment variables such as `TMDB_API_KEY`, `JACKETT_API_KEY`,
   --metadata "/path/to/metadata.json" --update-nfo --apply
 ```
 
-Transcoding removes inherited global and chapter metadata by default, then relies on normalized filenames, NFO, and local artwork. Organize/no-transcode mode preserves the media bytes and therefore does not alter embedded metadata.
+Transcoding removes inherited global and chapter metadata by default, while preserving language/title labels on mapped audio, video, and subtitle tracks. It then relies on normalized filenames, NFO, and local artwork. Organize/no-transcode mode preserves the media bytes and therefore does not alter embedded metadata.
 
-The default transcode container comes from the profile that `defaultProfiles.tv|movie` selects (MP4 in the example and current deployment). A profile with `container: "mkv"` keeps the source's embedded subtitle streams unchanged during transcode; MP4 still drops embedded subtitles for compatibility, while same-stem external subtitle files survive both modes. The example includes `movie1080-mkv` and `tv1080-mkv`; existing private configs may not contain newly added example profiles, so run `profiles` first.
+The default transcode container comes from the profile that `defaultProfiles.tv|movie` selects (MP4 in the example and current deployment). A profile with `container: "mkv"` keeps the source's embedded subtitle streams, per-track language/title metadata, and Matroska attachments such as ASS fonts during transcode; MP4 still drops embedded subtitles/attachments for compatibility, while same-stem external subtitle files survive both modes. The example includes `movie1080-mkv` and `tv1080-mkv`; existing private configs may not contain newly added example profiles, so run `profiles` first.
 
 For yt-dlp sources, omit `--format` for the best available streams or set a ceiling such as `--format "bv*[height<=720]+ba/b[height<=720]"`. This controls source selection only. The default transcode profile determines the final MP4 output; `--no-transcode` preserves yt-dlp's downloaded codecs and container. Playlists and Bilibili multi-part collections require `--type tv --playlist` and are mapped in confirmed playlist order from `--season`/`--episode`.
 

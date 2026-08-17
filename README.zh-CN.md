@@ -132,9 +132,9 @@ brew install ffmpeg aria2 yt-dlp
   --metadata "/path/to/metadata.json" --update-nfo --apply
 ```
 
-转码默认清理继承的全局和章节内嵌元数据，再由规范文件名、NFO 和本地图片提供 Plex 资料。免转码整理保持媒体字节不变，因此不会修改内嵌元数据。
+转码默认清理继承的全局和章节元数据，但保留实际映射的视频、音频和字幕轨道的语言/名称标签，再由规范文件名、NFO 和本地图片提供 Plex 资料。免转码整理保持媒体字节不变，因此不会修改内嵌元数据。
 
-默认转换容器由 `defaultProfiles.tv|movie` 指向的 profile 决定（示例和当前部署默认均为 MP4）。使用 `container: "mkv"` 的 profile 转码时会原样保留源的内嵌字幕流（不重编码）；MP4 为兼容性仍丢弃内嵌字幕，同名字幕文件在两种模式下都会跟随。示例配置提供 `movie1080-mkv`、`tv1080-mkv`；现有私有配置不一定包含示例新增项，使用前先运行 `profiles`。
+默认转换容器由 `defaultProfiles.tv|movie` 指向的 profile 决定（示例和当前部署默认均为 MP4）。使用 `container: "mkv"` 的 profile 转码时会原样保留源的内嵌字幕流、语言/轨道名称以及 Matroska 附件（例如 ASS 字幕字体，不重编码）；MP4 为兼容性仍丢弃内嵌字幕/附件，同名字幕文件在两种模式下都会跟随。示例配置提供 `movie1080-mkv`、`tv1080-mkv`；现有私有配置不一定包含示例新增项，使用前先运行 `profiles`。
 
 yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时可使用 `--format "bv*[height<=720]+ba/b[height<=720]"`。它只控制下载源，不决定流水线是否转码：默认转码 profile 决定最终 MP4，`--no-transcode` 则保留 yt-dlp 下载后的编码和容器。播放列表及 Bilibili 分 P/合集必须使用 `--type tv --playlist`，并在核实顺序后从 `--season`/`--episode` 开始映射。
 

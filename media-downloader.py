@@ -29,7 +29,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 CONFIG_SCHEMA_VERSION = 1
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
@@ -1530,7 +1530,15 @@ def ffprobe(path: Path) -> dict:
     data = json.loads(result.stdout or "{}")
     streams = data.get("streams", [])
     duration = float((data.get("format") or {}).get("duration") or 0)
-    return {"duration": duration, "hasVideo": any(item.get("codec_type") == "video" for item in streams), "hasAudio": any(item.get("codec_type") == "audio" for item in streams)}
+    return {
+        "duration": duration,
+        "hasVideo": any(item.get("codec_type") == "video" for item in streams),
+        "hasAudio": any(item.get("codec_type") == "audio" for item in streams),
+        "videoStreams": sum(item.get("codec_type") == "video" for item in streams),
+        "audioStreams": sum(item.get("codec_type") == "audio" for item in streams),
+        "subtitleStreams": sum(item.get("codec_type") == "subtitle" for item in streams),
+        "attachmentStreams": sum(item.get("codec_type") == "attachment" for item in streams),
+    }
 
 
 def validate_video(path: Path, minimum_duration: float) -> dict:
@@ -1605,13 +1613,13 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
     return plans
 
 
-def ffmpeg_command(ctx: dict, source: Path, target: Path) -> list[str]:
+def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | None = None) -> list[str]:
     profile = ctx["profile"]
     codec = str(profile.get("videoCodec", "libx264"))
     audio_codec = str(profile.get("audioCodec", "aac"))
     command = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-dn"]
     if profile["container"] == "mkv":
-        # MKV 支持字幕流原样保留（不重编码）；MP4 兼容性差，继续丢弃内嵌字幕，外挂字幕由 copy_sidecars 保留。
+        # MKV 支持字幕流原样保留（不重编码）；MP4 兼容性差，继续丢弃内嵌字幕。
         command += ["-map", "0:s?", "-c:s", "copy"]
     else:
         command += ["-sn"]
@@ -1630,6 +1638,18 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path) -> list[str]:
     if audio_codec != "copy" and profile.get("audioBitrate"):
         command += ["-b:a", str(profile["audioBitrate"])]
     command += ["-map_metadata", "-1", "-map_chapters", "-1"]
+    counts = stream_counts or {}
+    for kind, key in (("v", "videoStreams"), ("a", "audioStreams")):
+        mapped = min(int(counts.get(key, 0)), 1) if kind == "v" else int(counts.get(key, 0))
+        for index in range(mapped):
+            command += [f"-map_metadata:s:{kind}:{index}", f"0:s:{kind}:{index}"]
+    if profile["container"] == "mkv":
+        if int(counts.get("attachmentStreams", 0)):
+            command += ["-map", "0:t?", "-c:t", "copy"]
+        for index in range(int(counts.get("subtitleStreams", 0))):
+            command += [f"-map_metadata:s:s:{index}", f"0:s:s:{index}"]
+        for index in range(int(counts.get("attachmentStreams", 0))):
+            command += [f"-map_metadata:s:t:{index}", f"0:s:t:{index}"]
     if profile["container"] == "mp4":
         command += ["-movflags", "+faststart"]
     command.append(str(target))
@@ -1655,7 +1675,7 @@ def transcode(ctx: dict, plans: list[dict]) -> None:
         temp.unlink(missing_ok=True)
         status_update(ctx["id"], phase="transcoding", currentFile=plan["source"].name)
         log(ctx, f"转码: {plan['source'].name} -> {plan['relative']}")
-        run_child(ctx, ffmpeg_command(ctx, plan["source"], temp), "transcoding", task_timeout_seconds(ctx["config"]))
+        run_child(ctx, ffmpeg_command(ctx, plan["source"], temp, plan["sourceInfo"]), "transcoding", task_timeout_seconds(ctx["config"]))
         source_stat = plan["source"].stat()
         if source_stat.st_size != plan["sourceSize"] or source_stat.st_mtime_ns != plan["sourceMtimeNs"]:
             temp.unlink(missing_ok=True)

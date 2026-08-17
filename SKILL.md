@@ -168,9 +168,9 @@ For TV, the Plex preset may use `{episodeTitleSuffix}`. When a matched metadata 
 
 Verified `metadata.title` controls canonical naming and task identity while status retains the requested title. Enable “Use local Assets” in Plex for local artwork and select Plex NFO Agent on Plex Media Server 1.43.1 or newer. Use the Plex preset for catalogued movies and TV. Prefer a separate Plex “Other Videos” library for unmatched clips or ordinary channel uploads rather than disguising them as film/TV.
 
-Transcoding defaults to MP4 profiles and removes inherited global and chapter metadata. Normalized filenames, NFO, and artwork carry library metadata. `--no-transcode` promises byte-preserving media organization and therefore does not alter embedded metadata.
+Transcoding defaults to MP4 profiles, removes inherited global and chapter metadata, and preserves language/title labels on mapped audio, video, and subtitle tracks. Normalized filenames, NFO, and artwork carry library metadata. `--no-transcode` promises byte-preserving media organization and therefore does not alter embedded metadata.
 
-When a profile uses `container: "mkv"`, transcoding keeps the source's embedded subtitle streams unchanged (`-c:s copy`). MP4 containers still drop embedded subtitles for compatibility; same-stem external subtitle files always survive both modes. The default container is whatever the configured default profile declares; nothing forces MP4.
+When a profile uses `container: "mkv"`, transcoding keeps the source's embedded subtitle streams, per-track language/title metadata, and Matroska attachments such as ASS fonts unchanged (`-c:s copy`, `-c:t copy`). MP4 containers still drop embedded subtitles and attachments for compatibility; same-stem external subtitle files always survive both modes. The default container is whatever the configured default profile declares; nothing forces MP4.
 
 ## Configuration
 
