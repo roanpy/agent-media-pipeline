@@ -189,7 +189,7 @@ Run `cp config.example.json config.json && chmod 600 config.json`. The example u
 - `metadata`: TMDB, TVMaze fallback, artwork requirements, and optional comma-separated `subtitleLanguages` default.
 - `customWords`: pre-recognition word handling with three arrays. `ignore` removes noise tokens (e.g. `全39集`, `更新至`) from the metadata query; `replace` rewrites tokens (`{"from": "第12话", "to": "E12"}`) before episode parsing; `episodeOffset` shifts episode numbers for split-season/continuous numbering (`{"pattern": "(?i)show-name", "offset": 50}`), where `pattern` matches against `<media_type>:<cleaned title>`. Cleaning affects lookup only; the stored `metadata.title` keeps the supplied title.
 
-For TV runs, the pipeline logs a `缺集提醒` after metadata when the covered seasons have episode gaps. It reports against TMDB/TVMaze episode lists when present, otherwise against the contiguous range up to the highest fetched episode. Playlist mode skips the check. The report is informational and never fails the run.
+For multi-file, non-playlist TV runs, the pipeline logs a `缺集提醒` after metadata when the batch has episode gaps. Single-episode incremental tasks and playlists skip the check to avoid false warnings about episodes outside that task. The report is informational and never fails the run.
 
 Environment overrides include `MEDIA_DOWNLOADER_CONFIG`, `MEDIA_DOWNLOADER_BASE_DIR`, `MEDIA_DOWNLOADER_STATE_DIR`, `MEDIA_DOWNLOADER_DOWNLOAD_DIR`, `MEDIA_DOWNLOADER_TARGET_DIR`, and `MEDIA_DOWNLOADER_OFFLINE=1`.
 

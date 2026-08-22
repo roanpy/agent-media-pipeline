@@ -5,6 +5,7 @@
   English · [简体中文](README.zh-CN.md)
 
   [![Status: Beta](https://img.shields.io/badge/status-beta-2563eb.svg)](#project-status)
+  [![CI](https://github.com/roanpy/agent-media-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/roanpy/agent-media-pipeline/actions/workflows/ci.yml)
   [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](#requirements)
   [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-compatible-111827.svg)](SKILL.md)
   [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -149,7 +150,8 @@ The default Plex TV template appends a verified per-episode title when available
 - Search results expose review fields and candidate IDs, not stored download URLs.
 - `--version`, doctor, dry-run, and task status expose the pipeline version/config schema for stale-install detection.
 - Signed or tokenized URLs can be supplied through a user-owned `0600` file with `--source-file`.
-- `config.json`, runtime state, logs, and caches are Git-ignored; private JSON files are written as `0600`.
+- `config.json`, runtime state, logs, and caches are Git-ignored; private JSON files are written as `0600`, and the private config must not be a symlink.
+- Metadata and remote artwork accept only DNS-resolved public HTTP(S) destinations and reject cross-host or HTTPS-downgrade redirects; explicitly configured local indexers remain supported.
 - Existing different files are never overwritten. Matching files are verified before being accepted.
 - Existing-library repair rejects library/category roots, duplicate SxxEyy media, and existing destinations; it previews by default and leaves legacy empty directories alone.
 - Archive conflict preflight prevents a late artwork conflict from leaving a task partially delivered. For incremental TV episodes, `--merge` keeps existing different show-level artwork/`tvshow.nfo` while media conflicts still fail.

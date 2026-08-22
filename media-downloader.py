@@ -31,7 +31,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 CONFIG_SCHEMA_VERSION = 1
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
@@ -1130,6 +1130,8 @@ def validate_source(source: str, allow_local: bool = True) -> str:
     parsed = urllib.parse.urlsplit(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise RuntimeError("来源只允许本地路径、magnet 或 HTTP(S)")
+    if parsed.username or parsed.password:
+        raise RuntimeError("来源 URL 不得内嵌用户名或密码")
     return source
 
 
@@ -1821,6 +1823,15 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | 
     return command
 
 
+def validate_preserved_streams(source_info: dict, output_info: dict, container: str) -> None:
+    required = [("audioStreams", "音频")]
+    if container == "mkv":
+        required += [("subtitleStreams", "字幕"), ("attachmentStreams", "附件")]
+    for key, label in required:
+        if int(output_info.get(key, 0)) < int(source_info.get(key, 0)):
+            raise RuntimeError(f"转码输出缺少{label}流")
+
+
 def copy_sidecars(plan: dict) -> None:
     output = plan["output"]
     for sidecar in plan["source"].parent.iterdir():
@@ -1846,9 +1857,11 @@ def transcode(ctx: dict, plans: list[dict]) -> None:
             temp.unlink(missing_ok=True)
             raise RuntimeError(f"转码期间来源仍在变化: {plan['source'].name}")
         output_info = validate_video(temp, minimum)
-        if plan["sourceInfo"]["hasAudio"] and not output_info["hasAudio"]:
+        try:
+            validate_preserved_streams(plan["sourceInfo"], output_info, ctx["profile"]["container"])
+        except RuntimeError:
             temp.unlink(missing_ok=True)
-            raise RuntimeError(f"转码输出缺少音频: {plan['source'].name}")
+            raise
         allowed_shortfall = max(2.0, min(10.0, plan["sourceInfo"]["duration"] * 0.001))
         if output_info["duration"] + allowed_shortfall < plan["sourceInfo"]["duration"]:
             temp.unlink(missing_ok=True)
@@ -2074,7 +2087,7 @@ def write_artwork(ctx: dict, plans: list[dict]) -> None:
 
 def missing_episode_report(ctx: dict, plans: list[dict]) -> str | None:
     """剧集缺集检查：对本次覆盖到的季，按已知集数范围找空洞。只报告，不阻断。"""
-    if ctx["mediaType"] != "tv" or ctx["args"].playlist:
+    if ctx["mediaType"] != "tv" or ctx["args"].playlist or len(plans) < 2:
         return None
     known = {(item["season"], item["episode"]) for item in ctx["metadata"].get("episodes", [])}
     by_season: dict[int, set[int]] = {}
@@ -2747,7 +2760,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--no-archive", action="store_true", help="Skip archive transfer; deliver to downloadDir if configured, else keep output in the workspace")
     parser.add_argument("--no-deliver", action="store_true", help="Do not archive or deliver; keep Plex-ready output in the owned workspace")
     parser.add_argument("--keep-work", action="store_true", help="Keep the download cache/workspace after completion (cleaned by default after delivery/archive)")
-    parser.add_argument("--reset-work", action="store_true", help="确认来源已更换后，重建失败任务工作区")
+    parser.add_argument("--reset-work", action="store_true", help="Rebuild a verified failed-task workspace after confirming the source changed")
     parser.add_argument("--update-nfo", action="store_true", help="Atomically update existing NFO only; never overwrites media, subtitles, or artwork")
     parser.add_argument("--merge", action="store_true", help="For incremental TV archives, keep existing different show-level artwork/tvshow.nfo; media conflicts still fail")
     if mode_override:
@@ -2807,15 +2820,15 @@ def parser() -> argparse.ArgumentParser:
     organize_parser = commands.add_parser("organize", help="Organize local media without transcoding (keep container) and archive/deliver")
     add_pipeline_arguments(organize_parser, source_required=True, mode_override=False)
     organize_parser.set_defaults(copy_original=True)
-    profiles = commands.add_parser("profiles", aliases=["profile"])
+    profiles = commands.add_parser("profiles", aliases=["profile"], help="List configured defaults, profiles, targets, and naming presets")
     profiles.set_defaults(handler=command_profiles)
-    check = commands.add_parser("check", aliases=["status"])
+    check = commands.add_parser("check", aliases=["status"], help="Show all tasks or filter status by title")
     check.add_argument("title", nargs="?")
     check.set_defaults(handler=command_check)
-    stop = commands.add_parser("stop", aliases=["cancel"])
+    stop = commands.add_parser("stop", aliases=["cancel"], help="Stop matching owned pipeline and child processes")
     stop.add_argument("title")
     stop.set_defaults(handler=command_stop)
-    doctor = commands.add_parser("doctor")
+    doctor = commands.add_parser("doctor", help="Check tools, work paths, optional targets, and configured integrations")
     doctor.set_defaults(handler=command_doctor)
     return root
 

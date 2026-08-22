@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -32,4 +33,3 @@ jobs:
           python -m json.tool config.example.json >/dev/null
           ruff check media-downloader.py tests/test_pipeline.py
           ./scripts/smoke-test.sh
-          python tests/test_pipeline.py

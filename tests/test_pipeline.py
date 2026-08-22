@@ -391,6 +391,12 @@ def assert_path_and_naming_guards(module, root: Path):
         assert "URL" in str(exc)
     else:
         raise AssertionError("malformed HTTP ports must be rejected")
+    try:
+        module.validate_source("https://user:secret@example.test/video", allow_local=False)
+    except RuntimeError as exc:
+        assert "用户名或密码" in str(exc)
+    else:
+        raise AssertionError("credential-bearing source URLs must be rejected")
     command = module.ffmpeg_command({"profile": {"container": "mp4", "videoCodec": "libx264", "audioCodec": "aac", "resolution": 720}}, Path("input.mkv"), Path("output.mp4"))
     assert command[command.index("-map_metadata") + 1] == "-1"
     assert command[command.index("-map_chapters") + 1] == "-1"
@@ -405,6 +411,21 @@ def assert_path_and_naming_guards(module, root: Path):
     assert mkv_metadata_command[mkv_metadata_command.index("-map_metadata:s:s:1") + 1] == "0:s:s:1"
     assert mkv_metadata_command[mkv_metadata_command.index("-map_metadata:s:t:0") + 1] == "0:s:t:0"
     assert mkv_metadata_command[mkv_metadata_command.index("-c:t") + 1] == "copy"
+    module.validate_preserved_streams(
+        {"audioStreams": 2, "subtitleStreams": 2, "attachmentStreams": 1},
+        {"audioStreams": 2, "subtitleStreams": 2, "attachmentStreams": 1},
+        "mkv",
+    )
+    try:
+        module.validate_preserved_streams(
+            {"audioStreams": 2, "subtitleStreams": 2, "attachmentStreams": 1},
+            {"audioStreams": 2, "subtitleStreams": 1, "attachmentStreams": 1},
+            "mkv",
+        )
+    except RuntimeError as exc:
+        assert "字幕流" in str(exc)
+    else:
+        raise AssertionError("missing mapped subtitle streams must fail validation")
     playlist_args = type("Args", (), {"copy_original": True, "season": 3, "episode": 5, "playlist": True})()
     playlist_root = root / "playlist"
     playlist_root.mkdir()
@@ -586,6 +607,7 @@ def assert_path_and_naming_guards(module, root: Path):
     }
     plans = [{"season": 1, "episode": 1}, {"season": 1, "episode": 3}, {"season": 1, "episode": 4}]
     assert module.missing_episode_report(report_ctx, plans) == {"S01": [2]}
+    assert module.missing_episode_report(report_ctx, [{"season": 1, "episode": 3}]) is None
     assert module.missing_episode_report(report_ctx, [{"season": 1, "episode": 1}, {"season": 1, "episode": 2}]) is None
     report_ctx["metadata"]["episodes"] = [{"season": 1, "episode": 5}, {"season": 1, "episode": 6}]
     assert module.missing_episode_report(report_ctx, [{"season": 1, "episode": 1}, {"season": 1, "episode": 2}]) == {"S01": [5, 6]}
@@ -665,7 +687,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.3 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.4 (config schema 1)"
+        root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
+        for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
+            assert command_help in root_help, root_help
         module = assert_atomic_copy_never_overwrites(root)
         assert_path_and_naming_guards(module, root)
         assert_tmdb_auth_modes()
@@ -714,7 +739,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.3"
+            assert doctor_payload["version"] == "0.4.4"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -803,7 +828,7 @@ def main():
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
-            assert delivery_plan["version"] == "0.4.3" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.4" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
@@ -1184,6 +1209,10 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
                 locked_reset = run([sys.executable, str(SCRIPT), "adopt", "Conflict", str(source_conflict), "--type", "tv", "--target", "tv", "--offline", "--reset-work"], env=env, expect=1)
                 assert "任务已在运行" in locked_reset.stderr
             assert task_work.is_dir()
+            source_stat = source_conflict.stat()
+            os.utime(source_conflict, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 1))
+            changed_retry = run([sys.executable, str(SCRIPT), "adopt", "Conflict", str(source_conflict), "--type", "tv", "--target", "tv", "--offline"], env=env, expect=1)
+            assert "来源已变化" in changed_retry.stderr
 
             run([sys.executable, str(SCRIPT), "adopt", "待核实电影", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--metadata", str(movie_metadata), "--offline"], env=env)
             film = root / "movie" / "测试电影 (2025)" / "测试电影 (2025).mp4"
