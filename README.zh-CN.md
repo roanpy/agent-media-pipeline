@@ -5,6 +5,7 @@
   [English](README.md) · 简体中文
 
   [![状态：Beta](https://img.shields.io/badge/status-beta-2563eb.svg)](#项目状态)
+  [![CI](https://github.com/roanpy/agent-media-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/roanpy/agent-media-pipeline/actions/workflows/ci.yml)
   [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](#运行要求)
   [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-compatible-111827.svg)](SKILL.md)
   [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -149,7 +150,8 @@ yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时�
 - 搜索结果仅公开审查字段和候选 ID，不公开缓存的下载 URL。
 - `--version`、doctor、dry-run 和任务状态都会提供程序版本及配置 schema，供 Agent 执行前识别旧副本。
 - 带签名或 token 的 URL 通过当前用户拥有的 `0600` 文件配合 `--source-file` 传入。
-- `config.json`、运行状态、日志和缓存都被 Git 忽略；私有 JSON 文件按 `0600` 写入。
+- `config.json`、运行状态、日志和缓存都被 Git 忽略；私有 JSON 文件按 `0600` 写入，且私有配置不得是符号链接。
+- 元数据和远程图片只允许 DNS 解析到公网的 HTTP(S) 目标，并拒绝跨主机或 HTTPS 降级重定向；明确配置的本地索引器仍受支持。
 - 已存在且内容不同的目标文件永不覆盖。
 - 存量库修复拒绝媒体库/分类根目录、重复 SxxEyy 和已存在目标；默认预览，不清理遗留空目录。
 - 归档会先完成冲突预检，避免最后因图片冲突而留下“部分成功”。电视剧分集增量归档可用 `--merge` 保留已有节目级图片和 `tvshow.nfo`，不同视频仍拒绝写入。
