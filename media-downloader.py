@@ -31,8 +31,9 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 CONFIG_SCHEMA_VERSION = 1
+USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
@@ -630,7 +631,7 @@ def http_open(request, timeout: int, *, allow_private: bool = False):
 
 def http_json(url: str, params: dict, headers: dict | None = None, timeout: int = 20):
     query = urllib.parse.urlencode({key: value for key, value in params.items() if value not in (None, "")})
-    request = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": "media-downloader/2.0", **(headers or {})})
+    request = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
         with http_open(request, timeout=timeout) as response:
             return json.loads(read_response(response, 5 * 1024 * 1024, urllib.parse.urlsplit(url).netloc).decode("utf-8"))
@@ -1368,7 +1369,7 @@ def torznab_search(name: str, source: dict, query: str, media_type: str, limit: 
     params = {"apikey": api_key, "t": search_type, "q": query}
     if source.get("categories"):
         params["cat"] = ",".join(str(value) for value in source["categories"])
-    request = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers={"User-Agent": "media-downloader/2.0"})
+    request = urllib.request.Request(f"{url}?{urllib.parse.urlencode(params)}", headers={"User-Agent": USER_AGENT})
     try:
         with http_open(request, timeout=timeout or int(source.get("timeoutSeconds", 90)), allow_private=True) as response:
             root = ET.fromstring(read_response(response, 10 * 1024 * 1024, f"Torznab {name}"))
@@ -1990,7 +1991,7 @@ def download_image(source: str, destination: Path, ctx: dict) -> None:
     validate_source(source)
     temp_source = ctx["workRoot"] / f".artwork-source{Path(urllib.parse.urlsplit(source).path).suffix or '.img'}"
     if source.startswith(("http://", "https://")):
-        request = urllib.request.Request(source, headers={"User-Agent": "media-downloader/2.0"})
+        request = urllib.request.Request(source, headers={"User-Agent": USER_AGENT})
         try:
             with http_open(request, timeout=30) as response, open(temp_source, "wb") as handle:
                 remaining = 25 * 1024 * 1024
