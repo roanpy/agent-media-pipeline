@@ -135,15 +135,17 @@ brew install ffmpeg aria2 yt-dlp
 
 转码默认清理继承的全局和章节元数据，但保留实际映射的视频、音频和字幕轨道的语言/名称标签，再由规范文件名、NFO 和本地图片提供 Plex 资料。免转码整理保持媒体字节不变，因此不会修改内嵌元数据。
 
-默认转换容器由 `defaultProfiles.tv|movie` 指向的 profile 决定（示例和当前部署默认均为 MP4）。使用 `container: "mkv"` 的 profile 转码时会原样保留源的内嵌字幕流、语言/轨道名称以及 Matroska 附件（例如 ASS 字幕字体，不重编码）；MP4 为兼容性仍丢弃内嵌字幕/附件，同名字幕文件在两种模式下都会跟随。示例配置提供 `movie1080-mkv`、`tv1080-mkv`；现有私有配置不一定包含示例新增项，使用前先运行 `profiles`。
+默认转换容器由 `defaultProfiles.tv|movie` 指向的 profile 决定（示例和当前部署默认均为 MP4）。转码 profile 只支持 `mp4` 和 `mkv`，其他容器名会在配置校验阶段拒绝。使用 `container: "mkv"` 的 profile 转码时会原样保留源的内嵌字幕流、语言/轨道名称以及 Matroska 附件（例如 ASS 字幕字体，不重编码）；MP4 为兼容性仍丢弃内嵌字幕/附件，同名字幕文件在两种模式下都会跟随。示例配置提供 `movie1080-mkv`、`tv1080-mkv`；现有私有配置不一定包含示例新增项，使用前先运行 `profiles`。
 
 yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时可使用 `--format "bv*[height<=720]+ba/b[height<=720]"`。它只控制下载源，不决定流水线是否转码：默认转码 profile 决定最终 MP4，`--no-transcode` 则保留 yt-dlp 下载后的编码和容器。播放列表及 Bilibili 分 P/合集必须使用 `--type tv --playlist`，并在核实顺序后从 `--season`/`--episode` 开始映射。
 
 `--write-subs` 只对 yt-dlp 来源生效：下载手动/自动外挂字幕、转换为 `srt` 并随媒体一起整理，源没有字幕时跳过；`--sub-langs` 必须与它一起使用，用逗号分隔语言代码（如 `zh-CN,en`），默认取 `metadata.subtitleLanguages`、元数据语言或 `zh-CN`。项目不接入任何第三方字幕库。
 
-默认 Plex 电视剧模板在取得可靠单集标题时命名为 `剧名 - S01E03 - 单集标题.ext`；没有标题则保持 `剧名 - S01E03.ext`。同一个标题和该集自己的来源 ID 写入单集 NFO；`tvshow.nfo` 只保存整部剧资料，不重复塞入全季集数清单。TMDB、TVMaze fallback、Jackett 和 Prowlarr 都是可选项，缺少凭据不会阻塞直链、本地文件或网页媒体主流程。
+默认 Plex 电视剧模板在取得可靠单集标题时命名为 `剧名 - S01E03 - 单集标题.ext`；没有标题则保持 `剧名 - S01E03.ext`。同一个标题和该集自己的来源 ID 写入单集 NFO；`tvshow.nfo` 只保存整部剧资料，不重复塞入全季集数清单。元数据查询默认按需启用：`metadata.provider: "none"` 会禁用所有 provider 请求，省略 `metadata` 配置也不会隐式访问 TVMaze。`provider: "tmdb"` 仍默认保留 TVMaze fallback；省略 provider 时需显式设置 `tvFallback: "tvmaze"` 才启用。TMDB、TVMaze fallback、Jackett 和 Prowlarr 都是可选项，缺少凭据不会阻塞直链、本地文件或网页媒体主流程。
 
 `repair` 只接受单部剧目录，默认仅输出 JSON 预览；显式 `--apply` 才执行。它支持 Season 0，将同名字幕、单集图片和 NFO 随媒体一起处理；没有可靠集标题就保留原路径，`tvshow.nfo` 不修改。新路径全部复制并逐字节校验后才移除旧路径，中断最多留下副本。多集单文件（如 `S01E01-E02`）仍要求先拆分。
+
+`--metadata` 必须指向已存在的普通 JSON 文件；路径缺失或不是普通文件会立即报错。
 
 ## 安全与隐私
 
@@ -154,9 +156,10 @@ yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时�
 - 元数据和远程图片只允许 DNS 解析到公网的 HTTP(S) 目标，并拒绝跨主机或 HTTPS 降级重定向；明确配置的本地索引器仍受支持。
 - 已存在且内容不同的目标文件永不覆盖。
 - 存量库修复拒绝媒体库/分类根目录、重复 SxxEyy 和已存在目标；默认预览，不清理遗留空目录。
-- 归档会先完成冲突预检，避免最后因图片冲突而留下“部分成功”。电视剧分集增量归档可用 `--merge` 保留已有节目级图片和 `tvshow.nfo`，不同视频仍拒绝写入。
+- 归档会先完成冲突预检，避免最后因图片冲突而留下“部分成功”；只有边车文件而没有视频时会直接拒绝。电视剧分集增量归档可用 `--merge` 保留已有节目级图片和 `tvshow.nfo`，不同视频仍拒绝写入。
 - aria2 连续零流量达到 `btStopTimeoutSeconds`（默认 600 秒）后停止；是否换源仍由 Agent 与用户明确决定。
 - 只有大小、SHA-256、媒体有效性和目标身份校验全部通过后才清理工作区；调试时可用 `--keep-work` 保留任务缓存。
+- 本地失败任务的重试指纹包含同名字幕及约定名称图片；这些边车文件发生增删改后，确认来源再使用 `--reset-work`。
 - `--reset-work` 只删除验证过所有权的任务工作区，必须明确使用。
 - Agent 发现的新网站只有在用户确认后才会保存，并且只写入私有 `config.json`。
 
