@@ -134,7 +134,7 @@ chmod 600 /private/tmp/source-url
 
 `resume` and `download` alias `ingest`; `process` aliases `adopt`. `organize` skips profile transcoding but still uses profile naming and an optional default target. `repair` is foreground and preview-only unless `--apply` is explicit. Long-running pipeline commands launch in the background by default; add `--foreground` while debugging.
 
-Archive performs a complete conflict preflight before copying. `--merge` is intentionally narrow: for TV only, existing different root `poster`, `fanart`, `banner`, `clearlogo`, and `tvshow.nfo` are logged and kept. It never weakens no-clobber protection for episode media, subtitles, or episode NFO. `stop` waits for the owned task and downloader/transcoder process group to exit.
+Archive performs a complete conflict preflight before copying and rejects an output that contains only sidecars without a video. `--merge` is intentionally narrow: for TV only, existing different root `poster`, `fanart`, `banner`, `clearlogo`, and `tvshow.nfo` are logged and kept. It never weakens no-clobber protection for episode media, subtitles, or episode NFO. `stop` waits for the owned task and downloader/transcoder process group to exit.
 
 ## Source behavior
 
@@ -142,12 +142,12 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 - `add-source` writes only to private, Git-ignored `config.json`, rejects embedded credentials and duplicate names, and requires `--replace` for a confirmed replacement.
 - Structured candidates expire after seven days. The agent sees review fields and `candidateId`; the private `0600` cache retains the real download URL.
 - Put signed/tokenized URLs in a user-owned regular `0600` `--source-file` rather than a command argument.
-- Failed local-file tasks record a source snapshot (path, inode, size, modification time, and directory/sidecar manifest). If the local source changes before retry, the pipeline refuses to reuse the work area; use `--reset-work` only after confirming the new source.
+- Failed local-file tasks record a source snapshot (path, inode, size, modification time, and directory/sidecar manifest). Single-file snapshots include same-stem subtitles and conventional artwork; if the local source or these sidecars change before retry, the pipeline refuses to reuse the work area; use `--reset-work` only after confirming the new source.
 - Playlists are disabled by default. Add `--playlist` only after the user explicitly requests the whole list.
 - Use `probe URL` for a single item's formats; use `probe URL --playlist` for the title, count, and ordered entry list. Add the same `--cookies` value when anonymous probing is blocked. Probe output excludes media URLs and cookies.
 - Use `--type tv --playlist` for a playlist or Bilibili multi-part collection. For items without recognizable episode tokens, assign episodes in playlist order starting from `--season` (default 1) and `--episode` (default 1). Confirm count and ordering first.
 - Omit `--format` for yt-dlp's best available selection. Use a selector such as `bv*[height<=720]+ba/b[height<=720]` for a ceiling, or exact format IDs reported by `probe`. A source selector does not decide pipeline transcoding.
-- Let the configured default profile decide the final container; the example and current deployed defaults use MP4. `--no-transcode` preserves downloaded codecs/container. Run `profiles` before naming a profile because private deployments may not contain every example profile.
+- Let the configured default profile decide the final container; transcode profiles support only MP4 or MKV, and the example/current defaults use MP4. `--no-transcode` preserves downloaded codecs/container. Run `profiles` before naming a profile because private deployments may not contain every example profile.
 - `--cookies` takes a supported browser spec (`chrome`, `firefox`, `edge`, `safari`, `brave`, `chromium`, `opera`, `vivaldi`, `whale`) or a current-user-owned `0600` Netscape cookies.txt path. Use it only for the user's authorized session when YouTube bot checks or Bilibili login/quality restrictions require authentication. Do not export, log, copy, or commit cookies, and do not attempt to bypass DRM, CAPTCHA, membership, or regional controls.
 - `--write-subs` downloads external manual/auto subtitle tracks with the yt-dlp media, converts them to `srt`, and carries them through organize/transcode as same-stem sidecar files. `--sub-langs` requires `--write-subs`, takes comma-separated codes, and defaults to `metadata.subtitleLanguages`, then metadata language, then `zh-CN`. No third-party subtitle provider is contacted.
 - Metadata and remote artwork requests require DNS-resolved public destinations and reject cross-host or HTTPS downgrade redirects; configured API credentials cannot be forwarded to another host. Direct local artwork paths and explicitly configured local indexers remain supported.
@@ -156,7 +156,7 @@ Archive performs a complete conflict preflight before copying. `--merge` is inte
 
 ## Metadata and Plex
 
-Try TMDB through `TMDB_API_KEY`; TV may fall back to TVMaze. Both providers are optional. When available, fetch the requested season's episode titles/details and use episode-specific IDs in each episode NFO. Without them, continue with minimal NFO and the stable `SxxEyy` filename. A metadata JSON may override or supplement title, original/sort title, year, premiere date, plot, tagline, content rating, rating, runtime, status, genres, countries, tags, studio, directors, writers, actors, external IDs, episode details, and artwork URLs/paths.
+Try TMDB through `TMDB_API_KEY`; `provider: "tmdb"` keeps the TVMaze fallback by default, while an omitted provider needs explicit `tvFallback: "tvmaze"`. `metadata.provider: "none"` disables provider lookups, and omitting the metadata block does not trigger an implicit request. When available, fetch the requested season's episode titles/details and use episode-specific IDs in each episode NFO. Without them, continue with minimal NFO and the stable `SxxEyy` filename. A metadata JSON may override or supplement title, original/sort title, year, premiere date, plot, tagline, content rating, rating, runtime, status, genres, countries, tags, studio, directors, writers, actors, external IDs, episode details, and artwork URLs/paths.
 
 Supported root artwork names are `poster`, `fanart`, `banner`, and `clearlogo`. With no TMDB key, still generate minimal valid NFO. If `metadata.requireArtwork=true` but neither a key nor supplied poster exists, warn and downgrade artwork to optional.
 
@@ -186,7 +186,7 @@ Run `cp config.example.json config.json && chmod 600 config.json`. The example u
 - `downloadDir`: final local destination for `--no-archive`; it is created when its parent is writable, may equal or sit inside `baseDir`, but must never sit inside `.media-downloader-work`.
 - `targets`: optional local directory, external-drive, or NAS presets; keep `{}` for local-only use.
 - `namingPresets`: TV/movie path templates; `plex` is the default. TV templates can use `{episodeTitle}` or the optional separator-aware `{episodeTitleSuffix}`.
-- `metadata`: TMDB, TVMaze fallback, artwork requirements, and optional comma-separated `subtitleLanguages` default.
+- `metadata`: optional TMDB/TVMaze settings, artwork requirements, and optional comma-separated `subtitleLanguages` default. `provider: "none"` disables lookups; `tvFallback: "tvmaze"` is opt-in when the provider is omitted. `--metadata` paths must exist and be regular JSON files.
 - `customWords`: pre-recognition word handling with three arrays. `ignore` removes noise tokens (e.g. `全39集`, `更新至`) from the metadata query; `replace` rewrites tokens (`{"from": "第12话", "to": "E12"}`) before episode parsing; `episodeOffset` shifts episode numbers for split-season/continuous numbering (`{"pattern": "(?i)show-name", "offset": 50}`), where `pattern` matches against `<media_type>:<cleaned title>`. Cleaning affects lookup only; the stored `metadata.title` keeps the supplied title.
 
 For multi-file, non-playlist TV runs, the pipeline logs a `缺集提醒` after metadata when the batch has episode gaps. Single-episode incremental tasks and playlists skip the check to avoid false warnings about episodes outside that task. The report is informational and never fails the run.

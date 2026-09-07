@@ -359,6 +359,30 @@ def assert_path_and_naming_guards(module, root: Path):
     local_first = module.source_fingerprint(fingerprint_ctx, str(local_file))
     local_file.write_bytes(b"source-v2-with-a-different-size")
     assert local_first != module.source_fingerprint(fingerprint_ctx, str(local_file))
+    # A single local video fingerprints the sidecars consumed during output.
+    single_video = root / "single.mkv"
+    single_video.write_bytes(b"video")
+    single_first = module.local_source_snapshot(str(single_video))
+    subtitle = root / "single.zh.srt"
+    subtitle.write_text("subtitle", encoding="utf-8")
+    single_with_subtitle = module.local_source_snapshot(str(single_video))
+    assert single_first != single_with_subtitle
+    subtitle.write_text("subtitle changed", encoding="utf-8")
+    assert single_with_subtitle != module.local_source_snapshot(str(single_video))
+    subtitle.unlink()
+    assert single_first == module.local_source_snapshot(str(single_video))
+    poster = root / "poster.jpg"
+    poster.write_bytes(b"poster")
+    with_poster = module.local_source_snapshot(str(single_video))
+    assert with_poster != single_first
+    poster.write_bytes(b"poster changed")
+    assert with_poster != module.local_source_snapshot(str(single_video))
+    poster.unlink()
+    assert single_first == module.local_source_snapshot(str(single_video))
+    (root / "other.zh.srt").write_text("unrelated", encoding="utf-8")
+    assert single_first == module.local_source_snapshot(str(single_video))
+    (root / "irrelevant.txt").write_text("ignore", encoding="utf-8")
+    assert single_first == module.local_source_snapshot(str(single_video))
     local_dir = root / "fingerprint-directory"
     local_dir.mkdir()
     (local_dir / "episode.mkv").write_bytes(b"episode")
@@ -397,6 +421,121 @@ def assert_path_and_naming_guards(module, root: Path):
         assert "用户名或密码" in str(exc)
     else:
         raise AssertionError("credential-bearing source URLs must be rejected")
+    # FIFO inputs must be rejected without blocking before type validation.
+    fifo = root / "private-input.fifo"
+    os.mkfifo(fifo, 0o600)
+    fifo_probe = subprocess.run([
+        sys.executable, "-c",
+        "import importlib.util,sys; s=importlib.util.spec_from_file_location('m',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m);\ntry: m.open_private_input(__import__('pathlib').Path(sys.argv[2]), 'fifo', 1024)\nexcept RuntimeError: pass\nelse: raise SystemExit(2)",
+        str(SCRIPT), str(fifo),
+    ], capture_output=True, text=True, timeout=2)
+    assert fifo_probe.returncode == 0, fifo_probe.stderr
+    fifo.unlink()
+    private_text = root / "private-input.txt"
+    private_text.write_text("keep", encoding="utf-8")
+    private_text.chmod(0o644)
+    try:
+        module.write_private_text(private_text, "replace")
+    except RuntimeError as exc:
+        assert "不安全" in str(exc)
+    else:
+        raise AssertionError("write_private_text must reject group-readable files")
+    assert private_text.read_text(encoding="utf-8") == "keep"
+    private_text.chmod(0o600)
+    hardlink = root / "private-input-hardlink.txt"
+    os.link(private_text, hardlink)
+    try:
+        module.write_private_text(private_text, "replace")
+    except RuntimeError as exc:
+        assert "不安全" in str(exc)
+    else:
+        raise AssertionError("write_private_text must reject hard-linked files")
+    assert private_text.read_text(encoding="utf-8") == "keep"
+    hardlink.unlink()
+    fifo_write = root / "private-write.fifo"
+    os.mkfifo(fifo_write, 0o600)
+    write_probe = subprocess.run([
+        sys.executable, "-c",
+        "import importlib.util,sys; s=importlib.util.spec_from_file_location('m',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m);\ntry: m.write_private_text(__import__('pathlib').Path(sys.argv[2]), 'x')\nexcept (RuntimeError,OSError): pass\nelse: raise SystemExit(2)",
+        str(SCRIPT), str(fifo_write),
+    ], capture_output=True, text=True, timeout=2)
+    assert write_probe.returncode == 0, write_probe.stderr
+    fifo_write.unlink()
+    for lock_path, acquire_lock in (
+        (root / ".guard.json.lock", lambda: module.json_lock(root / "guard.json")),
+        (root / "guard.lock", lambda: module.task_lock({"stateRoot": root, "id": "guard", "title": "Guard"})),
+    ):
+        os.link(private_text, lock_path)
+        try:
+            with acquire_lock():
+                raise AssertionError("hard-linked locks must be rejected")
+        except RuntimeError as exc:
+            assert "不安全" in str(exc)
+        finally:
+            lock_path.unlink()
+        assert private_text.read_text(encoding="utf-8") == "keep"
+    try:
+        module.metadata_from_file(str(root / "missing-metadata.json"))
+    except RuntimeError as exc:
+        assert "不存在" in str(exc)
+    else:
+        raise AssertionError("missing explicit metadata path must fail")
+    metadata_dir = root / "metadata-dir"
+    metadata_dir.mkdir()
+    try:
+        module.metadata_from_file(str(metadata_dir))
+    except RuntimeError as exc:
+        assert "普通文件" in str(exc)
+    else:
+        raise AssertionError("directory metadata path must fail")
+    metadata_calls = []
+    original_tmdb, original_tvmaze = module.fetch_tmdb, module.fetch_tvmaze
+    offline_env = os.environ.pop("MEDIA_DOWNLOADER_OFFLINE", None)
+    module.fetch_tmdb = lambda *_args: metadata_calls.append("tmdb") or {}
+    module.fetch_tvmaze = lambda *_args: metadata_calls.append("tvmaze") or {}
+    try:
+        none_args = type("Args", (), {"metadata": None, "title": "No Lookup", "media_type": "tv", "year": None, "season": 1, "offline": False})()
+        resolved = module.resolve_metadata({"metadata": {"provider": "none"}}, none_args)
+        assert resolved["title"] == "No Lookup" and metadata_calls == []
+        explicit_none_args = type("Args", (), {"metadata": None, "title": "No Fallback", "media_type": "tv", "year": None, "season": 1, "offline": False})()
+        module.resolve_metadata({"metadata": {"provider": "none", "tvFallback": "tvmaze"}}, explicit_none_args)
+        assert metadata_calls == []
+        module.resolve_metadata({}, explicit_none_args)
+        assert metadata_calls == []
+        tmdb_args = type("Args", (), {"metadata": None, "title": "Fallback", "media_type": "tv", "year": None, "season": 1, "offline": False})()
+        module.resolve_metadata({"metadata": {"provider": "tmdb"}}, tmdb_args)
+        assert metadata_calls == ["tmdb", "tvmaze"]
+        metadata_calls.clear()
+        module.resolve_metadata({"metadata": {"tvFallback": "tvmaze"}}, explicit_none_args)
+        assert metadata_calls == ["tvmaze"]
+    finally:
+        module.fetch_tmdb, module.fetch_tvmaze = original_tmdb, original_tvmaze
+        if offline_env is not None:
+            os.environ["MEDIA_DOWNLOADER_OFFLINE"] = offline_env
+    bad_config = {
+        "profiles": {"tv": {"type": "tv", "container": "mp4"}, "nut": {"type": "movie", "container": "nut"}},
+        "defaultProfiles": {"tv": "tv", "movie": "nut"},
+        "namingPresets": {"plex": {"tv": {"showDir": "x", "seasonDir": "x", "episodeFile": "x"}, "movie": {"showDir": "x", "movieFile": "x"}}},
+    }
+    try:
+        module.validate_config(bad_config)
+    except RuntimeError as exc:
+        assert "容器" in str(exc)
+    else:
+        raise AssertionError("unsupported output containers must fail config validation")
+    sidecar_output = root / "sidecar-only"
+    sidecar_output.mkdir()
+    (sidecar_output / "Movie.nfo").write_text("<movie/>", encoding="utf-8")
+    target_root = root / "sidecar-target"
+    target_root.mkdir()
+    try:
+        module.archive({"outputRoot": sidecar_output, "targetRoot": target_root, "targetIdentity": module.directory_identity(target_root), "targetShow": target_root / "Movie", "mediaType": "movie", "config": {"minMediaDurationSeconds": 0}, "args": type("Args", (), {"merge": False, "update_nfo": False})(), "id": "sidecar-only"})
+    except RuntimeError as exc:
+        assert "视频文件" in str(exc)
+    else:
+        raise AssertionError("sidecar-only archive must fail")
+    assert list(target_root.iterdir()) == []
+    assert (sidecar_output / "Movie.nfo").is_file()
     command = module.ffmpeg_command({"profile": {"container": "mp4", "videoCodec": "libx264", "audioCodec": "aac", "resolution": 720}}, Path("input.mkv"), Path("output.mp4"))
     assert command[command.index("-map_metadata") + 1] == "-1"
     assert command[command.index("-map_chapters") + 1] == "-1"
@@ -620,13 +759,16 @@ def assert_path_and_naming_guards(module, root: Path):
     race_output = root / "merge-race-output"
     race_target_show.mkdir(parents=True)
     race_output.mkdir()
+    make_video(race_output / "Episode.mkv")
     (race_output / "fanart.jpg").write_bytes(b"incoming")
     race_logs = []
     original_atomic, original_log, original_status = module.atomic_copy, module.log, module.status_update
     try:
-        def race_atomic(_source, target, _minimum):
-            target.write_bytes(b"other task")
-            raise RuntimeError("simulated concurrent writer")
+        def race_atomic(source, target, minimum):
+            if target.name == "fanart.jpg":
+                target.write_bytes(b"other task")
+                raise RuntimeError("simulated concurrent writer")
+            return original_atomic(source, target, minimum)
 
         module.atomic_copy = race_atomic
         module.log = lambda _ctx, message: race_logs.append(message)
@@ -641,7 +783,8 @@ def assert_path_and_naming_guards(module, root: Path):
             "args": type("Args", (), {"merge": True, "update_nfo": False})(),
             "id": "merge-race",
         })
-        assert archived == [str(race_target_show / "fanart.jpg")]
+        assert archived == [str(race_target_show / "Episode.mkv"), str(race_target_show / "fanart.jpg")]
+        assert (race_target_show / "Episode.mkv").is_file()
         assert (race_target_show / "fanart.jpg").read_bytes() == b"other task"
         assert any("并发合并" in message for message in race_logs), race_logs
     finally:
@@ -687,7 +830,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.5 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.6 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
@@ -739,7 +882,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.5"
+            assert doctor_payload["version"] == "0.4.6"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -828,7 +971,7 @@ def main():
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
-            assert delivery_plan["version"] == "0.4.5" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.6" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"

@@ -31,13 +31,14 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
 ARCHIVE_EXTS = VIDEO_EXTS | SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
+OUTPUT_CONTAINERS = {"mp4", "mkv"}
 REPAIR_SIDECAR_EXTS = SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
 TV_SHARED_MERGE_FILES = {"tvshow.nfo", "poster.jpg", "fanart.jpg", "banner.jpg", "clearlogo.png"}
 YTDLP_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
@@ -91,27 +92,50 @@ def ensure_private_file(path: Path) -> None:
 
 
 def write_private_text(path: Path, value: str) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags, 0o600)
-    os.fchmod(descriptor, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(value)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise RuntimeError(f"私有文件不安全: {path}")
+        os.ftruncate(descriptor, 0)
+        os.fchmod(descriptor, 0o600)
+        os.set_blocking(descriptor, True)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            handle.write(value)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
 
 
 def open_private_input(path: Path, label: str, max_size: int) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK matters before fstat: opening a FIFO read-only otherwise waits
+    # forever for a writer, preventing the privacy/type guard from running.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags)
-    info = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) & 0o077
-        or info.st_size > max_size
-    ):
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or info.st_size > max_size
+        ):
+            raise RuntimeError(f"{label}：必须是当前用户拥有、单硬链接、无组/其他权限且不超过 {max_size // 1024}KB 的普通文件")
+        os.set_blocking(descriptor, True)
+        return descriptor
+    except Exception:
         os.close(descriptor)
-        raise RuntimeError(f"{label}：必须是当前用户拥有、单硬链接、无组/其他权限且不超过 {max_size // 1024}KB 的普通文件")
-    return descriptor
+        raise
 
 
 def require_private_input(path: Path, label: str, max_size: int) -> Path:
@@ -176,7 +200,7 @@ def validate_config(data: dict) -> None:
         if naming_name not in naming:
             raise RuntimeError(f"profile {name} 引用了未知 naming: {naming_name}")
         container = str(profile.get("container", "mp4")).lower().lstrip(".")
-        if not re.fullmatch(r"[a-z0-9]{2,8}", container):
+        if container not in OUTPUT_CONTAINERS:
             raise RuntimeError(f"profile {name} 容器无效: {container}")
         codec = profile.get("videoCodec", "libx264")
         audio_codec = profile.get("audioCodec", "aac")
@@ -305,15 +329,25 @@ def candidate_file() -> Path:
 def json_lock(path: Path):
     lock_path = path.with_name(f".{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(lock_path, flags, 0o600)
-    os.fchmod(descriptor, 0o600)
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o077:
+            raise RuntimeError(f"锁文件不安全: {lock_path}")
+        os.fchmod(descriptor, 0o600)
+        os.set_blocking(descriptor, True)
+        handle = os.fdopen(descriptor, "a+", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def status_update(task_id: str, **fields) -> dict:
@@ -476,6 +510,8 @@ def select_profile(config: dict, media_type: str, name: str | None) -> tuple[str
     if profile.get("type", media_type) != media_type:
         raise RuntimeError(f"预设 {name} 不适用于 {media_type}")
     container = str(profile.get("container", "mp4")).lower().lstrip(".")
+    if container not in OUTPUT_CONTAINERS:
+        raise RuntimeError(f"预设 {name} 容器不受支持: {container}")
     return name, {**profile, "container": container}
 
 
@@ -523,7 +559,13 @@ def render_path(template: str, fields: dict) -> Path:
 def metadata_from_file(path: str | None) -> dict:
     if not path:
         return {}
-    data = read_json(resolve_path(path))
+    resolved = resolve_path(path)
+    if not resolved.is_file():
+        raise RuntimeError(f"metadata JSON 文件不存在或不是普通文件: {resolved}")
+    try:
+        data = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"metadata JSON 文件无效: {resolved}: {exc}") from exc
     if not isinstance(data, dict):
         raise RuntimeError("metadata JSON 必须是对象")
     return data
@@ -784,13 +826,18 @@ def resolve_metadata(config: dict, args) -> dict:
     query_title = query_title or args.title
     fetched = {}
     offline = bool(args.offline or os.environ.get("MEDIA_DOWNLOADER_OFFLINE") == "1")
-    metadata_config = config.get("metadata", {})
-    if not offline and metadata_config.get("provider") == "tmdb":
+    metadata_config = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
+    provider = metadata_config.get("provider")
+    if not offline and provider == "tmdb":
         try:
             fetched = fetch_tmdb(config, args.media_type, query_title, args.year, args.season if args.media_type == "tv" else None)
         except Exception as exc:
             print(f"警告: TMDB 元数据查询失败: {exc}", file=sys.stderr)
-    if not fetched and not offline and args.media_type == "tv" and metadata_config.get("tvFallback", "tvmaze") == "tvmaze":
+    # An explicit provider=none is a provider contract.  Otherwise TVMaze is
+    # opt-in when configured; the old implicit default would surprise local runs.
+    tv_fallback = metadata_config.get("tvFallback", "tvmaze" if provider == "tmdb" else None)
+    fallback_enabled = provider != "none" and tv_fallback == "tvmaze"
+    if not fetched and not offline and args.media_type == "tv" and fallback_enabled:
         try:
             fetched = fetch_tvmaze(query_title, args.season)
         except Exception as exc:
@@ -952,7 +999,26 @@ def local_source_snapshot(source: str) -> dict | None:
         return ("other", relative, item_info.st_ino, item_info.st_size, item_info.st_mtime_ns, mode)
 
     if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        return {"kind": "file", "path": str(path), "record": record(path, path.name)}
+        records = [record(path, path.name)]
+        if stat.S_ISREG(info.st_mode) and path.suffix.lower() in VIDEO_EXTS:
+            # copy_sidecars consumes same-stem subtitles; artwork inference also
+            # scans these conventional shared names. Track both on local retry.
+            artwork_stems = {"poster", "folder", "cover", "default", "movie", "fanart", "backdrop", "background", "art", "banner", "clearlogo", "logo"}
+            for sibling in sorted(path.parent.iterdir(), key=lambda item: item.name):
+                if (
+                    sibling != path
+                    and is_safe_file(path.parent, sibling)
+                    and (
+                        (sibling.name.startswith(f"{path.stem}.") and sibling.suffix.lower() in SUBTITLE_EXTS)
+                        or (sibling.stem.casefold() in artwork_stems and sibling.suffix.lower() in IMAGE_EXTS)
+                    )
+                ):
+                    records.append(record(sibling, sibling.name))
+        encoded = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        result = {"kind": "file", "path": str(path), "record": records[0]}
+        if len(records) > 1:
+            result["siblingsDigest"] = hashlib.sha256(encoded).hexdigest()
+        return result
     if not stat.S_ISDIR(info.st_mode):
         return {"kind": "other", "path": str(path), "record": record(path, path.name)}
 
@@ -1060,26 +1126,32 @@ def task_lock(ctx: dict):
     path = ctx["stateRoot"] / f"{ctx['id']}.lock"
     require_mounted_volume(path, "状态目录")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags, 0o600)
-    info = os.fstat(descriptor)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-        os.close(descriptor)
-        raise RuntimeError(f"任务锁不安全: {path}")
-    os.fchmod(descriptor, 0o600)
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(f"任务已在运行: {ctx['title']}") from exc
-        handle.seek(0)
-        handle.truncate()
-        handle.write(str(os.getpid()))
-        handle.flush()
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o077:
+            raise RuntimeError(f"任务锁不安全: {path}")
+        os.fchmod(descriptor, 0o600)
+        os.set_blocking(descriptor, True)
+        handle = os.fdopen(descriptor, "a+", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(f"任务已在运行: {ctx['title']}") from exc
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(os.getpid()))
+            handle.flush()
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def log(ctx: dict, message: str) -> None:
@@ -2465,6 +2537,8 @@ def archive(ctx: dict, phase: str = "archiving", action: str = "归档") -> list
     )
     if not files:
         raise RuntimeError("没有可归档文件")
+    if not any(path.suffix.lower() in VIDEO_EXTS for path in files):
+        raise RuntimeError("没有可归档的视频文件，拒绝仅归档边车文件")
     prepared = []
     for source in files:
         relative = source.relative_to(output_root)
@@ -2749,7 +2823,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--profile")
     parser.add_argument("--target")
     parser.add_argument("--naming")
-    parser.add_argument("--metadata", help="Agent-provided metadata JSON")
+    parser.add_argument("--metadata", help="Path to a metadata JSON file")
     parser.add_argument("--downloader", choices=("auto", "aria2", "yt-dlp", "local"), default="auto")
     parser.add_argument("--season", type=int, default=1)
     parser.add_argument("--episode", type=int)
@@ -2809,7 +2883,7 @@ def parser() -> argparse.ArgumentParser:
     repair.add_argument("--season", type=int, default=1, help="Season to query from the metadata provider; Season 0 is supported")
     repair.add_argument("--profile")
     repair.add_argument("--naming")
-    repair.add_argument("--metadata", help="Agent-provided metadata JSON")
+    repair.add_argument("--metadata", help="Path to a metadata JSON file")
     repair.add_argument("--offline", action="store_true")
     repair.add_argument("--update-nfo", action="store_true", help="Update per-episode NFO only when reliable episode metadata is available")
     repair.add_argument("--apply", action="store_true", help="Apply the displayed repair plan; preview is the default")
