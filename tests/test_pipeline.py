@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import http.server
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -17,8 +18,10 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -81,6 +84,8 @@ def make_image(path: Path):
 class Handler(http.server.SimpleHTTPRequestHandler):
     root: Path
     last_query = {}
+    retry_counts = {}
+    retry_mode = "success"
 
     def log_message(self, _format, *_args):
         pass
@@ -89,6 +94,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path.endswith("/torznab/api"):
             type(self).last_query = urllib.parse.parse_qs(parsed.query)
+            if type(self).last_query.get("t") == ["caps"]:
+                if type(self).retry_mode == "caps-fail":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                payload = b"<?xml version='1.0'?><caps><server version='1'/></caps>"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/xml")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             url = f"http://127.0.0.1:{self.server.server_address[1]}/Remote.S01E01.mp4"
             payload = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item>
@@ -102,6 +119,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if parsed.path == "/retry.mp4":
+            count = type(self).retry_counts.get(parsed.path, 0) + 1
+            type(self).retry_counts[parsed.path] = count
+            if type(self).retry_mode == "retry-once" and count == 1 or type(self).retry_mode == "always-fail":
+                self.send_response(503)
+                self.end_headers()
+                return
         super().do_GET()
 
     def translate_path(self, path):
@@ -639,6 +663,14 @@ def assert_path_and_naming_guards(module, root: Path):
         assert acquired == [fake_media]
         assert any(arg.startswith("--input-file=") for arg in captured[0]), captured
         assert "--bt-stop-timeout=600" in captured[0], captured
+        assert "--max-tries=4" in captured[0] and "--retry-wait=3" in captured[0], captured
+        module.acquire({
+            "sourceRoot": magnet_source,
+            "workRoot": magnet_work,
+            "config": {"timeoutHours": 1, "downloadRetries": 0},
+            "args": type("Args", (), {"playlist": False})(),
+        }, long_magnet, "auto")
+        assert "--max-tries=1" in captured[-1], captured[-1]
     finally:
         module.log, module.run_child, module.shutil.which = original_log, original_run_child, original_which
 
@@ -707,6 +739,9 @@ def assert_path_and_naming_guards(module, root: Path):
         assert command[command.index("--format") + 1] == "bv*[height<=720]+ba/b", command
         assert command[command.index("--cookies-from-browser") + 1] == "chrome", command
         assert "--yes-playlist" in command
+        assert "--abort-on-unavailable-fragments" in command
+        assert command[command.index("--retries") + 1] == "3"
+        assert command.count("--retry-sleep") == 3
         assert "--write-subs" in command and "--write-auto-subs" in command
         assert command[command.index("--sub-format") + 1] == "srt/best"
         assert command[command.index("--sub-langs") + 1] == "zh-CN,en"
@@ -826,11 +861,61 @@ def assert_path_and_naming_guards(module, root: Path):
         module.validate_video = original_validate
 
 
+def assert_doctor_contract(module, data: dict):
+    data = {**data, "targets": {}, "searchSources": {}, "metadata": {"provider": "tmdb", "apiKeyEnv": "DOCTOR_TEST_KEY"}}
+    secret = "doctor-private-test-value"
+
+    def fake_tool(command, **_kwargs):
+        if "--verbose" in command:
+            return subprocess.CompletedProcess(command, 2, "", f"[debug] Optional libraries: yt_dlp_ejs-0.8.0\n[debug] JS runtimes: deno-2.9.5\n[debug] Proxy map: {secret}\n")
+        return subprocess.CompletedProcess(command, 0, "2026.07.04\n", "")
+
+    def doctor(*flags):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = module.command_doctor(module.parser().parse_args(["doctor", *flags]))
+        assert secret not in output.getvalue()
+        return code, {item["name"]: item for item in json.loads(output.getvalue())["checks"]}
+
+    with patch.dict(os.environ, {"DOCTOR_TEST_KEY": secret}, clear=True), patch.object(module, "load_config", return_value=data), patch.object(module.shutil, "which", side_effect=lambda tool: f"/mock/{tool}"), patch.object(module.subprocess, "run", side_effect=fake_tool), patch.object(module, "http_open") as http:
+        code, checks = doctor("--cookies", "chrome")
+        http.assert_not_called()
+        assert code == 0 and checks["runtime:deno"]["status"] == checks["yt-dlp:ejs"]["status"] == "ok"
+        assert checks["cookies"]["status"] == "unverified"
+        with patch.object(module.shutil, "which", side_effect=lambda tool: f"/mock/{tool}" if tool in {"ffmpeg", "ffprobe"} else None):
+            code, checks = doctor()
+            assert code == 0 and checks["deno"]["status"] == "optional-missing"
+        http.return_value = io.BytesIO(b'{"images":{"secure_base_url":"https://image.tmdb.org/","poster_sizes":["original"]}}')
+        code, checks = doctor("--online")
+        assert code == 0 and checks["online:tmdb"]["status"] == "ok"
+        request = http.call_args.args[0]
+        assert request.full_url.startswith("https://api.themoviedb.org/3/configuration?")
+        assert not http.call_args.kwargs.get("allow_private", False)
+        for error, detail in (
+            (urllib.error.HTTPError("https://example.test", 401, secret, {}, None), "HTTP 401"),
+            (urllib.error.URLError(TimeoutError(secret)), "timeout"),
+        ):
+            http.side_effect = error
+            code, checks = doctor("--online")
+            assert code == 1 and checks["online:tmdb"]["detail"] == detail
+        http.side_effect = None
+        http.return_value = io.BytesIO(b'{"success":false}')
+        code, checks = doctor("--online")
+        assert code == 1 and checks["online:tmdb"]["detail"] == "invalid-response"
+        http.reset_mock()
+        with patch.dict(os.environ, {"MEDIA_DOWNLOADER_OFFLINE": "1"}):
+            code, checks = doctor("--online")
+            assert code == 0 and checks["online"]["status"] == "skipped"
+        data["metadata"]["provider"] = "none"
+        doctor("--online")
+        http.assert_not_called()
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.6 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.7 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
@@ -867,7 +952,34 @@ def main():
 
         with server(root / "http") as port:
             cfg = config(root, port)
+            assert_doctor_contract(module, json.loads(cfg.read_text(encoding="utf-8")))
             env = {**os.environ, "MEDIA_DOWNLOADER_CONFIG": str(cfg), "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "status.json"), "MEDIA_DOWNLOADER_CANDIDATE_FILE": str(root / "candidates.json"), "MEDIA_DOWNLOADER_OFFLINE": "1", "TEST_JACKETT_KEY": "secret-key", "TEST_TORZNAB_KEY": "secret-key"}
+            make_video(root / "http" / "retry.mp4")
+            retry_config = json.loads(cfg.read_text(encoding="utf-8"))
+            retry_config.update(downloadRetries=1, downloadDir=str(root / "retry-delivery"))
+            retry_cfg = write_config(root / "retry-config.json", retry_config)
+            retry_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(retry_cfg), "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "retry-status.json")}
+            retry_command = [sys.executable, str(SCRIPT), "ingest", "Retry Movie", f"http://127.0.0.1:{port}/retry.mp4", "--type", "movie", "--no-archive", "--no-transcode", "--offline"]
+            Handler.retry_counts = {}
+            Handler.retry_mode = "retry-once"
+            run(retry_command, env=retry_env)
+            retry_state = next(iter(json.loads((root / "retry-status.json").read_text()).values()))
+            assert Handler.retry_counts["/retry.mp4"] == 2
+            assert retry_state["phase"] == "done" and not Path(retry_state["workPath"]).exists()
+            assert list(Path(retry_state["targetPath"]).glob("*.mp4"))
+            Handler.retry_mode = "always-fail"
+            for retries in (1, 0):
+                retry_config["downloadRetries"] = retries
+                write_config(retry_cfg, retry_config)
+                Handler.retry_counts = {}
+                failed_command = list(retry_command)
+                failed_command[3] = f"Failed Retry {retries}"
+                run(failed_command, env=retry_env, expect=1)
+                assert Handler.retry_counts["/retry.mp4"] == retries + 1
+                failed_state = next(state for state in json.loads((root / "retry-status.json").read_text()).values() if state["title"] == f"Failed Retry {retries}")
+                assert failed_state["phase"] == "failed" and Path(failed_state["workPath"]).is_dir()
+                assert not Path(failed_state["targetPath"]).exists()
+            Handler.retry_mode = "success"
 
             insecure_cfg = root / "insecure-config.json"
             shutil.copy2(cfg, insecure_cfg)
@@ -882,13 +994,38 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.6"
+            assert doctor_payload["version"] == "0.4.7"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
             assert checks["work:state"] == "ok"
             assert checks["target:tv"] == "ok"
             assert checks["target:movie"] == "unavailable"
+            assert any(item["name"] == "ffmpeg" and "version" in item for item in doctor_payload["checks"])
+            Handler.last_query = {}
+            run([sys.executable, str(SCRIPT), "doctor"], env=env)
+            assert Handler.last_query == {}
+            online_env = dict(env)
+            online_env.pop("MEDIA_DOWNLOADER_OFFLINE", None)
+            online_doctor = run([sys.executable, str(SCRIPT), "doctor", "--online"], env=online_env)
+            online_checks = {item["name"]: item for item in json.loads(online_doctor.stdout)["checks"]}
+            assert online_checks["online:search:jackett"]["status"] == "ok"
+            Handler.retry_mode = "caps-fail"
+            failed_online = run([sys.executable, str(SCRIPT), "doctor", "--online"], env=online_env, expect=1)
+            failed_item = next(item for item in json.loads(failed_online.stdout)["checks"] if item["name"] == "online:search:jackett")
+            assert failed_item["status"] == "error" and "secret-key" not in failed_online.stdout
+            Handler.retry_mode = "success"
+            insecure_cookie = root / "doctor-cookies.txt"
+            insecure_cookie.write_text("cookie", encoding="utf-8")
+            insecure_cookie.chmod(0o644)
+            cookie_result = run([sys.executable, str(SCRIPT), "doctor", "--cookies", str(insecure_cookie)], env=env, expect=1)
+            assert "cookies" in cookie_result.stderr
+            invalid_retries = json.loads(cfg.read_text(encoding="utf-8"))
+            invalid_retries["downloadRetries"] = 1.5
+            invalid_retries_cfg = root / "invalid-retries.json"
+            write_config(invalid_retries_cfg, invalid_retries)
+            bad_retries = run([sys.executable, str(SCRIPT), "doctor"], env={**env, "MEDIA_DOWNLOADER_CONFIG": str(invalid_retries_cfg)}, expect=1)
+            assert "downloadRetries" in bad_retries.stderr
             optional_env = dict(env)
             optional_env.pop("TEST_JACKETT_KEY", None)
             optional_doctor = run([sys.executable, str(SCRIPT), "doctor"], env=optional_env)
@@ -971,7 +1108,8 @@ def main():
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
-            assert delivery_plan["version"] == "0.4.6" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["downloadRetries"] == 3
+            assert delivery_plan["version"] == "0.4.7" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"

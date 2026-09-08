@@ -158,6 +158,8 @@ yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时�
 - 存量库修复拒绝媒体库/分类根目录、重复 SxxEyy 和已存在目标；默认预览，不清理遗留空目录。
 - 归档会先完成冲突预检，避免最后因图片冲突而留下“部分成功”；只有边车文件而没有视频时会直接拒绝。电视剧分集增量归档可用 `--merge` 保留已有节目级图片和 `tvshow.nfo`，不同视频仍拒绝写入。
 - aria2 连续零流量达到 `btStopTimeoutSeconds`（默认 600 秒）后停止；是否换源仍由 Agent 与用户明确决定。
+- `downloadRetries` 控制有限原生网络重试（`0-10`，默认 `3`；`0` 禁用），按 aria2 请求或 yt-dlp HTTP/分片/提取器请求计算，而非整条播放列表；不可用分片会中止下载。现有任务超时仍生效，流水线不会自动换源。
+- `doctor` 离线报告工具版本及 yt-dlp 识别到的 Deno/EJS。`doctor --online` 才探测 TMDB `/configuration` 与启用的 Torznab `t=caps`（每项 10 秒，离线模式下跳过）；caps 可读不代表资源可下载。`doctor --cookies SPEC` 检查私有文件权限或接受浏览器名称，均不证明登录有效。YouTube 环境说明参考上游 [EJS 指南](https://github.com/yt-dlp/yt-dlp/wiki/EJS)。
 - 只有大小、SHA-256、媒体有效性和目标身份校验全部通过后才清理工作区；调试时可用 `--keep-work` 保留任务缓存。
 - 本地失败任务的重试指纹包含同名字幕及约定名称图片；这些边车文件发生增删改后，确认来源再使用 `--reset-work`。
 - `--reset-work` 只删除验证过所有权的任务工作区，必须明确使用。

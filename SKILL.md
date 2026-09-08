@@ -20,7 +20,7 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
 
 ## Workflow
 
-1. Run `./run.sh --version`, then `./run.sh doctor`. Record the pipeline version/config schema and confirm FFmpeg/FFprobe, the required downloader, and `download:output` when using local delivery. Archive targets are optional; an unused missing target may remain `unavailable`.
+1. Run `./run.sh --version`, then `./run.sh doctor`. Record the pipeline version/config schema and confirm FFmpeg/FFprobe, the required downloader, and `download:output` when using local delivery. Archive targets are optional; an unused missing target may remain `unavailable`. For YouTube, inspect the reported Deno/EJS checks; `unverified` requires a source `probe` before assuming readiness. Use `doctor --online` to investigate configured provider connectivity, or `doctor --cookies SPEC` to check the selected credential input without opening a browser session.
 2. Establish media type, verified title/year, playlist scope, transcode mode, local-delivery/archive choice and target, profile, naming preset, and quality requirements.
    - Run `profiles` to inspect `defaultModes.tv|movie`.
    - If the user says “use the default,” apply it directly.
@@ -61,6 +61,8 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
 # Diagnose and inspect configuration
 ./run.sh --version
 ./run.sh doctor
+# Optional read-only endpoint checks (skipped under MEDIA_DOWNLOADER_OFFLINE=1)
+./run.sh doctor --online
 ./run.sh profiles
 ./run.sh sources
 
@@ -180,6 +182,7 @@ Run `cp config.example.json config.json && chmod 600 config.json`. The example u
 
 - `searchSources`: optional Jackett, generic Torznab/Prowlarr, or web templates; `apiKeyEnv` names an environment variable. Missing keys appear as `optional-missing` in doctor and fail only when that source is actually searched.
 - `btStopTimeoutSeconds`: aria2 sustained-zero-traffic limit; default `600`, set `0` only to disable it deliberately.
+- `downloadRetries`: finite native downloader retries, integer `0-10`, default `3`; `0` disables retries. aria2/yt-dlp apply this per request/fragment, not as a whole-playlist counter; yt-dlp aborts on unavailable fragments.
 - `profiles`: container, resolution, codec, CRF/bitrate, optional target, and naming. The example defaults produce MP4; `mkv` profiles preserve embedded subtitle streams. Inspect private profile names with `profiles` before selecting one.
 - `defaultProfiles.tv|movie`: default compression profiles.
 - `defaultModes.tv|movie`: `transcode` or `organize`; omitted values remain backward-compatible as `transcode`.
@@ -195,6 +198,6 @@ Environment overrides include `MEDIA_DOWNLOADER_CONFIG`, `MEDIA_DOWNLOADER_BASE_
 
 `stateDir` stores task locks and per-task logs. Global `status.json` and `candidates.json` default to `.runtime/` and can be overridden with `MEDIA_DOWNLOADER_STATUS_FILE` / `MEDIA_DOWNLOADER_CANDIDATE_FILE`.
 
-`--version`, doctor JSON, dry-run plans, and task status expose the pipeline version and configuration schema so an agent can detect stale installations before execution.
+`--version`, doctor JSON, dry-run plans, and task status expose the pipeline version and configuration schema so an agent can detect stale installations before execution. `doctor --online` is opt-in, checks TMDB `/configuration` and enabled Torznab `t=caps` with bounded requests, and never sends requests when `MEDIA_DOWNLOADER_OFFLINE=1`; `doctor --cookies` validates a private cookies file while browser login remains unverified. A readable caps response does not prove search/download availability or authentication on indexers that serve caps anonymously.
 
 After code or configuration changes, run `./scripts/smoke-test.sh`.
