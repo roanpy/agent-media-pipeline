@@ -11,7 +11,7 @@ Audience: an independent AI verification agent. Work from the repository root or
 
 ## Pass criteria (run each, report pass/fail + evidence)
 
-1. **Baseline/version**: `./run.sh --version` prints `Agent Media Pipeline 0.4.6 (config schema 1)`; `./scripts/smoke-test.sh` prints `integration test passed`; `ruff check media-downloader.py tests/test_pipeline.py` clean; `python3 -m py_compile` both files OK.
+1. **Baseline/version**: `./run.sh --version` prints `Agent Media Pipeline 0.4.7 (config schema 1)`; `./scripts/smoke-test.sh` prints `integration test passed`; `ruff check media-downloader.py tests/test_pipeline.py` clean; `python3 -m py_compile` both files OK.
 2. **Movie no-archive → downloadDir**: `adopt` a local mkv with `--type movie --no-archive --offline --metadata <path-to-json>` (a file containing `{"title": ..., "year": ...}`). Expect `downloadDir/<Title> (<Year>)/<Title> (<Year>).<ext>` + `movie.nfo`; work area removed; `status.json` `targetPath` points at the delivered folder.
 3. **TV episode naming**: adopt `Show.S02E03.mkv` as TV → `.../Season 02/<Show> - S02E03.<ext>` and a sibling `.nfo` containing `<season>2</season>`, `<episode>3</episode>`, and at least one `<uniqueid>`.
 4. **Organize (no transcode)**: `organize` keeps the original container bytes (compare SHA-256 source vs output) and still writes NFO.
@@ -20,7 +20,7 @@ Audience: an independent AI verification agent. Work from the repository root or
 7. **No-clobber**: re-run an adopt whose NFO/metadata differs from the existing output; the run must fail with `拒绝覆盖` and leave the first output byte-identical. (A byte-identical re-run is intentionally idempotent and exits 0 — only differing content is rejected.)
 8. **--keep-work**: with it, the delivered copy exists AND the work area is retained.
 9. **Safety negatives**: `--source-file` with 0644 perms, FIFO `--source-file` inputs (must reject without hanging), missing/non-file `--metadata` paths, and HTTP URLs with embedded credentials are rejected; a `downloadDir` inside `.media-downloader-work` is rejected; config files that are group/other-readable or symlinked are rejected; a failed local task detects changed file/directory/sidecar snapshots before retry.
-10. **doctor**: `./run.sh doctor` returns valid JSON with `version: 0.4.6` and `configSchemaVersion: 1`; `download:output` is `ok` when `downloadDir` is set.
+10. **doctor**: `./run.sh doctor` returns valid JSON with `version: 0.4.7` and `configSchemaVersion: 1`; `download:output` is `ok` when `downloadDir` is set. `doctor --online` is explicit and bounded; `doctor --cookies` validates syntax/private files but browser login remains unverified.
 11. **Incremental TV merge**: pre-create a different root `fanart.jpg`/`tvshow.nfo`, then add an S02 episode. Without `--merge`, expect failure before any episode is copied. Re-run the same task with `--merge`; expect the new episode/NFO, unchanged shared files, and a `合并跳过已有共享文件` log. A different existing episode media file must still fail under `--merge`.
 12. **Search/stall controls**: `search --timeout 90` succeeds against the stub; values outside 1-300 fail. Capture fake aria2 arguments and require `--bt-stop-timeout=600` by default.
 13. **Stop closure**: run a fake long-lived aria2 child in its own process group, call `stop`, and require parent + child exit and final `phase: stopped` with no leftover process.
@@ -31,6 +31,8 @@ Audience: an independent AI verification agent. Work from the repository root or
 18. **Stream metadata policy**: a movie profile with `container: "mkv"` must retain mapped video/audio/subtitle stream `language/title` tags and Matroska attachment metadata while dropping inherited global/chapter metadata; embedded subtitles remain present (no `-sn`), and a missing mapped stream must fail validation. The MP4 profile still drops embedded subtitles/attachments and keeps external sidecars. Unsupported output containers such as `nut` must fail profile validation, and archive must reject sidecar-only output.
 
 19. **Optional metadata and local retries**: without an offline override, stub both providers and confirm absent metadata config and `provider: "none"` (even with `tvFallback: "tvmaze"`) make no provider calls. TMDB keeps its default TVMaze fallback; an omitted provider requires explicit `tvFallback: "tvmaze"`. Adding/editing/removing conventional sibling artwork changes a single-video snapshot; unrelated subtitles do not. Private writes/locks reject hard links without truncating the original file. Sidecar-only delivery leaves both its workspace and the target unchanged.
+
+20. **Doctor and finite network retries**: default doctor must make no provider requests and report tool versions plus available yt-dlp Deno/EJS diagnostics. Simulate TMDB success/401/timeout/invalid JSON shape and Torznab caps success/401; failures return nonzero with no credential disclosure. `--online` obeys offline mode and disabled providers. Browser cookie validation does not access a browser session; unsafe files fail. Serve a synthetic MP4 from local HTTP: an initial 503 then 200 must recover and deliver, while persistent 503 with `downloadRetries: 1` or `0` must stop after two or one attempts, report failed, preserve work and not deliver. Capture yt-dlp finite retry/backoff arguments and `--abort-on-unavailable-fragments`.
 
 ## Report format
 

@@ -31,7 +31,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
@@ -172,10 +172,14 @@ def validate_config(data: dict) -> None:
         timeout_hours = float(data.get("timeoutHours", 24))
         minimum_duration = float(data.get("minMediaDurationSeconds", 120))
         bt_stop_timeout = int(data.get("btStopTimeoutSeconds", 600))
+        raw_retries = data.get("downloadRetries", 3)
+        if isinstance(raw_retries, bool) or not isinstance(raw_retries, int):
+            raise ValueError("downloadRetries must be integer")
+        download_retries = raw_retries
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("timeoutHours/minMediaDurationSeconds/btStopTimeoutSeconds 必须是数字") from exc
-    if timeout_hours <= 0 or minimum_duration < 0 or not 0 <= bt_stop_timeout <= 86400:
-        raise RuntimeError("timeoutHours 必须大于 0，minMediaDurationSeconds 不得小于 0，btStopTimeoutSeconds 必须在 0-86400 秒")
+        raise RuntimeError("timeoutHours/minMediaDurationSeconds/btStopTimeoutSeconds/downloadRetries 必须是数字") from exc
+    if timeout_hours <= 0 or minimum_duration < 0 or not 0 <= bt_stop_timeout <= 86400 or not 0 <= download_retries <= 10:
+        raise RuntimeError("timeoutHours 必须大于 0，minMediaDurationSeconds 不得小于 0，btStopTimeoutSeconds 必须在 0-86400 秒，downloadRetries 必须在 0-10")
     download_dir = data.get("downloadDir")
     if download_dir not in (None, "") and (not isinstance(download_dir, str) or not download_dir.strip()):
         raise RuntimeError("downloadDir 必须是非空路径字符串")
@@ -683,21 +687,26 @@ def http_json(url: str, params: dict, headers: dict | None = None, timeout: int 
         raise RuntimeError(f"{urllib.parse.urlsplit(url).netloc} 连接失败: {exc.reason}") from exc
 
 
+def tmdb_auth(config: dict) -> tuple[dict, dict] | None:
+    metadata_config = config.get("metadata", {})
+    key_env = str(metadata_config.get("apiKeyEnv", "TMDB_API_KEY"))
+    api_key = os.environ.get(key_env, "")
+    if not api_key:
+        return None
+    # TMDB read tokens use Bearer auth; v3 API keys use the query parameter.
+    if api_key.startswith("eyJ"):
+        return {"Authorization": f"Bearer {api_key}"}, {}
+    return {}, {"api_key": api_key}
+
+
 def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None, season: int | None = None) -> dict:
     metadata_config = config.get("metadata", {})
-    key_env = metadata_config.get("apiKeyEnv", "TMDB_API_KEY")
-    api_key = os.environ.get(str(key_env), "")
-    if not api_key:
+    auth_info = tmdb_auth(config)
+    if not auth_info:
         return {}
+    auth, auth_params = auth_info
     language = metadata_config.get("language", "zh-CN")
     kind = "tv" if media_type == "tv" else "movie"
-    # TMDB v4 只读 token 是 JWT（eyJ 开头），必须走 Bearer header；v3 key 走 api_key 参数
-    if api_key.startswith("eyJ"):
-        auth = {"Authorization": f"Bearer {api_key}"}
-        auth_params = {}
-    else:
-        auth = None
-        auth_params = {"api_key": api_key}
     # 用户常输入带年份的标题（"The Odyssey 2026"），TMDB 的 query 是全文匹配会 0 命中；
     # 剥离末尾年份单独走 year 过滤参数，标题回到干净检索词。
     query = title
@@ -1424,19 +1433,22 @@ def torznab_attr(item: ET.Element, name: str):
     return None
 
 
+def torznab_endpoint(source: dict) -> str:
+    base = str(source.get("url", "")).rstrip("/")
+    if source.get("type") == "jackett":
+        indexer = urllib.parse.quote(str(source.get("indexer", "all")), safe="")
+        return f"{base}/api/v2.0/indexers/{indexer}/results/torznab/api"
+    return base
+
+
 def torznab_search(name: str, source: dict, query: str, media_type: str, limit: int, timeout: int | None = None) -> list[dict]:
     key_env = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
     api_key = os.environ.get(key_env)
     if not api_key:
         raise RuntimeError(f"搜索源 {name} 缺少环境变量 {key_env}")
-    base = str(source.get("url", "")).rstrip("/")
-    if not base.startswith(("http://", "https://")):
+    url = torznab_endpoint(source)
+    if not url.startswith(("http://", "https://")):
         raise RuntimeError(f"搜索源 {name} URL 无效")
-    if source.get("type") == "jackett":
-        indexer = urllib.parse.quote(str(source.get("indexer", "all")), safe="")
-        url = f"{base}/api/v2.0/indexers/{indexer}/results/torznab/api"
-    else:
-        url = base
     search_type = "tvsearch" if media_type == "tv" else "movie"
     params = {"apikey": api_key, "t": search_type, "q": query}
     if source.get("categories"):
@@ -1663,6 +1675,8 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
             "--auto-file-renaming=false", "--allow-overwrite=false", "--file-allocation=none",
             "--check-integrity=true", "--seed-time=0", "--summary-interval=10",
         ]
+        retries = int(ctx["config"].get("downloadRetries", 3))
+        command += [f"--max-tries={retries + 1}", "--retry-wait=3"]
         bt_stop_timeout = int(ctx["config"].get("btStopTimeoutSeconds", 600))
         if bt_stop_timeout:
             command.append(f"--bt-stop-timeout={bt_stop_timeout}")
@@ -1702,9 +1716,14 @@ def acquire(ctx: dict, source: str, requested: str) -> list[Path]:
             ]
         command += [
             playlist_flag, "--continue",
-            "--no-overwrites", "--newline",
+            "--no-overwrites", "--newline", "--abort-on-unavailable-fragments",
             "--paths", str(ctx["sourceRoot"]),
             "--output", "%(playlist_index,autonumber)03d %(title).180B [%(id)s].%(ext)s", "--batch-file", str(input_file),
+        ]
+        retries = int(ctx["config"].get("downloadRetries", 3))
+        command += [
+            "--retries", str(retries), "--fragment-retries", str(retries), "--extractor-retries", str(retries),
+            "--retry-sleep", "http:exp=1:8", "--retry-sleep", "fragment:exp=1:8", "--retry-sleep", "extractor:exp=1:8",
         ]
         try:
             run_child(ctx, command, "downloading", task_timeout_seconds(ctx["config"]), [source])
@@ -2617,6 +2636,7 @@ def pipeline(args) -> int:
         "subs": bool(args.write_subs),
         "subtitleLanguages": selected_subtitles,
         "authenticated": bool(args.cookies),
+        "downloadRetries": int(config.get("downloadRetries", 3)),
         "downloader": downloader,
         "targetPath": str(ctx["targetShow"]), "source": redacted_source(source),
     }
@@ -2761,12 +2781,94 @@ def command_stop(args) -> int:
     return 0
 
 
-def command_doctor(_args) -> int:
+def _probe_version(command: list[str]) -> tuple[str | None, str | None]:
+    """Return successful version output; do not echo failure diagnostics."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "probe-timeout"
+    if result.returncode != 0:
+        return None, f"exit-{result.returncode}"
+    output = (result.stdout or "").strip()
+    first = output.splitlines()[0][:200] if output else ""
+    return (first or None), (None if first else "empty-output")
+
+
+def _doctor_torznab_caps(name: str, source: dict) -> None:
+    key_env = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
+    api_key = os.environ.get(key_env)
+    if not api_key:
+        raise RuntimeError(f"缺少环境变量 {key_env}")
+    base = torznab_endpoint(source)
+    request = urllib.request.Request(
+        f"{base}?{urllib.parse.urlencode({'apikey': api_key, 't': 'caps'})}",
+        headers={"User-Agent": USER_AGENT},
+    )
+    try:
+        with http_open(request, timeout=10, allow_private=True) as response:
+            root = ET.fromstring(read_response(response, 1024 * 1024, f"Torznab {name}"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"连接失败: {exc.reason}") from exc
+    if root.tag.rsplit("}", 1)[-1].casefold() != "caps":
+        raise ValueError("响应不是 Torznab caps")
+
+
+def _doctor_error(exc: Exception) -> str:
+    cause = exc.__cause__ or exc
+    if isinstance(cause, urllib.error.URLError) and isinstance(cause.reason, Exception):
+        cause = cause.reason
+    if isinstance(cause, urllib.error.HTTPError):
+        return f"HTTP {cause.code}"
+    if isinstance(cause, (TimeoutError, socket.timeout, subprocess.TimeoutExpired)):
+        return "timeout"
+    if isinstance(cause, (ValueError, ET.ParseError)):
+        return "invalid-response"
+    return "connection-failed"
+
+
+def command_doctor(args) -> int:
     config = load_config()
     checks = []
-    for tool, required in (("ffmpeg", True), ("ffprobe", True), ("aria2c", False), ("yt-dlp", False)):
+    for tool, required in (("ffmpeg", True), ("ffprobe", True), ("aria2c", False), ("yt-dlp", False), ("deno", False)):
         location = shutil.which(tool)
-        checks.append({"name": tool, "status": "ok" if location else ("error" if required else "optional-missing"), "path": location or ""})
+        item = {"name": tool, "status": "ok" if location else ("error" if required else "optional-missing"), "path": location or ""}
+        if location:
+            version_command = [tool, "--version"] if tool != "ffmpeg" and tool != "ffprobe" else [tool, "-version"]
+            version, probe_error = _probe_version(version_command)
+            item["version"] = version or "unverified"
+            if probe_error:
+                item["versionStatus"] = "unverified"
+                item["status"] = "error" if required else "unverified"
+                item["detail"] = "Tool could not report its version; check its installation"
+        checks.append(item)
+    if shutil.which("yt-dlp"):
+        # No URL is supplied: this stays offline while allowing yt-dlp to report its own EJS/runtime inventory.
+        try:
+            result = subprocess.run(
+                [*ytdlp_base_command(), "--verbose", "--simulate", "--no-playlist"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            diagnostic = f"{result.stdout}\n{result.stderr}"
+        except (OSError, subprocess.TimeoutExpired):
+            diagnostic = ""
+        deno_match = re.search(r"(?im)^\s*(?:\[debug\]\s*)?JS runtimes:\s*(.+)$", diagnostic)
+        deno_version = re.search(r"deno[- :](\d+)\.(\d+)", deno_match.group(1), re.I) if deno_match else None
+        deno_ok = bool(deno_version and tuple(map(int, deno_version.groups())) >= (2, 3))
+        ejs_match = re.search(r"(?im)^\s*(?:\[debug\]\s*)?Optional libraries:.*\b(yt_dlp_ejs[-\w.]*)\b", diagnostic)
+        deno_item = {"name": "runtime:deno", "status": "ok" if deno_ok else "unverified", "detail": "Deno runtime meets YouTube EJS requirement" if deno_ok else "YouTube EJS requires Deno >= 2.3.0; install/upgrade Deno if unavailable"}
+        if deno_version:
+            deno_item["version"] = ".".join(deno_version.groups())
+        checks.append(deno_item)
+        ejs_item = {"name": "yt-dlp:ejs", "status": "ok" if ejs_match else "unverified", "detail": "EJS component reported by yt-dlp" if ejs_match else "Install yt-dlp EJS components if YouTube challenges require them"}
+        if ejs_match:
+            ejs_item["version"] = ejs_match.group(1)
+        checks.append(ejs_item)
+    if getattr(args, "cookies", None):
+        ytdlp_auth_args(args.cookies)
+        browser = re.split(r"[+:]", args.cookies, maxsplit=1)[0].casefold()
+        checks.append({"name": "cookies", "status": "unverified" if browser in YTDLP_BROWSERS else "ok", "detail": "browser login is unverified" if browser in YTDLP_BROWSERS else "private cookies file validated"})
     base_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_BASE_DIR") or config.get("baseDir") or (SKILL_DIR / "work"))
     state_root = resolve_path(os.environ.get("MEDIA_DOWNLOADER_STATE_DIR") or config.get("stateDir") or (base_root / ".state"))
     for name, path, label in (("work:base", base_root, "工作目录"), ("work:state", state_root, "状态目录")):
@@ -2804,11 +2906,42 @@ def command_doctor(_args) -> int:
     for name, source in (config.get("searchSources", {}) or {}).items():
         if isinstance(source, dict) and source.get("type") in {"jackett", "torznab"} and source.get("enabled", True):
             env_name = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
-            checks.append({"name": f"search:{name}", "status": "ok" if os.environ.get(env_name) else "optional-missing", "detail": env_name})
+            checks.append({"name": f"search:{name}", "status": "ok" if os.environ.get(env_name) else "optional-missing", "detail": (f"configured; authentication unverified; env={env_name}" if os.environ.get(env_name) else env_name)})
     metadata = config.get("metadata", {})
     if metadata.get("provider") == "tmdb":
         env_name = str(metadata.get("apiKeyEnv", "TMDB_API_KEY"))
-        checks.append({"name": "metadata:tmdb", "status": "ok" if os.environ.get(env_name) else "optional-missing", "detail": env_name})
+        checks.append({"name": "metadata:tmdb", "status": "ok" if os.environ.get(env_name) else "optional-missing", "detail": (f"configured; authentication unverified; env={env_name}" if os.environ.get(env_name) else env_name)})
+    if getattr(args, "online", False) and os.environ.get("MEDIA_DOWNLOADER_OFFLINE") == "1":
+        checks.append({"name": "online", "status": "skipped", "detail": "MEDIA_DOWNLOADER_OFFLINE=1"})
+    elif getattr(args, "online", False):
+        metadata = config.get("metadata", {})
+        if metadata.get("provider") == "tmdb":
+            env_name = str(metadata.get("apiKeyEnv", "TMDB_API_KEY"))
+            auth_info = tmdb_auth(config)
+            if auth_info:
+                try:
+                    headers, params = auth_info
+                    payload = http_json("https://api.themoviedb.org/3/configuration", params, headers, timeout=10)
+                    images = payload.get("images") if isinstance(payload, dict) else None
+                    if not isinstance(images, dict) or not images.get("secure_base_url") or not images.get("poster_sizes"):
+                        raise ValueError("响应格式无效")
+                    checks.append({"name": "online:tmdb", "status": "ok", "detail": "configuration validated"})
+                except Exception as exc:
+                    checks.append({"name": "online:tmdb", "status": "error", "detail": _doctor_error(exc)})
+            else:
+                checks.append({"name": "online:tmdb", "status": "optional-missing", "detail": env_name})
+        for name, source in (config.get("searchSources", {}) or {}).items():
+            if not isinstance(source, dict) or source.get("type") not in {"jackett", "torznab"} or not source.get("enabled", True):
+                continue
+            env_name = str(source.get("apiKeyEnv", "JACKETT_API_KEY"))
+            if not os.environ.get(env_name):
+                checks.append({"name": f"online:search:{name}", "status": "optional-missing", "detail": env_name})
+                continue
+            try:
+                _doctor_torznab_caps(name, source)
+                checks.append({"name": f"online:search:{name}", "status": "ok", "detail": "caps validated"})
+            except Exception as exc:
+                checks.append({"name": f"online:search:{name}", "status": "error", "detail": _doctor_error(exc)})
     print(json.dumps({"version": VERSION, "configSchemaVersion": CONFIG_SCHEMA_VERSION, "config": str(config_file()), "checks": checks}, ensure_ascii=False, indent=2))
     return 1 if any(item["status"] == "error" for item in checks) else 0
 
@@ -2904,6 +3037,8 @@ def parser() -> argparse.ArgumentParser:
     stop.add_argument("title")
     stop.set_defaults(handler=command_stop)
     doctor = commands.add_parser("doctor", help="Check tools, work paths, optional targets, and configured integrations")
+    doctor.add_argument("--cookies", help="Validate browser name or private cookies.txt path (browser login remains unverified)")
+    doctor.add_argument("--online", action="store_true", help="Explicitly probe configured TMDB/Torznab endpoints (10s each)")
     doctor.set_defaults(handler=command_doctor)
     return root
 
