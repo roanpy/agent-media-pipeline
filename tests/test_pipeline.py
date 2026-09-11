@@ -273,6 +273,15 @@ def assert_atomic_copy_never_overwrites(root: Path):
     symlink_target = root / "atomic-symlink.txt"
     symlink_target.symlink_to(source)
     assert not module.existing_matches(source, symlink_target, 0)
+
+    # 日志脱敏必须重建为 0600，且不留默认权限的临时副本。
+    log_path = root / "scrub-log.txt"
+    log_path.write_text("failed https://example.test/private/video?token=DO_NOT_LEAK\n", encoding="utf-8")
+    log_path.chmod(0o644)
+    module.scrub_log(log_path, ["https://example.test/private/video?token=DO_NOT_LEAK"])
+    assert stat.S_IMODE(log_path.stat().st_mode) == 0o600, oct(log_path.stat().st_mode)
+    assert "DO_NOT_LEAK" not in log_path.read_text(encoding="utf-8")
+    assert not list(root.glob(".scrub-log.txt*")), "scrub temp files must be removed"
     return module
 
 
@@ -318,6 +327,24 @@ def assert_tmdb_auth_modes():
         assert calls[0][1].get("api_key") == "v3-api-key-123", calls
         assert not calls[0][2].get("Authorization"), calls
         assert calls[1][1].get("api_key") == "v3-api-key-123", calls
+
+        # 同名条目必须优先于热度更高的其他条目；没有同名时才回退到热度。
+        def ranked(url, params, headers=None, timeout=20):
+            calls.append((url, dict(params), dict(headers or {})))
+            if "/search/" in url:
+                return {"results": [
+                    {"id": 1, "name": "Stub Special", "popularity": 900.0},
+                    {"id": 2, "name": "Stub", "popularity": 1.0},
+                ]}
+            return {"id": int(url.rsplit("/", 1)[-1]), "name": "Stub", "first_air_date": "2020-01-01"}
+
+        module.http_json = ranked
+        calls.clear()
+        assert module.fetch_tmdb(config, "tv", "Stub", None, None)["ids"]["tmdb"] == 2
+        assert calls[1][0].endswith("/tv/2"), calls
+        calls.clear()
+        assert module.fetch_tmdb(config, "tv", "Unrelated", None, None)["ids"]["tmdb"] == 1
+        assert calls[1][0].endswith("/tv/1"), calls
     finally:
         module.http_json = original
         os.environ.pop("TEST_TMDB_AUTH_KEY", None)
@@ -358,14 +385,13 @@ def assert_path_and_naming_guards(module, root: Path):
     else:
         raise AssertionError("different names for the same episode must not create duplicates")
 
-    canonical_id = module.task_id("movie", "测试电影 (2025)", root / "movie")
-    assert canonical_id == module.task_id("movie", "测试电影 (2025)", root / "movie")
-    assert canonical_id != module.task_id("movie", "测试电影 (2025)", root / "other-movie")
     ctx_a = {"mediaType": "tv", "canonical": "测试剧 (2026)", "targetRoot": root / "tv"}
     id_magnet_a = module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:AAAA")
     id_magnet_b = module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:BBBB")
     assert id_magnet_a != id_magnet_b
     assert id_magnet_a == module.pipeline_task_id(ctx_a, "magnet:?xt=urn:btih:AAAA")
+    assert id_magnet_a != module.pipeline_task_id({**ctx_a, "canonical": "另一部剧 (2026)"}, "magnet:?xt=urn:btih:AAAA")
+    assert id_magnet_a != module.pipeline_task_id({**ctx_a, "targetRoot": root / "other-tv"}, "magnet:?xt=urn:btih:AAAA")
     fingerprint_args = type("Args", (), {
         "downloader": "yt-dlp", "copy_original": True, "season": 1, "episode": 1,
         "playlist": False, "format": "best", "cookies": "chrome",
@@ -915,7 +941,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.7 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.8 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
@@ -994,7 +1020,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.7"
+            assert doctor_payload["version"] == "0.4.8"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -1109,7 +1135,7 @@ def main():
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
             assert delivery_plan["downloadRetries"] == 3
-            assert delivery_plan["version"] == "0.4.7" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.8" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"

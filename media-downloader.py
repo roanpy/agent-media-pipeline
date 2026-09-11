@@ -31,7 +31,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.7"
+VERSION = "0.4.8"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
@@ -43,7 +43,6 @@ REPAIR_SIDECAR_EXTS = SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
 TV_SHARED_MERGE_FILES = {"tvshow.nfo", "poster.jpg", "fanart.jpg", "banner.jpg", "clearlogo.png"}
 YTDLP_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 MAX_COMPONENT_BYTES = 200
-ACTIVE_CHILD: subprocess.Popen | None = None
 STOP_REQUESTED = False
 
 
@@ -490,11 +489,6 @@ def canonical_name(title: str, year: int | None) -> str:
     return title
 
 
-def task_id(media_type: str, canonical: str, target_root: Path) -> str:
-    digest = hashlib.sha256(f"{media_type}\0{canonical}\0{target_root}".encode()).hexdigest()[:12]
-    return f"{media_type}-{digest}"
-
-
 def pipeline_task_id(ctx: dict, source: str) -> str:
     # 下载/转换/整理任务：身份含来源，同标题换源重下互不覆盖
     digest = hashlib.sha256(f"{ctx['mediaType']}\0{ctx['canonical']}\0{ctx['targetRoot']}\0{source}".encode()).hexdigest()[:12]
@@ -718,19 +712,24 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None, seas
     params = {**auth_params, "language": language, "query": query}
     params["first_air_date_year" if kind == "tv" else "year"] = year
     search = http_json(f"https://api.themoviedb.org/3/search/{kind}", params, auth)
-    results = search.get("results", []) if isinstance(search, dict) else []
+    date_key = "first_air_date" if kind == "tv" else "release_date"
+    name_key = "name" if kind == "tv" else "title"
+    original_key = "original_name" if kind == "tv" else "original_title"
+    results = [entry for entry in (search.get("results") or []) if isinstance(entry, dict) and entry.get("id")] if isinstance(search, dict) else []
     if not results:
         return {}
-    item = results[0]
+    # 同名优先、其次热度：TMDB 是全文检索，短标题（如中文剧名）容易把同名热门条目排到前面。
+    wanted = re.sub(r"\W", "", query).casefold()
+    item = max(results, key=lambda entry: (
+        int(re.sub(r"\W", "", str(entry.get(name_key) or entry.get(original_key) or "")).casefold() == wanted),
+        float(entry.get("popularity") or 0),
+    ))
     tmdb_id = item.get("id")
     detail = http_json(
         f"https://api.themoviedb.org/3/{kind}/{tmdb_id}",
         {**auth_params, "language": language, "append_to_response": "external_ids,credits"},
         auth,
     )
-    date_key = "first_air_date" if kind == "tv" else "release_date"
-    name_key = "name" if kind == "tv" else "title"
-    original_key = "original_name" if kind == "tv" else "original_title"
     date = detail.get(date_key) or item.get(date_key) or ""
     externals = detail.get("external_ids", {}) if isinstance(detail.get("external_ids"), dict) else {}
     credits = detail.get("credits", {}) if isinstance(detail.get("credits"), dict) else {}
@@ -1241,38 +1240,42 @@ def scrub_log(path: Path, secrets: list[str]) -> None:
     secrets = [value for value in secrets if value]
     if not secrets or not path.exists():
         return
-    temp = path.with_name(f".{path.name}.{os.getpid()}.scrub")
-    with open(path, "r", encoding="utf-8", errors="replace") as source, open(temp, "w", encoding="utf-8") as target:
-        for line in source:
-            for secret in secrets:
-                line = scrub_source_text(line, secret)
-            target.write(line)
-    os.chmod(temp, 0o600)
-    os.replace(temp, path)
+    # mkstemp 直接以 0600 创建，避免重写期间出现一个默认权限、可被他人读取的日志副本。
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".scrub", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as source, os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            for line in source:
+                for secret in secrets:
+                    line = scrub_source_text(line, secret)
+                target.write(line)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: int | None = None, redactions: list[str] | None = None) -> None:
-    global ACTIVE_CHILD
     require_mounted_volume(ctx["stateRoot"], "状态目录")
     ensure_private_file(ctx["logPath"])
     status_update(ctx["id"], phase=operation, currentOperation=operation, childPid=None)
     code = -1
     try:
         with open(ctx["logPath"], "a", encoding="utf-8", errors="replace") as handle:
-            ACTIVE_CHILD = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
-            status_update(ctx["id"], childPid=ACTIVE_CHILD.pid)
+            child = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+            status_update(ctx["id"], childPid=child.pid)
             started = time.monotonic()
-            while ACTIVE_CHILD.poll() is None:
+            while child.poll() is None:
                 if STOP_REQUESTED:
-                    stop_child(ACTIVE_CHILD)
+                    stop_child(child)
                     raise InterruptedError("任务已停止")
                 if timeout_seconds and time.monotonic() - started > timeout_seconds:
-                    stop_child(ACTIVE_CHILD)
+                    stop_child(child)
                     raise TimeoutError(f"{operation} 超时")
                 time.sleep(0.25)
-            code = ACTIVE_CHILD.returncode
+            code = child.returncode
     finally:
-        ACTIVE_CHILD = None
         scrub_log(ctx["logPath"], redactions or [])
     status_update(ctx["id"], childPid=None)
     if STOP_REQUESTED:
