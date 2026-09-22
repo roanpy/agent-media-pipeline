@@ -11,7 +11,7 @@ Audience: an independent AI verification agent. Work from the repository root or
 
 ## Pass criteria (run each, report pass/fail + evidence)
 
-1. **Baseline/version**: `./run.sh --version` prints `Agent Media Pipeline 0.4.8 (config schema 1)`; `./scripts/smoke-test.sh` prints `integration test passed`; `ruff check media-downloader.py tests/test_pipeline.py` clean; `python3 -m py_compile` both files OK.
+1. **Baseline/version**: `./run.sh --version` prints `Agent Media Pipeline 0.4.9 (config schema 1)`; `./scripts/smoke-test.sh` prints `integration test passed`; `ruff check media-downloader.py tests/test_pipeline.py` clean; `python3 -m py_compile` both files OK.
 2. **Movie no-archive → downloadDir**: `adopt` a local mkv with `--type movie --no-archive --offline --metadata <path-to-json>` (a file containing `{"title": ..., "year": ...}`). Expect `downloadDir/<Title> (<Year>)/<Title> (<Year>).<ext>` + `movie.nfo`; work area removed; `status.json` `targetPath` points at the delivered folder.
 3. **TV episode naming**: adopt `Show.S02E03.mkv` as TV → `.../Season 02/<Show> - S02E03.<ext>` and a sibling `.nfo` containing `<season>2</season>`, `<episode>3</episode>`, and at least one `<uniqueid>`.
 4. **Organize (no transcode)**: `organize` keeps the original container bytes (compare SHA-256 source vs output) and still writes NFO.
@@ -20,7 +20,7 @@ Audience: an independent AI verification agent. Work from the repository root or
 7. **No-clobber**: re-run an adopt whose NFO/metadata differs from the existing output; the run must fail with `拒绝覆盖` and leave the first output byte-identical. (A byte-identical re-run is intentionally idempotent and exits 0 — only differing content is rejected.)
 8. **--keep-work**: with it, the delivered copy exists AND the work area is retained.
 9. **Safety negatives**: `--source-file` with 0644 perms, FIFO `--source-file` inputs (must reject without hanging), missing/non-file `--metadata` paths, and HTTP URLs with embedded credentials are rejected; a `downloadDir` inside `.media-downloader-work` is rejected; config files that are group/other-readable or symlinked are rejected; a failed local task detects changed file/directory/sidecar snapshots before retry.
-10. **doctor**: `./run.sh doctor` returns valid JSON with `version: 0.4.8` and `configSchemaVersion: 1`; `download:output` is `ok` when `downloadDir` is set. `doctor --online` is explicit and bounded; `doctor --cookies` validates syntax/private files but browser login remains unverified.
+10. **doctor**: `./run.sh doctor` returns valid JSON with `version: 0.4.9` and `configSchemaVersion: 1`; `download:output` is `ok` when `downloadDir` is set. `doctor --online` is explicit and bounded; `doctor --cookies` validates syntax/private files but browser login remains unverified.
 11. **Incremental TV merge**: pre-create a different root `fanart.jpg`/`tvshow.nfo`, then add an S02 episode. Without `--merge`, expect failure before any episode is copied. Re-run the same task with `--merge`; expect the new episode/NFO, unchanged shared files, and a `合并跳过已有共享文件` log. A different existing episode media file must still fail under `--merge`.
 12. **Search/stall controls**: `search --timeout 90` succeeds against the stub; values outside 1-300 fail. Capture fake aria2 arguments and require `--bt-stop-timeout=600` by default.
 13. **Stop closure**: run a fake long-lived aria2 child in its own process group, call `stop`, and require parent + child exit and final `phase: stopped` with no leftover process.

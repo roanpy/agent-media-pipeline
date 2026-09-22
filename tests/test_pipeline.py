@@ -941,7 +941,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.8 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.9 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
@@ -1020,7 +1020,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.8"
+            assert doctor_payload["version"] == "0.4.9"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -1131,11 +1131,20 @@ def main():
             delivery_env = {**env, "MEDIA_DOWNLOADER_CONFIG": str(delivery_cfg)}
             delivery_checks = {item["name"]: item["status"] for item in json.loads(run([sys.executable, str(SCRIPT), "doctor"], env=delivery_env).stdout)["checks"]}
             assert delivery_checks["download:output"] == "ok"
+            # 超长 btStopTimeoutSeconds 只给中文警告，不影响 doctor 退出码
+            slow_bt = json.loads(delivery_cfg.read_text(encoding="utf-8"))
+            slow_bt["btStopTimeoutSeconds"] = 7200
+            slow_bt_cfg = root / "slow-bt.json"
+            write_config(slow_bt_cfg, slow_bt)
+            slow_bt_checks = {item["name"]: item for item in json.loads(run([sys.executable, str(SCRIPT), "doctor"], env={**delivery_env, "MEDIA_DOWNLOADER_CONFIG": str(slow_bt_cfg)}).stdout)["checks"]}
+            assert slow_bt_checks["download:bt-stop-timeout"]["status"] == "warning"
+            assert "900-1800" in slow_bt_checks["download:bt-stop-timeout"]["detail"]
+            assert "download:bt-stop-timeout" not in checks and "download:bt-stop-timeout" not in delivery_checks
             delivery_url = f"http://127.0.0.1:{port}/Remote.S01E01.mp4"
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
             assert delivery_plan["downloadRetries"] == 3
-            assert delivery_plan["version"] == "0.4.8" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.9" and delivery_plan["configSchemaVersion"] == 1
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
@@ -1246,6 +1255,30 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert "离线模式" in offline_key.stderr
             assert (root / "movie" / "离线有 Key" / "离线有 Key.mp4").is_file()
 
+            # requireArtwork 且无任何海报来源（无 --metadata 海报、payload 也无约定图片）时必须在
+            # 下载完成之后、转码之前失败：既不误拒自带封面的素材，也不让整季转码白跑。
+            no_poster = json.loads(cfg.read_text(encoding="utf-8"))
+            no_poster["metadata"] = {"provider": "none", "requireArtwork": True, "apiKeyEnv": "POSTER_TEST_KEY"}
+            no_poster_cfg = root / "no-poster.json"
+            write_config(no_poster_cfg, no_poster)
+            no_poster_env = {
+                **env,
+                "MEDIA_DOWNLOADER_CONFIG": str(no_poster_cfg),
+                "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "no-poster-status.json"),
+                "POSTER_TEST_KEY": "present",
+            }
+            no_poster_env.pop("MEDIA_DOWNLOADER_OFFLINE", None)
+            missing_poster = run([
+                sys.executable, str(SCRIPT), "ingest", "缺海报", f"http://127.0.0.1:{port}/Remote.S01E01.mp4",
+                "--type", "movie", "--target", "movie",
+            ], env=no_poster_env, expect=1)
+            assert "requireArtwork" in missing_poster.stderr and "海报" in missing_poster.stderr, missing_poster.stderr
+            no_poster_state = next(iter(json.loads((root / "no-poster-status.json").read_text(encoding="utf-8")).values()))
+            assert no_poster_state["phase"] == "failed" and "requireArtwork" in no_poster_state["lastError"], no_poster_state
+            no_poster_work = Path(no_poster_state["workPath"])
+            assert list((no_poster_work / "source").rglob("*.mp4")), "下载应已完成，素材保留在任务工作区"
+            assert not list((no_poster_work / "output").rglob("*.mp4")), "必须在转码之前失败"
+
             relative_env = {**no_archive_env, "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "relative-status.json")}
             relative = run([str(PROJECT / "run.sh"), "adopt", "Relative Background", "Film.mkv", "--type", "movie", "--no-transcode", "--no-archive", "--offline"], env=relative_env, cwd=root / "source")
             launch_log = Path(next(line.split(": ", 1)[1] for line in relative.stdout.splitlines() if line.startswith("Launch log: ")))
@@ -1300,6 +1333,30 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
                 if stop_child_pid:
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(stop_child_pid, signal.SIGKILL)
+
+            # 下载失败要给出退出码含义和已脱敏日志尾部，而不是裸退出码。
+            hint_bin = root / "hint-bin"
+            hint_bin.mkdir(exist_ok=True)
+            hint_aria2 = hint_bin / "aria2c"
+            hint_aria2.write_text("#!/bin/sh\necho 'Download Results:'\necho 'Download aborted: resource not found'\nexit 3\n", encoding="utf-8")
+            hint_aria2.chmod(0o700)
+            hint_env = {**env, "PATH": f"{hint_bin}:{env.get('PATH', '')}", "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "hint-status.json")}
+            hint_error = run([
+                sys.executable, str(SCRIPT), "ingest", "失败提示", "magnet:?xt=urn:btih:ABCDEF0123456789&dn=hint",
+                "--type", "movie", "--target", "movie", "--offline", "--no-transcode",
+            ], env=hint_env, expect=1)
+            assert "退出码 3" in hint_error.stderr and "资源不存在或链接已失效" in hint_error.stderr, hint_error.stderr
+            assert "Download aborted: resource not found" in hint_error.stderr, hint_error.stderr
+
+            # check 必须把“非终结 phase 但进程已消失”的任务标成 stale，避免调用方继续等待。
+            stale_file = root / "stale-status.json"
+            stale_file.write_text(json.dumps({
+                "stale-task": {"title": "僵死任务", "requestedTitle": "僵死任务", "phase": "downloading", "pid": 999999},
+                "done-task": {"title": "完成任务", "requestedTitle": "完成任务", "phase": "done", "pid": 999999},
+            }, ensure_ascii=False), encoding="utf-8")
+            checked = json.loads(run([sys.executable, str(SCRIPT), "check"], env={**env, "MEDIA_DOWNLOADER_STATUS_FILE": str(stale_file)}).stdout)
+            assert checked["stale-task"]["stale"] is True
+            assert "stale" not in checked["done-task"] and checked["done-task"]["phase"] == "done"
 
             searched = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--type", "tv"], env=env)
             payload = json.loads(searched.stdout)
@@ -1432,12 +1489,16 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             increment_metadata = root / "increment-metadata.json"
             increment_metadata.write_text(json.dumps({
                 "title": "增量剧", "year": 2026, "fanartPath": str(root / "source" / "poster.png"),
+                "seasonNumber": 2, "seasonPosterPath": str(root / "source" / "poster.png"),
                 "episodes": [{"season": 2, "episode": 4, "title": "第四集"}],
             }, ensure_ascii=False), encoding="utf-8")
             increment_show = root / "tv" / "增量剧 (2026)"
             increment_show.mkdir()
             (increment_show / "fanart.jpg").write_bytes(b"existing fanart")
             (increment_show / "tvshow.nfo").write_bytes(b"existing nfo")
+            increment_season = increment_show / "Season 02"
+            increment_season.mkdir()
+            (increment_season / "Season02.jpg").write_bytes(b"existing season poster")
             increment_command = [sys.executable, str(SCRIPT), "adopt", "增量剧", str(increment_source), "--type", "tv", "--year", "2026", "--target", "tv", "--metadata", str(increment_metadata), "--offline"]
             refused_merge = run(increment_command, env=env, expect=1)
             assert "拒绝覆盖" in refused_merge.stderr
@@ -1449,6 +1510,8 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert increment_episode.with_suffix(".nfo").is_file()
             assert (increment_show / "fanart.jpg").read_bytes() == b"existing fanart"
             assert (increment_show / "tvshow.nfo").read_bytes() == b"existing nfo"
+            # 季海报/剧集剧照等图片边车同样保留旧文件，不再让整单归档失败
+            assert (increment_season / "Season02.jpg").read_bytes() == b"existing season poster"
 
             metadata.write_text(json.dumps({
                 "title": "示例剧", "originalTitle": "Example Show", "year": 2026,

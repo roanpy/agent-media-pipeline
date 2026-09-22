@@ -31,7 +31,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.8"
+VERSION = "0.4.9"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
@@ -40,7 +40,9 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
 ARCHIVE_EXTS = VIDEO_EXTS | SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
 OUTPUT_CONTAINERS = {"mp4", "mkv"}
 REPAIR_SIDECAR_EXTS = SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
-TV_SHARED_MERGE_FILES = {"tvshow.nfo", "poster.jpg", "fanart.jpg", "banner.jpg", "clearlogo.png"}
+# 约定名称的本地海报候选；--metadata 的 posterPath/posterUrl 优先于它
+POSTER_SOURCE_STEMS = {"poster", "folder", "cover", "default", "movie"}
+ARIA2_EXIT_HINTS = {3: "资源不存在或链接已失效", 7: "仍有未完成的下载项", 9: "磁盘空间不足"}
 YTDLP_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 MAX_COMPONENT_BYTES = 200
 STOP_REQUESTED = False
@@ -1256,6 +1258,16 @@ def scrub_log(path: Path, secrets: list[str]) -> None:
         temp.unlink(missing_ok=True)
 
 
+def log_tail(path: Path, lines: int = 5, limit: int = 600) -> str:
+    """已脱敏日志的最后几行非空内容；读取失败或为空时返回空串。"""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    tail = [line.strip() for line in content.splitlines() if line.strip()][-lines:]
+    return " | ".join(tail)[:limit]
+
+
 def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: int | None = None, redactions: list[str] | None = None) -> None:
     require_mounted_volume(ctx["stateRoot"], "状态目录")
     ensure_private_file(ctx["logPath"])
@@ -1281,7 +1293,12 @@ def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: in
     if STOP_REQUESTED:
         raise InterruptedError("任务已停止")
     if code != 0:
-        raise RuntimeError(f"{operation} 失败，退出码 {code}，日志: {ctx['logPath']}")
+        hint = ""
+        if os.path.basename(str(command[0])) == "aria2c" and code in ARIA2_EXIT_HINTS:
+            hint = f"（{ARIA2_EXIT_HINTS[code]}）"
+        tail = log_tail(ctx["logPath"])
+        summary = f"，日志末尾: {tail}" if tail else ""
+        raise RuntimeError(f"{operation} 失败，退出码 {code}{hint}{summary}，日志: {ctx['logPath']}")
 
 
 def stop_child(process: subprocess.Popen) -> None:
@@ -1879,7 +1896,8 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | 
     profile = ctx["profile"]
     codec = str(profile.get("videoCodec", "libx264"))
     audio_codec = str(profile.get("audioCodec", "aac"))
-    command = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-dn"]
+    # -nostats：进度统计未被解析，只会淹没任务日志；结束摘要与错误仍保留在 -hide_banner 之外。
+    command = ["ffmpeg", "-hide_banner", "-nostats", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-dn"]
     if profile["container"] == "mkv":
         # MKV 支持字幕流原样保留（不重编码）；MP4 兼容性差，继续丢弃内嵌字幕。
         command += ["-map", "0:s?", "-c:s", "copy"]
@@ -2126,16 +2144,49 @@ def download_image(source: str, destination: Path, ctx: dict) -> None:
         temp_source.unlink(missing_ok=True)
 
 
+def artwork_source_images(roots) -> list[Path]:
+    """收集来源目录中的候选图片；目录不存在（纯下载任务）时返回空列表。"""
+    images: set[Path] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        images.update(path for path in root.rglob("*") if is_safe_file(root, path) and path.suffix.lower() in IMAGE_EXTS)
+    return sorted(images)
+
+
+def poster_artwork_source(metadata: dict, images: list[Path]) -> str:
+    """海报来源判定：metadata.posterPath/posterUrl，其次约定名称的本地图片。"""
+    return str(metadata.get("posterPath") or metadata.get("posterUrl") or next((str(path) for path in images if path.stem.casefold() in POSTER_SOURCE_STEMS), ""))
+
+
+def local_artwork_roots(ctx: dict, source: str | None) -> list[Path]:
+    """本地来源的图片目录（目录本身或单文件所在目录）；URL/magnet 来源视为无本地图片。"""
+    roots = [ctx["sourceRoot"]]
+    local = resolve_path(source) if source and is_plausible_path(source) else None
+    if local is not None and local.exists():
+        roots.append(local if local.is_dir() else local.parent)
+    return roots
+
+
+def ensure_required_artwork(ctx: dict, source: str) -> None:
+    """requireArtwork 且没有任何海报来源时失败；在下载完成之后、转码之前调用。
+
+    此时本地来源与下载 payload 都已可见，既不会误拒种子/播放列表自带封面的素材，
+    也不会让整季转码白跑（历史故障：转码 45 分钟后才报缺海报）。
+    """
+    if not ctx["config"].get("metadata", {}).get("requireArtwork"):
+        return
+    if poster_artwork_source(ctx["metadata"], artwork_source_images(local_artwork_roots(ctx, source))):
+        return
+    raise RuntimeError("requireArtwork 已开启但找不到任何海报来源；请用 --metadata 提供海报、修正标题/年份，或关闭 requireArtwork")
+
+
 def write_artwork(ctx: dict, plans: list[dict]) -> None:
     require_mounted_volume(ctx["baseRoot"], "工作目录")
     metadata = ctx["metadata"]
-    roots = {ctx["sourceRoot"], *(plan["source"].parent for plan in plans)}
-    source_images = {path for path in ctx["sourceRoot"].rglob("*") if is_safe_file(ctx["sourceRoot"], path) and path.suffix.lower() in IMAGE_EXTS}
-    for root in roots - {ctx["sourceRoot"]}:
-        source_images.update(path for path in root.iterdir() if is_safe_file(root, path) and path.suffix.lower() in IMAGE_EXTS)
-    source_images = sorted(source_images)
+    source_images = artwork_source_images([ctx["sourceRoot"], *(plan["source"].parent for plan in plans)])
     # ponytail: infer only conventional names; ambiguous libraries must provide metadata paths.
-    poster = metadata.get("posterPath") or metadata.get("posterUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"poster", "folder", "cover", "default", "movie"}), "")
+    poster = poster_artwork_source(metadata, source_images)
     fanart = metadata.get("fanartPath") or metadata.get("fanartUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"fanart", "backdrop", "background", "art"}), "")
     banner = metadata.get("bannerPath") or metadata.get("bannerUrl") or next((str(path) for path in source_images if path.stem.casefold() == "banner"), "")
     clearlogo = metadata.get("clearlogoPath") or metadata.get("clearlogoUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"clearlogo", "logo"}), "")
@@ -2519,11 +2570,11 @@ def archive_existing_action(ctx: dict, source: Path, target: Path, relative: Pat
         return "keep"
     if source.suffix.lower() == ".nfo" and ctx["args"].update_nfo:
         return "replace"
-    if (
-        ctx["args"].merge
-        and ctx["mediaType"] == "tv"
-        and len(relative.parts) == 1
-        and relative.name.casefold() in TV_SHARED_MERGE_FILES
+    # --merge 的 TV 增量归档保留已有图片边车（单集剧照、季海报等）和剧根级 tvshow.nfo；
+    # 媒体、字幕、单集 NFO 的拒绝覆盖保护不变。
+    if ctx["args"].merge and ctx["mediaType"] == "tv" and (
+        relative.suffix.lower() in IMAGE_EXTS
+        or (len(relative.parts) == 1 and relative.name.casefold() == "tvshow.nfo")
     ):
         return "skip"
     raise RuntimeError(f"目标已存在且内容不同，拒绝覆盖: {target}")
@@ -2657,6 +2708,7 @@ def pipeline(args) -> int:
         )
         try:
             sources = acquire(ctx, source, requested_downloader)
+            ensure_required_artwork(ctx, source)
             plans = planned_outputs(ctx, sources)
             (organize if args.copy_original else transcode)(ctx, plans)
             status_update(ctx["id"], phase="metadata", currentOperation="metadata", currentFile="")
@@ -2706,6 +2758,14 @@ def command_check(args) -> int:
             key: value for key, value in states.items()
             if any(title in str(value.get(name, "")).casefold() for name in ("title", "requestedTitle"))
         }
+    for state in states.values():
+        if state.get("phase") in {"done", "failed", "stopped"}:
+            continue
+        # 非终结 phase 却没有任何存活进程：任务是被 kill/崩溃留下的，标记 stale 让调用方停止等待。
+        process_title = str(state.get("requestedTitle") or state.get("title", ""))
+        pids = [pid for pid in (state.get("pid"), state.get("childPid")) if isinstance(pid, int)]
+        if not any(process_matches(pid, process_title) for pid in pids):
+            state["stale"] = True
     print(json.dumps(states, ensure_ascii=False, indent=2))
     return 0 if states else 1
 
@@ -2889,6 +2949,9 @@ def command_doctor(args) -> int:
         except RuntimeError:
             status = "unavailable"
         checks.append({"name": "download:output", "status": status, "path": str(download_root)})
+    bt_stop_timeout = int(config.get("btStopTimeoutSeconds", 600))
+    if bt_stop_timeout > 3600:
+        checks.append({"name": "download:bt-stop-timeout", "status": "warning", "detail": f"btStopTimeoutSeconds={bt_stop_timeout} 过长，建议 900-1800；超时前 aria2 不会放弃没有流量的 BT/磁力任务"})
     for name, raw in (config.get("targets", {}) or {}).items():
         value = raw.get("path") if isinstance(raw, dict) else raw
         path = resolve_path(value)

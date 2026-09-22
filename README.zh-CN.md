@@ -156,7 +156,7 @@ yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时�
 - 元数据和远程图片只允许 DNS 解析到公网的 HTTP(S) 目标，并拒绝跨主机或 HTTPS 降级重定向；明确配置的本地索引器仍受支持。
 - 已存在且内容不同的目标文件永不覆盖。
 - 存量库修复拒绝媒体库/分类根目录、重复 SxxEyy 和已存在目标；默认预览，不清理遗留空目录。
-- 归档会先完成冲突预检，避免最后因图片冲突而留下“部分成功”；只有边车文件而没有视频时会直接拒绝。电视剧分集增量归档可用 `--merge` 保留已有节目级图片和 `tvshow.nfo`，不同视频仍拒绝写入。
+- 归档会先完成冲突预检，避免最后因图片冲突而留下“部分成功”；只有边车文件而没有视频时会直接拒绝。电视剧分集增量归档可用 `--merge` 保留已有图片（节目级 poster/fanart/banner/clearlogo、单集剧照、季海报）和 `tvshow.nfo`，不同视频、字幕和单集 NFO 仍拒绝写入。
 - aria2 连续零流量达到 `btStopTimeoutSeconds`（默认 600 秒）后停止；是否换源仍由 Agent 与用户明确决定。
 - `downloadRetries` 控制有限原生网络重试（`0-10`，默认 `3`；`0` 禁用），按 aria2 请求或 yt-dlp HTTP/分片/提取器请求计算，而非整条播放列表；不可用分片会中止下载。现有任务超时仍生效，流水线不会自动换源。
 - `doctor` 离线报告工具版本及 yt-dlp 识别到的 Deno/EJS。`doctor --online` 才探测 TMDB `/configuration` 与启用的 Torznab `t=caps`（每项 10 秒，离线模式下跳过）；caps 可读不代表资源可下载。`doctor --cookies SPEC` 检查私有文件权限或接受浏览器名称，均不证明登录有效。YouTube 环境说明参考上游 [EJS 指南](https://github.com/yt-dlp/yt-dlp/wiki/EJS)。
@@ -171,7 +171,7 @@ yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时�
 
 每集剧照按 Plex 官方规则与视频完全同名，只把扩展名改为 `.jpg`：优先使用 Agent 提供的 `thumbPath`/`thumbUrl`，其次用 TMDB 分集 `still_path`。季海报写入对应季目录，S02 为 `Season02.jpg`，Season 0 为 `season-specials-poster.jpg`。
 
-新增 S02 时，`--merge` 保留根目录已有的 `tvshow.nfo`、`poster` 和 `fanart`，只补新集媒体、单集 NFO/图片/字幕和可用的季海报。Plex 不要求为此重写根级资料，`season.nfo` 也不是必需项；历史 `thumb.png` 不作为 Plex 标准资源维护。
+新增 S02 时，`--merge` 保留已有的 `tvshow.nfo`、`poster` 和 `fanart`；已存在且内容不同的单集剧照、季海报同样保留旧文件而不是让任务失败，只补新集媒体、单集 NFO/图片/字幕，季海报槽位为空时才写入。Plex 不要求为此重写根级资料，`season.nfo` 也不是必需项；历史 `thumb.png` 不作为 Plex 标准资源维护。
 
 普通频道视频、短片或无法匹配影视数据库的网络内容，通常更适合独立的 Plex “Other Videos” 库。本项目不会自动把任意网页视频伪装成正式电影或电视剧。
 

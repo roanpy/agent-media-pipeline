@@ -38,7 +38,8 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
    - Add `--write-subs` (optionally `--sub-langs "zh-CN,en"`) only for yt-dlp web sources that provide subtitles. Never pass `--sub-langs` alone. Unavailable subtitle tracks are skipped; no third-party subtitle service is contacted.
    - A TV file without a season/episode token requires explicit `--season`/`--episode`.
    - Split unsupported multi-episode files before processing.
-   - When separate tasks add episodes to the same existing TV show, use `--merge`. It keeps existing different show-level artwork and `tvshow.nfo`, but still rejects different media, subtitles, and episode NFO files.
+   - Batch one show per task: one `adopt` for a local directory, one `ingest --playlist` for a playlist. Splitting one show into many same-minute tasks is the largest source of failures, because they race on shared `fanart`/`poster`/`tvshow.nfo` and on the archive target. If episodes must be split, give every task `--merge` and run them one at a time, never in parallel.
+   - When separate tasks add episodes to the same existing TV show, use `--merge`. It keeps existing different artwork (show-level poster/fanart/banner/clearlogo, episode thumbnails, season posters) and `tvshow.nfo`, but still rejects different media, subtitles, and episode NFO files.
    - If aria2 stops after sustained zero traffic, report the stalled candidate and use another reviewed candidate only when the user already authorized fallback or confirms it now.
 6. Run `check` until `done` or `failed`. After `stop`, run `check` again.
 7. Report the output/archive path, actual mode/profile/naming/target, file count, and unmet requirements.
@@ -136,7 +137,7 @@ chmod 600 /private/tmp/source-url
 
 `resume` and `download` alias `ingest`; `process` aliases `adopt`. `organize` skips profile transcoding but still uses profile naming and an optional default target. `repair` is foreground and preview-only unless `--apply` is explicit. Long-running pipeline commands launch in the background by default; add `--foreground` while debugging.
 
-Archive performs a complete conflict preflight before copying and rejects an output that contains only sidecars without a video. `--merge` is intentionally narrow: for TV only, existing different root `poster`, `fanart`, `banner`, `clearlogo`, and `tvshow.nfo` are logged and kept. It never weakens no-clobber protection for episode media, subtitles, or episode NFO. `stop` waits for the owned task and downloader/transcoder process group to exit.
+Archive performs a complete conflict preflight before copying and rejects an output that contains only sidecars without a video. `--merge` applies to TV only: existing different images (`poster`, `fanart`, `banner`, `clearlogo`, episode thumbnails, season posters) and the root `tvshow.nfo` are logged and kept, wherever they sit inside the show folder. It never weakens no-clobber protection for episode media, subtitles, or episode NFO. `stop` waits for the owned task and downloader/transcoder process group to exit.
 
 ## Source behavior
 
@@ -160,11 +161,11 @@ Archive performs a complete conflict preflight before copying and rejects an out
 
 Try TMDB through `TMDB_API_KEY`; `provider: "tmdb"` keeps the TVMaze fallback by default, while an omitted provider needs explicit `tvFallback: "tvmaze"`. `metadata.provider: "none"` disables provider lookups, and omitting the metadata block does not trigger an implicit request. When available, fetch the requested season's episode titles/details and use episode-specific IDs in each episode NFO. Without them, continue with minimal NFO and the stable `SxxEyy` filename. A metadata JSON may override or supplement title, original/sort title, year, premiere date, plot, tagline, content rating, rating, runtime, status, genres, countries, tags, studio, directors, writers, actors, external IDs, episode details, and artwork URLs/paths.
 
-Supported root artwork names are `poster`, `fanart`, `banner`, and `clearlogo`. With no TMDB key, still generate minimal valid NFO. If `metadata.requireArtwork=true` but neither a key nor supplied poster exists, warn and downgrade artwork to optional.
+Supported root artwork names are `poster`, `fanart`, `banner`, and `clearlogo`. With no TMDB key, still generate minimal valid NFO. If `metadata.requireArtwork=true` but neither a key nor supplied poster exists, warn and downgrade artwork to optional. Otherwise `requireArtwork` is enforced after acquisition and before transcoding: with no `posterPath`/`posterUrl` and no local or downloaded `poster|folder|cover|default|movie` image, the task fails with a Chinese hint instead of after a full transcode — supply a poster through `--metadata`, fix the title/year, or turn `requireArtwork` off.
 
 Name Plex episode artwork exactly like the video with only the extension changed to `.jpg`. Prefer an agent-supplied episode `thumbPath`/`thumbUrl`, then TMDB `still_path`. Store a normal season poster as `Season XX/SeasonXX.jpg`, and Season 0 artwork as `season-specials-poster.jpg`. Missing artwork is a warning only.
 
-When adding S02 or later with `--merge`, keep existing show-level `tvshow.nfo`, poster, and fanart; add only new episode NFO/artwork/subtitles and the season poster when available. Do not generate `season.nfo` merely for Plex—it is optional and mostly ignored. Do not maintain legacy root `thumb.png` as a Plex asset.
+When adding S02 or later with `--merge`, existing `tvshow.nfo`, poster, and fanart stay untouched, and an existing different episode thumbnail or season poster is kept instead of failing the task; the pipeline adds new episode NFO/artwork/subtitles and the season poster when that slot is free. Do not generate `season.nfo` merely for Plex—it is optional and mostly ignored. Do not maintain legacy root `thumb.png` as a Plex asset.
 
 For TV, the Plex preset may use `{episodeTitleSuffix}`. When a matched metadata episode (or an explicitly confirmed web-playlist item) has a title, name it `Show - S01E03 - Episode title.ext`; otherwise keep `Show - S01E03.ext`. Write that same title to the sibling episode NFO. Keep `tvshow.nfo` show-level only; never duplicate the whole episode catalogue into it.
 
