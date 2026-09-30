@@ -31,7 +31,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.9"
+VERSION = "0.4.10"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
@@ -45,6 +45,7 @@ POSTER_SOURCE_STEMS = {"poster", "folder", "cover", "default", "movie"}
 ARIA2_EXIT_HINTS = {3: "资源不存在或链接已失效", 7: "仍有未完成的下载项", 9: "磁盘空间不足"}
 YTDLP_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 MAX_COMPONENT_BYTES = 200
+XML_INVALID_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 STOP_REQUESTED = False
 
 
@@ -706,10 +707,10 @@ def fetch_tmdb(config: dict, media_type: str, title: str, year: int | None, seas
     # 用户常输入带年份的标题（"The Odyssey 2026"），TMDB 的 query 是全文匹配会 0 命中；
     # 剥离末尾年份单独走 year 过滤参数，标题回到干净检索词。
     query = title
-    if year is None:
-        match = re.match(r"^(?P<name>.+?)\s*[\(\[]?(?P<year>(?:19|20)\d{2})[\)\]]?$", title.strip())
-        if match:
-            query = match.group("name").strip()
+    match = re.match(r"^(?P<name>.+?)(?:\s+|\s*[\(\[])(?P<year>(?:19|20)\d{2})[\)\]]?$", title.strip())
+    if match:
+        query = match.group("name").strip()
+        if year is None:
             year = int(match.group("year"))
     params = {**auth_params, "language": language, "query": query}
     params["first_air_date_year" if kind == "tv" else "year"] = year
@@ -902,7 +903,7 @@ def resolve_metadata(config: dict, args) -> dict:
     return metadata
 
 
-def build_context(config: dict, args) -> dict:
+def build_context(config: dict, args, source: str) -> dict:
     title = validate_title(args.title)
     profile_name, profile = select_profile(config, args.media_type, args.profile)
     metadata = resolve_metadata(config, args)
@@ -933,7 +934,7 @@ def build_context(config: dict, args) -> dict:
             raise RuntimeError(f"工作区与目标目录不得重叠: {base_root} / {target_root}")
         if paths_overlap(state_root, target_root):
             raise RuntimeError(f"状态目录与目标目录不得重叠: {state_root} / {target_root}")
-    identifier = pipeline_task_id({"mediaType": args.media_type, "canonical": canonical, "targetRoot": target_root}, resolve_source(args)[0])
+    identifier = pipeline_task_id({"mediaType": args.media_type, "canonical": canonical, "targetRoot": target_root}, source)
     work_parent = base_root / ".media-downloader-work"
     work_root = work_parent / identifier
     if not contains_path(work_parent.resolve(strict=False), work_root.resolve(strict=False)):
@@ -1276,17 +1277,18 @@ def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: in
     try:
         with open(ctx["logPath"], "a", encoding="utf-8", errors="replace") as handle:
             child = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
-            status_update(ctx["id"], childPid=child.pid)
-            started = time.monotonic()
-            while child.poll() is None:
-                if STOP_REQUESTED:
-                    stop_child(child)
-                    raise InterruptedError("任务已停止")
-                if timeout_seconds and time.monotonic() - started > timeout_seconds:
-                    stop_child(child)
-                    raise TimeoutError(f"{operation} 超时")
-                time.sleep(0.25)
-            code = child.returncode
+            try:
+                status_update(ctx["id"], childPid=child.pid)
+                started = time.monotonic()
+                while child.poll() is None:
+                    if STOP_REQUESTED:
+                        raise InterruptedError("任务已停止")
+                    if timeout_seconds and time.monotonic() - started > timeout_seconds:
+                        raise TimeoutError(f"{operation} 超时")
+                    time.sleep(0.25)
+                code = child.returncode
+            finally:
+                stop_child(child)
     finally:
         scrub_log(ctx["logPath"], redactions or [])
     status_update(ctx["id"], childPid=None)
@@ -1302,16 +1304,46 @@ def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: in
 
 
 def stop_child(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
+    pgid = process.pid
+    if process.poll() is not None and not process_group_running(pgid):
         return
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
+    signal_owned_child(pgid, "", signal.SIGTERM, verified=True)
+    deadline = time.monotonic() + 10
+    while process_group_running(pgid) and time.monotonic() < deadline:
+        process.poll()
+        time.sleep(0.1)
+    if process_group_running(pgid):
+        signal_owned_child(pgid, "", signal.SIGKILL, verified=True)
+        deadline = time.monotonic() + 10
+        while process_group_running(pgid) and time.monotonic() < deadline:
+            process.poll()
+            time.sleep(0.1)
+    if process_group_running(pgid):
+        raise RuntimeError(f"进程组未能停止: pgid={pgid}")
+    process.wait()
+
+
+def process_group_running(pid: int) -> bool:
+    """Return whether a process group has any non-zombie members; unknown is live."""
     try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return True
+    try:
+        result = subprocess.run(["ps", "-A", "-o", "pgid=,stat="], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if result.returncode != 0:
+        return True
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit() and int(fields[0]) == pid and not fields[1].startswith("Z"):
+            return True
+    return False
 
 
 def ytdlp_supports_no_remote_components() -> bool:
@@ -2007,6 +2039,13 @@ def xml_text(parent: ET.Element, name: str, value) -> None:
 
 
 def write_xml(path: Path, root: ET.Element) -> None:
+    # Provider/file metadata may contain characters forbidden in XML 1.0.
+    for element in root.iter():
+        for field in ("text", "tail"):
+            value = getattr(element, field)
+            if value is not None:
+                setattr(element, field, XML_INVALID_CHARS.sub("", value))
+        element.attrib.update({key: XML_INVALID_CHARS.sub("", value) for key, value in element.attrib.items()})
     ET.indent(root, space="  ")
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.tmp")
@@ -2664,8 +2703,8 @@ def pipeline(args) -> int:
         args.no_archive = True
     if args.copy_original is None:
         args.copy_original = config.get("defaultModes", {}).get(args.media_type, "transcode") == "organize"
-    ctx = build_context(config, args)
     source, requested_downloader = resolve_source(args)
+    ctx = build_context(config, args, source)
     downloader = classify_downloader(source, requested_downloader)
     if args.playlist and args.media_type != "tv":
         raise RuntimeError("--playlist 必须使用 --type tv，才能按播放顺序映射季集")
@@ -2735,11 +2774,11 @@ def pipeline(args) -> int:
             log(ctx, f"完成: {ctx['canonical']}")
             return 0
         except InterruptedError as exc:
-            status_update(ctx["id"], phase="stopped", currentOperation="stopped", lastError=str(exc), pid=None, childPid=None)
+            status_update(ctx["id"], phase="stopped", currentOperation="stopped", lastError=str(exc), pid=None, childPid=None, finishedAt=now())
             log(ctx, str(exc))
             return 130
         except Exception as exc:
-            status_update(ctx["id"], phase="failed", currentOperation="failed", lastError=str(exc), pid=None, childPid=None)
+            status_update(ctx["id"], phase="failed", currentOperation="failed", lastError=str(exc), pid=None, childPid=None, finishedAt=now())
             log(ctx, f"失败: {exc}")
             raise
 
@@ -2763,9 +2802,13 @@ def command_check(args) -> int:
             continue
         # 非终结 phase 却没有任何存活进程：任务是被 kill/崩溃留下的，标记 stale 让调用方停止等待。
         process_title = str(state.get("requestedTitle") or state.get("title", ""))
-        pids = [pid for pid in (state.get("pid"), state.get("childPid")) if isinstance(pid, int)]
-        if not any(process_matches(pid, process_title) for pid in pids):
+        pid, child_pid = state.get("pid"), state.get("childPid")
+        parent_running = isinstance(pid, int) and process_matches(pid, process_title)
+        child_running = isinstance(child_pid, int) and bool(state.get("workPath")) and owned_child_matches(child_pid, str(state["workPath"]))
+        if not parent_running and not child_running:
             state["stale"] = True
+        elif not parent_running:
+            state["orphaned"] = True
     print(json.dumps(states, ensure_ascii=False, indent=2))
     return 0 if states else 1
 
@@ -2776,6 +2819,8 @@ def process_matches(pid: int, title: str) -> bool:
 
 
 def owned_child_matches(pid: int, work_path: str) -> bool:
+    if not work_path:
+        return False
     result = subprocess.run(["ps", "-p", str(pid), "-o", "pgid=,command="], capture_output=True, text=True)
     if result.returncode != 0 or not result.stdout.strip():
         return False
@@ -2783,13 +2828,29 @@ def owned_child_matches(pid: int, work_path: str) -> bool:
     if len(fields) != 2 or not fields[0].isdigit():
         return False
     executables = {os.path.basename(token) for token in fields[1].split()[:3]}
-    return int(fields[0]) == pid and bool(executables & {"aria2c", "ffmpeg", "yt-dlp"}) and work_path in fields[1]
+    command = fields[1]
+    path = os.path.normpath(work_path)
+    start = command.find(path)
+    while start >= 0:
+        end = start + len(path)
+        if end == len(command) or command[end].isspace() or command[end] in {os.sep, "'", '"'}:
+            return int(fields[0]) == pid and bool(executables & {"aria2c", "ffmpeg", "yt-dlp"})
+        start = command.find(path, end)
+    return False
 
 
-def signal_owned_child(pid: int, work_path: str, sig: signal.Signals) -> None:
-    if owned_child_matches(pid, work_path):
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(pid, sig)
+def signal_owned_child(pid: int, work_path: str, sig: signal.Signals, *, verified: bool = False) -> bool:
+    if not (verified or owned_child_matches(pid, work_path)) or not process_group_running(pid):
+        return False
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        if process_group_running(pid):
+            raise
+        return False
+    return True
 
 
 def command_stop(args) -> int:
@@ -2808,6 +2869,7 @@ def command_stop(args) -> int:
         child_pid = state.get("childPid")
         process_title = str(state.get("requestedTitle") or state.get("title", ""))
         work_path = str(state.get("workPath") or (base_root / ".media-downloader-work" / identifier))
+        child_group = child_pid if isinstance(child_pid, int) and owned_child_matches(child_pid, work_path) else None
         if isinstance(pid, int) and process_matches(pid, process_title):
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -2817,28 +2879,28 @@ def command_stop(args) -> int:
             grace = time.monotonic() + 2
             while time.monotonic() < grace and process_matches(pid, process_title):
                 time.sleep(0.1)
-        if isinstance(child_pid, int):
-            signal_owned_child(child_pid, work_path, signal.SIGTERM)
+        if child_group is not None:
+            signal_owned_child(child_group, work_path, signal.SIGTERM, verified=True)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             parent_running = isinstance(pid, int) and process_matches(pid, process_title)
-            child_running = isinstance(child_pid, int) and owned_child_matches(child_pid, work_path)
+            child_running = child_group is not None and process_group_running(child_group)
             if not parent_running and not child_running:
                 break
             time.sleep(0.1)
-        if isinstance(child_pid, int):
-            signal_owned_child(child_pid, work_path, signal.SIGKILL)
+        if child_group is not None:
+            signal_owned_child(child_group, work_path, signal.SIGKILL, verified=True)
         if isinstance(pid, int) and process_matches(pid, process_title):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
         final_deadline = time.monotonic() + 2
         while time.monotonic() < final_deadline:
             parent_running = isinstance(pid, int) and process_matches(pid, process_title)
-            child_running = isinstance(child_pid, int) and owned_child_matches(child_pid, work_path)
+            child_running = child_group is not None and process_group_running(child_group)
             if not parent_running and not child_running:
                 break
             time.sleep(0.1)
-        if (isinstance(pid, int) and process_matches(pid, process_title)) or (isinstance(child_pid, int) and owned_child_matches(child_pid, work_path)):
+        if (isinstance(pid, int) and process_matches(pid, process_title)) or (child_group is not None and process_group_running(child_group)):
             raise RuntimeError(f"停止任务失败，进程仍在运行: {state.get('title')}")
         status_update(identifier, phase="stopped", currentOperation="stopped", lastError="任务已停止", pid=None, childPid=None, finishedAt=now())
     return 0
@@ -3036,7 +3098,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--keep-work", action="store_true", help="Keep the download cache/workspace after completion (cleaned by default after delivery/archive)")
     parser.add_argument("--reset-work", action="store_true", help="Rebuild a verified failed-task workspace after confirming the source changed")
     parser.add_argument("--update-nfo", action="store_true", help="Atomically update existing NFO only; never overwrites media, subtitles, or artwork")
-    parser.add_argument("--merge", action="store_true", help="For incremental TV archives, keep existing different show-level artwork/tvshow.nfo; media conflicts still fail")
+    parser.add_argument("--merge", action="store_true", help="For incremental TV archives, keep existing different artwork (show/season/episode) and tvshow.nfo; media, subtitle, and episode-NFO conflicts still fail")
     if mode_override:
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--transcode", dest="copy_original", action="store_false", help="Override the default mode and transcode")

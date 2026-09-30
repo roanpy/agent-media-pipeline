@@ -150,7 +150,8 @@ The default Plex TV template appends a verified per-episode title when available
 - Search results expose review fields and candidate IDs, not stored download URLs.
 - `--version`, doctor, dry-run, and task status expose the pipeline version/config schema for stale-install detection.
 - Signed or tokenized URLs can be supplied through a user-owned `0600` file with `--source-file`.
-- `config.json`, runtime state, logs, and caches are Git-ignored; private JSON files are written as `0600`, and the private config must not be a symlink.
+- `config.json`, default work/cache folders, runtime state, logs, `.env*`, and commonly named cookies files are Git-ignored; private JSON files are written as `0600`, and the private config must not be a symlink. Custom credential filenames still require review before committing.
+- `check` reports `stale: true` only when neither recorded owned process is running. `orphaned: true` means a downloader is still running without its pipeline parent; stop it before retrying. These diagnostic flags do not modify stored state.
 - Metadata and remote artwork accept only DNS-resolved public HTTP(S) destinations and reject cross-host or HTTPS-downgrade redirects; explicitly configured local indexers remain supported.
 - Existing different files are never overwritten. Matching files are verified before being accepted.
 - Existing-library repair rejects library/category roots, duplicate SxxEyy media, and existing destinations; it previews by default and leaves legacy empty directories alone.

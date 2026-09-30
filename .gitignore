@@ -5,3 +5,11 @@ __pycache__/
 .runtime/
 logs/
 config.json
+/work/
+.media-downloader-work/
+.state/
+.env
+.env.*
+cookies.txt
+*.cookies.txt
+cookies.*.txt

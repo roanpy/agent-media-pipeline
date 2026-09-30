@@ -328,6 +328,19 @@ def assert_tmdb_auth_modes():
         assert not calls[0][2].get("Authorization"), calls
         assert calls[1][1].get("api_key") == "v3-api-key-123", calls
 
+        for kind, title, year, expected_query, expected_year in (
+            ("movie", "Name 2026", None, "Name", 2026),
+            ("movie", "Name (2026)", 2025, "Name", 2025),
+            ("tv", "Name [2026]", 2026, "Name", 2026),
+            ("movie", "Name 2026", 2026, "Name", 2026),
+            ("movie", "Title2026", None, "Title2026", None),
+            ("movie", "2001", None, "2001", None),
+        ):
+            calls.clear()
+            module.fetch_tmdb(config, kind, title, year)
+            assert calls[0][1]["query"] == expected_query, calls
+            assert calls[0][1]["first_air_date_year" if kind == "tv" else "year"] == expected_year, calls
+
         # 同名条目必须优先于热度更高的其他条目；没有同名时才回退到热度。
         def ranked(url, params, headers=None, timeout=20):
             calls.append((url, dict(params), dict(headers or {})))
@@ -937,15 +950,118 @@ def assert_doctor_contract(module, data: dict):
         http.assert_not_called()
 
 
+def assert_xml_character_guards(module, root: Path):
+    import xml.etree.ElementTree as ET
+
+    tree = module.episode_nfo_root(2, 3, "中文 & English", {
+        "plot": "剧情\x00\x1f\ud800\ufffe\uffff\t\n😀 <end>",
+        "ids": {"tmdb\x01": "123\x02"},
+    })
+    path = root / "xml-characters.nfo"
+    module.write_xml(path, tree)
+    parsed = ET.parse(path).getroot()
+    assert parsed.findtext("title") == "中文 & English"
+    assert parsed.findtext("plot") == "剧情\t\n😀 <end>"
+    assert parsed.find("uniqueid").attrib["type"] == "tmdb"
+    assert parsed.findtext("uniqueid") == "123"
+
+
+def assert_child_process_cleanup(module, root: Path):
+    # macOS may return EPERM for killpg(0) on a group containing only zombies.
+    with patch.object(module.os, "killpg", side_effect=PermissionError), patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess("ps", 0, "12345 Z\n")):
+        assert module.process_group_running(12345) is False
+    with patch.object(module.os, "killpg", side_effect=PermissionError), patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess("ps", 0, "12345 S\n")):
+        assert module.process_group_running(12345) is True
+    with patch.object(module.os, "killpg"), patch.object(module.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 2)):
+        assert module.process_group_running(12345) is True
+    child_bin = root / "lifecycle-bin"
+    child_bin.mkdir()
+    executable = child_bin / "aria2c"
+    executable.write_text("""#!/usr/bin/env python3
+import os, signal, subprocess, sys, time
+worker = subprocess.Popen([sys.executable, '-c',
+    "import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)",
+    sys.argv[2]])
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+while True:
+    time.sleep(0.1)
+""", encoding="utf-8")
+    executable.chmod(0o700)
+    work_path = str(root / "owned-work-extra")
+    ready = root / "lifecycle-child.pid"
+    command = [str(executable), work_path, str(ready)]
+
+    def wait_ready():
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ready.exists(), "descendant failed to start"
+
+    def assert_group_stopped(pid):
+        deadline = time.monotonic() + 3
+        while module.process_group_running(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not module.process_group_running(pid), "a live descendant survived group cleanup"
+
+    # The leader exits on TERM, but its descendant ignores it: stop must kill the group.
+    leader = subprocess.Popen(command, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_ready()
+        assert module.owned_child_matches(leader.pid, work_path)
+        assert not module.owned_child_matches(leader.pid, str(root / "owned-work")), "workspace prefixes are not ownership"
+        states = {"cleanup-task": {"title": "Cleanup", "phase": "downloading", "pid": 999999, "childPid": leader.pid, "workPath": work_path}}
+        with patch.object(module, "load_config", return_value={"baseDir": str(root)}), patch.object(module, "status_read", return_value=states), patch.object(module, "status_update") as update, contextlib.redirect_stdout(io.StringIO()):
+            assert module.command_stop(module.parser().parse_args(["stop", "Cleanup"])) == 0
+        leader.wait(timeout=5)
+        assert_group_stopped(leader.pid)
+        assert update.call_args.kwargs["phase"] == "stopped" and update.call_args.kwargs["finishedAt"]
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(leader.pid, signal.SIGKILL)
+        leader.wait(timeout=5)
+        ready.unlink(missing_ok=True)
+
+    # Once Popen succeeds, failure to publish childPid must not leak any child process.
+    recorded_pid = None
+
+    def fail_child_status(_identifier, **fields):
+        nonlocal recorded_pid
+        if fields.get("childPid") is not None:
+            recorded_pid = fields["childPid"]
+            wait_ready()
+            raise OSError("simulated childPid write failure")
+
+    ctx = {"id": "state-write-failure", "stateRoot": root, "logPath": root / "lifecycle-logs" / "child.log"}
+    try:
+        with patch.object(module, "status_update", side_effect=fail_child_status):
+            try:
+                module.run_child(ctx, command, "downloading", timeout_seconds=5)
+            except OSError as exc:
+                assert "childPid write failure" in str(exc)
+            else:
+                raise AssertionError("expected the state-write error")
+        assert recorded_pid is not None
+        assert_group_stopped(recorded_pid)
+    finally:
+        if recorded_pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(recorded_pid, signal.SIGKILL)
+        ready.unlink(missing_ok=True)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.9 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.10 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
         module = assert_atomic_copy_never_overwrites(root)
+        assert_xml_character_guards(module, root)
+        assert_child_process_cleanup(module, root)
+        ingest_help = run([sys.executable, str(SCRIPT), "ingest", "--help"]).stdout
+        assert "show/season/episode" in ingest_help and "episode-NFO" in ingest_help
         assert_path_and_naming_guards(module, root)
         assert_tmdb_auth_modes()
         for name in ("tv", "movie", "source", "http"):
@@ -1020,7 +1136,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.9"
+            assert doctor_payload["version"] == "0.4.10"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -1144,7 +1260,19 @@ def main():
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
             assert delivery_plan["downloadRetries"] == 3
-            assert delivery_plan["version"] == "0.4.9" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.10" and delivery_plan["configSchemaVersion"] == 1
+            # Read the private source once: identity and acquisition must use the same snapshot.
+            private_source = root / "single-read-source.txt"
+            private_source.write_text(delivery_url, encoding="utf-8")
+            private_source.chmod(0o600)
+            args = module.parser().parse_args([
+                "ingest", "交付电影", "--source-file", str(private_source), "--type", "movie",
+                "--year", "2026", "--no-transcode", "--no-archive", "--offline", "--dry-run",
+            ])
+            with patch.dict(os.environ, delivery_env), patch.object(module, "read_private_text", wraps=module.read_private_text) as read_source, contextlib.redirect_stdout(io.StringIO()) as output:
+                assert module.pipeline(args) == 0
+            read_source.assert_called_once()
+            assert json.loads(output.getvalue())["taskId"] == delivery_plan["taskId"]
             delivery_output = delivery_root / "交付电影 (2026)"
             assert Path(delivery_plan["targetPath"]) == delivery_output.resolve()
             assert delivery_plan["target"] == "download"
@@ -1325,6 +1453,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
                 states = json.loads((root / "status.json").read_text(encoding="utf-8"))
                 stop_state = next(item for item in states.values() if item.get("requestedTitle") == stop_title)
                 assert stop_state["phase"] == "stopped", stop_state
+                assert stop_state["finishedAt"], stop_state
                 assert subprocess.run(["ps", "-p", str(stop_child_pid)], capture_output=True).returncode != 0
             finally:
                 if stop_process.poll() is None:
@@ -1347,6 +1476,8 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             ], env=hint_env, expect=1)
             assert "退出码 3" in hint_error.stderr and "资源不存在或链接已失效" in hint_error.stderr, hint_error.stderr
             assert "Download aborted: resource not found" in hint_error.stderr, hint_error.stderr
+            hint_state = next(iter(json.loads((root / "hint-status.json").read_text(encoding="utf-8")).values()))
+            assert hint_state["phase"] == "failed" and hint_state["finishedAt"]
 
             # check 必须把“非终结 phase 但进程已消失”的任务标成 stale，避免调用方继续等待。
             stale_file = root / "stale-status.json"
@@ -1357,6 +1488,32 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             checked = json.loads(run([sys.executable, str(SCRIPT), "check"], env={**env, "MEDIA_DOWNLOADER_STATUS_FILE": str(stale_file)}).stdout)
             assert checked["stale-task"]["stale"] is True
             assert "stale" not in checked["done-task"] and checked["done-task"]["phase"] == "done"
+
+            # A live owned downloader without its parent is orphaned, not dead/stale.
+            orphan_work = str(root / "orphan-work")
+            orphan = subprocess.Popen([str(fake_aria2), orphan_work], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 3
+                while not module.owned_child_matches(orphan.pid, orphan_work) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                orphan_states = {
+                    "orphan-task": {"title": "Orphan", "phase": "downloading", "pid": 999999, "childPid": orphan.pid, "workPath": orphan_work},
+                    "unrelated-task": {"title": "Unrelated", "phase": "downloading", "pid": 999999, "childPid": orphan.pid, "workPath": str(root / "other-work")},
+                }
+                write_config(stale_file, orphan_states)
+                orphan_env = {**env, "MEDIA_DOWNLOADER_STATUS_FILE": str(stale_file)}
+                checked = json.loads(run([sys.executable, str(SCRIPT), "check"], env=orphan_env).stdout)
+                assert checked["orphan-task"]["orphaned"] is True and "stale" not in checked["orphan-task"]
+                assert checked["unrelated-task"]["stale"] is True and "orphaned" not in checked["unrelated-task"]
+                assert json.loads(stale_file.read_text(encoding="utf-8")) == orphan_states, "check must remain read-only"
+                run([sys.executable, str(SCRIPT), "stop", "Orphan"], env=orphan_env)
+                orphan.wait(timeout=5)
+                assert json.loads(stale_file.read_text(encoding="utf-8"))["orphan-task"]["phase"] == "stopped"
+            finally:
+                if orphan.poll() is None:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(orphan.pid, signal.SIGKILL)
+                    orphan.wait(timeout=5)
 
             searched = run([sys.executable, str(SCRIPT), "search", "Remote", "--source", "jackett", "--type", "tv"], env=env)
             payload = json.loads(searched.stdout)
