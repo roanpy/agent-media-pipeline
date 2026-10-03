@@ -8,8 +8,7 @@ config.json
 /work/
 .media-downloader-work/
 .state/
-.env
-.env.*
+.env*
 cookies.txt
 *.cookies.txt
 cookies.*.txt
