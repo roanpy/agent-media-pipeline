@@ -41,8 +41,9 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
    - Prefer one task per show: one `adopt` for a local directory, one `ingest --playlist` for a playlist. If episodes must be split, use `--merge` and consistent metadata/profile/target settings. Prefer serial execution for tasks sharing a TV folder to reduce shared artwork/NFO contention; separate shows can run concurrently.
    - When separate tasks add episodes to the same existing TV show, use `--merge`. It keeps existing different artwork (show-level poster/fanart/banner/clearlogo, episode thumbnails, season posters) and `tvshow.nfo`, but still rejects different media, subtitles, and episode NFO files.
    - If aria2 stops after sustained zero traffic, report the stalled candidate and use another reviewed candidate only when the user already authorized fallback or confirms it now.
-6. Run `check` until `done`, `failed`, or `stopped`. If `stale: true`, the recorded owned processes are gone; inspect the retained workspace/log before a retry. If `orphaned: true`, an owned downloader still runs without the pipeline parent: use `stop` and confirm termination before retrying. `check` reports these flags without changing saved state. After `stop`, run `check` again.
-7. Report the output/archive path, actual mode/profile/naming/target, file count, and unmet requirements.
+6. For requested post-download track review, launch a transcode task with `--track-review-seconds 60` and monitor `check` for `track-review`. Report embedded subtitle/audio counts and numbered language/title/codec choices, plus same-stem external subtitle files and their suffixes; filename language labels are hints, not verified language detection. Ask once whether to burn a subtitle or select audio tracks. Check `trackBurnAvailable` before offering burning as ready; select a verified libass build before launch if needed. Explain the deadline: no reply preserves all audio and all external subtitle copies with the previously selected compression profile. Use `choose-tracks TASK_ID` only during that window and for an explicit selection. Choose either `--burn-subtitle N` (embedded) or `--burn-sidecar zh.srt` (the exact external suffix from `tracks`), never both; do not supply arbitrary paths. Batch choices apply to every file, so verify matching ordinals/suffixes across episodes first. If a rejected explicit choice would make default processing violate the request, stop the pending task and explain rather than treating it as no reply. Do not claim a late choice changed a running conversion or restart without approval. For local media, inspect with `tracks PATH` before launching. An already explicit choice needs no further pause; a file with no embedded/external subtitles and at most one audio track also skips review. Bitmap sidecars are retained but not burned or OCR'd.
+7. Run `check` until `done`, `failed`, or `stopped`. If `stale: true`, the recorded owned processes are gone; inspect the retained workspace/log before a retry. If `orphaned: true`, an owned downloader still runs without the pipeline parent: use `stop` and confirm termination before retrying. `check` reports these flags without changing saved state. After `stop`, run `check` again.
+8. Report the output/archive path, actual mode/profile/naming/target, file count, subtitle/audio counts, any burned track, and unmet requirements.
 
 For an existing TV show folder, run `repair` without `--apply` first and show the complete plan. Pass exactly one show folder, never a TV library/category root. Apply only after approval. Rename only episodes with reliable provider/supplied titles; preserve original paths when titles are missing. Add `--update-nfo` only when the same reliable episode metadata should replace per-episode NFO. `tvshow.nfo` remains untouched.
 
@@ -66,6 +67,19 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
 ./run.sh doctor --online
 ./run.sh profiles
 ./run.sh sources
+
+# Inspect local soft-subtitle/audio tracks (ordinals start at 0)
+./run.sh tracks "/path/to/Movie.mkv"
+# Allow a bounded post-download choice; no reply preserves all tracks
+./run.sh ingest "Movie Name" "VIDEO_URL" --type movie --no-archive --track-review-seconds 60
+# Submit an explicit choice while check reports track-review
+./run.sh choose-tracks TASK_ID --burn-subtitle 0 --audio-tracks 0,1
+# Or select before starting; hard subtitles require video re-encoding
+./run.sh adopt "Movie Name" "/path/to/Movie.mkv" --type movie --transcode --no-archive \
+  --burn-subtitle 0
+# Or burn the same-stem Movie.zh.srt; the external copy is still retained
+./run.sh adopt "Movie Name" "/path/to/Movie.mkv" --type movie --transcode --no-archive \
+  --burn-sidecar zh.srt
 
 # Save a reviewed reusable source to private config.json; store env-var names, never keys
 ./run.sh add-source public-site 'https://example.test/search?q={query}' --type web
@@ -175,7 +189,13 @@ Verified `metadata.title` controls canonical naming and task identity while stat
 
 Transcoding defaults to MP4 profiles, removes inherited global and chapter metadata, and preserves language/title labels on mapped audio, video, and subtitle tracks. Normalized filenames, NFO, and artwork carry library metadata. `--no-transcode` promises byte-preserving media organization and therefore does not alter embedded metadata.
 
-When a profile uses `container: "mkv"`, transcoding keeps the source's embedded subtitle streams, per-track language/title metadata, and Matroska attachments such as ASS fonts unchanged (`-c:s copy`, `-c:t copy`). MP4 containers still drop embedded subtitles and attachments for compatibility; same-stem external subtitle files always survive both modes. The default container is whatever the configured default profile declares; nothing forces MP4.
+Inspect downloaded media tracks before processing. Soft subtitles are separate selectable streams, not text already baked into video pixels; already-hardcoded subtitles cannot be detected reliably with FFprobe or extracted as subtitle tracks. Report subtitle/audio counts and each track's ordinal, language, title, codec, and default/forced flags. Unknown language is `und`, not a guessed Chinese/English label.
+
+Without an explicit selection, keep all audio tracks and preserve every soft-subtitle track as an external sidecar alongside the converted video. MKV also retains embedded subtitles and attachments; MP4 uses external subtitles for compatibility. Existing same-stem external subtitles follow the final movie/TV video stem, retain language/forced suffixes, and are copied to the final delivery/archive directory in both modes; verify these final paths, not just cache files. Retain ASS styling and fonts, and disclose subtitle-only Matroska preservation files that are not universally recognized by Plex rather than claiming bitmap subtitles were converted to text. Never silently discard an unextractable subtitle or clean up the source after preservation fails. The final container still comes from the configured profile; nothing forces MP4 or MKV.
+
+Hard subtitles mean burning one selected soft-subtitle track into the picture: playback cannot switch it off, and video re-encoding is required. Do this only after the user explicitly chooses a track. Keep the external copies even when burning a subtitle. Default audio handling maps all tracks and preserves their language/title/disposition labels, using the profile's audio codec/bitrate; this is not byte-identical audio preservation. `organize`/`--no-transcode` retains the original media bytes and embedded streams and cannot burn subtitles or remove audio tracks.
+
+Use `MEDIA_DOWNLOADER_FFMPEG` to explicitly select an executable FFmpeg build when needed; do not silently switch to another application's bundled binary. `doctor` reports the selected build's `subtitles` filter separately from ordinary transcoding readiness. Text-subtitle burning requires that filter/libass and fonts with the required glyphs; a missing filter must fail before conversion, not fall back to unburned output. Do not treat filter availability as proof of correct Chinese glyph rendering. Bitmap tracks remain preserved externally but unsupported burn requests must be reported clearly, not guessed or OCR'd.
 
 ## Configuration
 

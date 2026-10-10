@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import http.server
 import importlib.util
 import io
@@ -74,6 +75,48 @@ def make_subtitled_video(path: Path, seconds: int = 3):
     ])
     subtitle.unlink()
     attachment.unlink()
+
+
+def make_multitrack_subtitled_video(path: Path, seconds: int = 3):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subtitle_srt = path.with_name(f".{path.stem}.one.srt")
+    subtitle_ass = path.with_name(f".{path.stem}.two.ass")
+    attachment = path.with_name(f".{path.stem}.font.txt")
+    subtitle_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n中文轨道\n", encoding="utf-8")
+    subtitle_ass.write_text(
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 160\nPlayResY: 90\n"
+        "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Arial,18,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,1,1,0,2,10,10,10,1\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,ASS subtitle\n",
+        encoding="utf-8",
+    )
+    attachment.write_text("test attachment bytes", encoding="utf-8")
+    run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12",
+        "-f", "lavfi", "-i", "sine=frequency=440",
+        "-f", "lavfi", "-i", "sine=frequency=880",
+        "-i", str(subtitle_srt), "-i", str(subtitle_ass),
+        "-t", str(seconds), "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:s", "-map", "4:s",
+        "-metadata:s:a:0", "language=eng", "-metadata:s:a:0", "title=English audio", "-disposition:a:0", "default",
+        "-metadata:s:a:1", "language=jpn", "-metadata:s:a:1", "title=Japanese audio", "-disposition:a:1", "0",
+        "-metadata:s:s:0", "language=chi", "-metadata:s:s:0", "title=中文字幕", "-disposition:s:0", "default+forced",
+        "-metadata:s:s:1", "language=eng", "-metadata:s:s:1", "title=Styled English", "-disposition:s:1", "0",
+        "-attach", str(attachment), "-metadata:s:t:0", "mimetype=text/plain", "-metadata:s:t:0", "filename=font.txt",
+        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-c:s:0", "srt", "-c:s:1", "ass", str(path),
+    ])
+    subtitle_srt.unlink()
+    subtitle_ass.unlink()
+    attachment.unlink()
+
+
+def decoded_frame_digest(path: Path, timestamp: float = 0.5, binary: str | None = None) -> str:
+    result = subprocess.run(
+        [binary or os.environ.get("MEDIA_DOWNLOADER_FFMPEG") or shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", str(timestamp), "-i", str(path), "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+        capture_output=True, check=True,
+    )
+    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def make_image(path: Path):
@@ -222,6 +265,17 @@ def assert_atomic_copy_never_overwrites(root: Path):
     finally:
         module.os.link = original_link
     assert fallback.read_text(encoding="utf-8") == "source"
+
+    subtitle_temp = root / "subtitle-temp.srt"
+    subtitle_temp.write_text("subtitle", encoding="utf-8")
+    subtitle_target = root / (("长" * 65) + ".subtitle-00.default.chi.forced.srt")
+    module.os.link = unsupported_link
+    try:
+        module.install_no_clobber(subtitle_temp, subtitle_target)
+    finally:
+        module.os.link = original_link
+    assert subtitle_target.read_text(encoding="utf-8") == "subtitle"
+    assert not subtitle_temp.exists()
 
     failed_fallback = root / "atomic-failed-fallback.txt"
     original_digest = module.file_digest
@@ -1053,11 +1107,26 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.10 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.11 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
+        assert "tracks" in root_help and "choose-tracks" in root_help
         module = assert_atomic_copy_never_overwrites(root)
+        saved_choice = {"fingerprint": "same-source", "audioOrdinals": [1]}
+        resume = module.resumable_track_decision
+        assert resume({"phase": "failed", "trackDecision": saved_choice}, "same-source", reset_work=False, audio_tracks=None, burn_subtitle=None, burn_sidecar=None, review_seconds=0) == saved_choice
+        assert resume({"phase": "stopped", "trackDecision": saved_choice}, "same-source", reset_work=False, audio_tracks=None, burn_subtitle=None, burn_sidecar=None, review_seconds=0) == saved_choice
+        assert resume({"phase": "done", "trackDecision": saved_choice}, "same-source", reset_work=False, audio_tracks=None, burn_subtitle=None, burn_sidecar=None, review_seconds=0) is None
+        assert resume({"phase": "failed", "trackDecision": saved_choice}, "same-source", reset_work=True, audio_tracks=None, burn_subtitle=None, burn_sidecar=None, review_seconds=0) is None
+        assert resume({"phase": "track-review", "trackDecision": saved_choice}, "same-source", reset_work=False, audio_tracks="1", burn_subtitle=None, burn_sidecar=None, review_seconds=0) is None
+        assert resume({"phase": "track-review", "trackDecision": saved_choice}, "same-source", reset_work=False, audio_tracks=None, burn_subtitle=None, burn_sidecar=None, review_seconds=30) is None
+        try:
+            resume({"phase": "track-review", "trackDecision": saved_choice}, "same-source", reset_work=False, audio_tracks=None, burn_subtitle=None, burn_sidecar=None, review_seconds=0)
+        except RuntimeError as exc:
+            assert "为避免静默丢失" in str(exc)
+        else:
+            raise AssertionError("stale nonterminal track choices must not silently revert to defaults")
         assert_xml_character_guards(module, root)
         assert_child_process_cleanup(module, root)
         ingest_help = run([sys.executable, str(SCRIPT), "ingest", "--help"]).stdout
@@ -1071,6 +1140,16 @@ def main():
         make_video(root / "source" / "Organize.Show.S04E05.mkv")
         make_video(root / "source" / "Organize.Movie.mkv")
         make_subtitled_video(root / "source" / "Subtitled.Movie.mkv")
+        multi_track_source = root / "source" / "punctuation,[]' 中文 多音轨.mkv"
+        make_multitrack_subtitled_video(multi_track_source)
+        external_subtitle = multi_track_source.with_name(f"{multi_track_source.stem}.jpn.srt")
+        external_subtitle.write_text("1\n00:00:00,000 --> 00:00:02,000\n外置字幕烧录\n", encoding="utf-8")
+        bitmap_index = multi_track_source.with_name(f"{multi_track_source.stem}.vobsub.idx")
+        bitmap_data = multi_track_source.with_name(f"{multi_track_source.stem}.vobsub.sub")
+        bitmap_index.write_text("invalid VobSub index fixture\n", encoding="utf-8")
+        bitmap_data.write_bytes(b"VobSub bitmap fixture\x00\x01")
+        unsafe_sidecar_link = multi_track_source.with_name(f"{multi_track_source.stem}.unsafe.srt")
+        unsafe_sidecar_link.symlink_to(external_subtitle)
         make_video(root / "http" / "Remote.S01E01.mp4")
         make_image(root / "source" / "poster.png")
         (root / "source" / "Example.S02E03.zh.forced.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
@@ -1096,6 +1175,80 @@ def main():
             cfg = config(root, port)
             assert_doctor_contract(module, json.loads(cfg.read_text(encoding="utf-8")))
             env = {**os.environ, "MEDIA_DOWNLOADER_CONFIG": str(cfg), "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "status.json"), "MEDIA_DOWNLOADER_CANDIDATE_FILE": str(root / "candidates.json"), "MEDIA_DOWNLOADER_OFFLINE": "1", "TEST_JACKETT_KEY": "secret-key", "TEST_TORZNAB_KEY": "secret-key"}
+            source_hash_before_tracks = module.file_digest(multi_track_source)
+            track_file = json.loads(run([sys.executable, str(SCRIPT), "tracks", str(multi_track_source)], env=env).stdout)
+            assert track_file["files"][0]["audioTrackCount"] == 2, track_file
+            assert track_file["files"][0]["subtitleTrackCount"] == 2, track_file
+            assert [item["subtitleOrdinal"] for item in track_file["files"][0]["subtitleTracks"]] == [0, 1]
+            assert [item["streamIndex"] for item in track_file["files"][0]["subtitleTracks"]] == [3, 4]
+            assert track_file["files"][0]["subtitleTracks"][0]["default"] is True
+            assert track_file["files"][0]["subtitleTracks"][0]["forced"] is True
+            assert track_file["files"][0]["subtitleTracks"][1]["codec"] == "ass"
+            inventory = track_file["files"][0]
+            assert inventory["externalSubtitleFileCount"] == 3, inventory
+            external_by_suffix = {item["suffix"]: item for item in inventory["externalSubtitleFiles"]}
+            assert set(external_by_suffix) == {"jpn.srt", "vobsub.idx", "vobsub.sub"}, external_by_suffix
+            assert external_by_suffix["jpn.srt"]["tracks"][0]["codec"] == "subrip"
+            assert external_by_suffix["jpn.srt"]["tracks"][0]["language"] == "jpn"
+            assert external_by_suffix["vobsub.idx"]["pairedFileName"] == bitmap_data.name
+            assert external_by_suffix["vobsub.idx"]["probeNote"]
+            assert all("unsafe.srt" not in item["fileName"] for item in inventory["externalSubtitleFiles"])
+            assert inventory["externalSubtitleTrackCount"] == sum(
+                len(item["tracks"]) for item in inventory["externalSubtitleFiles"]
+            )
+            try:
+                module.validate_review_choice([inventory], None, None, "missing.srt")
+            except RuntimeError as exc:
+                assert "未在" in str(exc)
+            else:
+                raise AssertionError("sidecar burn must reject a suffix not present in the inventory")
+            try:
+                module.validate_review_choice([inventory], None, None, "vobsub.idx")
+            except RuntimeError as exc:
+                assert "不能安全烧录" in str(exc) or "位图" in str(exc)
+            else:
+                raise AssertionError("bitmap/unknown sidecar must not be accepted for burn")
+            sidecar_selection = module.resolve_external_sidecar_selection({
+                "source": multi_track_source,
+                "sourceInfo": {
+                    **module.ffprobe(multi_track_source),
+                    "externalSubtitleFiles": inventory["externalSubtitleFiles"],
+                },
+            }, "jpn.srt")
+            escaped_sidecar_command = module.ffmpeg_command({
+                "profile": {"container": "mp4", "videoCodec": "libx264", "audioCodec": "aac", "resolution": 90},
+                "args": type("Args", (), {"burn_subtitle": None})(),
+                "externalSubtitleSelections": {str(multi_track_source.resolve()): sidecar_selection},
+            }, multi_track_source, root / "escaped-sidecar.mp4")
+            filter_arg = escaped_sidecar_command[escaped_sidecar_command.index("-vf") + 1]
+            assert f"subtitles=filename={module.escape_filter_option(str(external_subtitle.resolve()))}:si=0" in filter_arg
+            try:
+                module.validate_sidecar_suffix("../jpn.srt")
+            except RuntimeError as exc:
+                assert "不能包含目录路径" in str(exc)
+            else:
+                raise AssertionError("sidecar selector must reject path traversal")
+            name_max = int(os.pathconf(root, "PC_NAME_MAX"))
+            output_stem = "O" * 40
+            tag_length = name_max - len(output_stem.encode("utf-8")) - len(".srt".encode("utf-8")) - 1
+            exact_limit_plan = {
+                "source": Path("Movie.mkv"), "relative": Path(output_stem + ".mp4"),
+                "sourceInfo": {"externalSubtitleFiles": [{"fileName": "Movie." + ("x" * tag_length) + ".srt"}]},
+            }
+            module.validate_sidecar_output_names([exact_limit_plan], root)
+            over_limit_plan = {
+                "source": Path("Movie.mkv"), "relative": Path(output_stem + ".mp4"),
+                "sourceInfo": {"externalSubtitleFiles": [{"fileName": "Movie." + ("x" * (tag_length + 1)) + ".srt"}]},
+            }
+            try:
+                module.validate_sidecar_output_names([over_limit_plan], root)
+            except RuntimeError as exc:
+                assert "目标文件系统限制" in str(exc)
+            else:
+                raise AssertionError("sidecar name at 256 bytes must be rejected before transcoding")
+            assert module.file_digest(multi_track_source) == source_hash_before_tracks
+            track_directory = json.loads(run([sys.executable, str(SCRIPT), "tracks", str(root / "source")], env=env).stdout)
+            assert any(item["path"] == str(multi_track_source.resolve()) for item in track_directory["files"])
             make_video(root / "http" / "retry.mp4")
             retry_config = json.loads(cfg.read_text(encoding="utf-8"))
             retry_config.update(downloadRetries=1, downloadDir=str(root / "retry-delivery"))
@@ -1136,7 +1289,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.10"
+            assert doctor_payload["version"] == "0.4.11"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -1260,7 +1413,7 @@ def main():
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
             assert delivery_plan["downloadRetries"] == 3
-            assert delivery_plan["version"] == "0.4.10" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.11" and delivery_plan["configSchemaVersion"] == 1
             # Read the private source once: identity and acquisition must use the same snapshot.
             private_source = root / "single-read-source.txt"
             private_source.write_text(delivery_url, encoding="utf-8")
@@ -1557,8 +1710,11 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             run([sys.executable, str(SCRIPT), "adopt", "示例剧", str(root / "source" / "Example.S02E03.mkv"), "--type", "tv", "--year", "2026", "--target", "tv", "--metadata", str(metadata), "--offline"], env=env)
             show = root / "tv" / "示例剧 (2026)"
             episode = show / "Season 02" / "示例剧 (2026) - S02E03.mp4"
+            original_tv_sidecar = root / "source" / "Example.S02E03.zh.forced.srt"
             assert episode.is_file()
-            assert episode.with_name(f"{episode.stem}.zh.forced.srt").is_file()
+            episode_sidecar = episode.with_name(f"{episode.stem}.zh.forced.srt")
+            assert episode_sidecar.is_file()
+            assert module.file_digest(episode_sidecar) == module.file_digest(original_tv_sidecar)
             assert (show / "poster.jpg").is_file()
             assert_xml(show / "tvshow.nfo", "<uniqueid type=\"tmdb\" default=\"true\">123</uniqueid>")
             assert_xml(episode.with_suffix(".nfo"), "<title>第三集</title>")
@@ -1583,6 +1739,9 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             run(titled_command, env=env)
             titled_episode = root / "tv" / "标题剧 (2026)" / "Season 02" / "标题剧 (2026) - S02E03 - 可靠的单集标题.mkv"
             assert titled_episode.is_file()
+            titled_sidecar = titled_episode.with_name(f"{titled_episode.stem}.zh.forced.srt")
+            assert titled_sidecar.is_file()
+            assert module.file_digest(titled_sidecar) == module.file_digest(original_tv_sidecar)
             assert_xml(titled_episode.with_suffix(".nfo"), "<title>可靠的单集标题</title>")
             assert_xml(titled_episode.with_suffix(".nfo"), "<uniqueid type=\"tmdb\">1003</uniqueid>")
             assert titled_episode.with_suffix(".jpg").is_file()
@@ -1697,7 +1856,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert (organized_movie.parent / "movie.nfo").is_file()
             assert not organized_movie.with_suffix(".mp4").exists()
 
-            # MKV 转码保留原有内嵌字幕流；MP4 转码仍按兼容性丢弃内嵌字幕（外挂字幕不受影响）。
+            # MKV 转码保留原有内嵌字幕流，MP4 用外挂字幕替代内嵌字幕丢弃。
             run([sys.executable, str(SCRIPT), "adopt", "带字幕电影", str(root / "source" / "Subtitled.Movie.mkv"), "--type", "movie", "--profile", "movie-mkv", "--target", "movie", "--offline"], env=env)
             mkv_movie = root / "movie" / "带字幕电影" / "带字幕电影.mkv"
             assert mkv_movie.is_file()
@@ -1710,6 +1869,163 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert audio_streams and audio_streams[0].get("tags") == {"language": "jpn", "title": "日语音轨"}, subtitle_payload
             assert subtitle_streams and subtitle_streams[0].get("tags") == {"language": "chi", "title": "中文"}, subtitle_payload
             assert attachment_streams and attachment_streams[0].get("tags") == {"filename": "font.txt", "mimetype": "text/plain"}, subtitle_payload
+            assert (mkv_movie.parent / "带字幕电影.subtitle-00.chi.srt").is_file()
+
+            run([sys.executable, str(SCRIPT), "adopt", "多轨测试", str(multi_track_source), "--type", "movie", "--profile", "movie", "--target", "movie", "--offline"], env=env)
+            mp4_movie = root / "movie" / "多轨测试" / "多轨测试.mp4"
+            mp4_info = module.ffprobe(mp4_movie)
+            assert mp4_info["audioStreams"] == 2 and mp4_info["subtitleStreams"] == 0, mp4_info
+            assert [item["language"] for item in mp4_info["audioTracks"]] == ["eng", "jpn"], mp4_info
+            assert [item.get("title") or item.get("handlerName") for item in mp4_info["audioTracks"]] == ["English audio", "Japanese audio"], mp4_info
+            assert [item["default"] for item in mp4_info["audioTracks"]] == [True, False], mp4_info
+            assert (mp4_movie.parent / "多轨测试.subtitle-00.default.chi.forced.srt").is_file()
+            assert (mp4_movie.parent / "多轨测试.subtitle-01.eng.ass").is_file()
+            font_fallback = mp4_movie.parent / "多轨测试.subtitle-01.fonts.eng.mks"
+            assert module.ffprobe(font_fallback)["attachmentStreams"] == 1
+            default_track_state = next(item for item in json.loads((root / "status.json").read_text()).values() if item.get("requestedTitle") == "多轨测试")
+            assert default_track_state["audioTrackMode"] == "all" and default_track_state["audioTrackOrdinals"] is None
+            assert len(default_track_state["subtitleSidecars"]) == 6, default_track_state
+            copied_external = [
+                mp4_movie.with_name(f"{mp4_movie.stem}.jpn.srt"),
+                mp4_movie.with_name(f"{mp4_movie.stem}.vobsub.idx"),
+                mp4_movie.with_name(f"{mp4_movie.stem}.vobsub.sub"),
+            ]
+            assert all(path.is_file() for path in copied_external), copied_external
+            assert [module.file_digest(path) for path in copied_external] == [
+                module.file_digest(external_subtitle), module.file_digest(bitmap_index), module.file_digest(bitmap_data),
+            ]
+            assert module.file_digest(multi_track_source) == source_hash_before_tracks
+
+            duplicate_audio = run([
+                sys.executable, str(SCRIPT), "adopt", "重复音轨选择", str(multi_track_source), "--type", "movie",
+                "--target", "movie", "--audio-tracks", "0,0", "--offline",
+            ], env=env, expect=1)
+            assert "不得包含重复序号" in duplicate_audio.stderr
+            if not module.subtitle_filter_available():
+                unavailable_burn = run([
+                    sys.executable, str(SCRIPT), "adopt", "无法硬烧字幕", str(multi_track_source), "--type", "movie",
+                    "--target", "movie", "--burn-subtitle", "0", "--offline",
+                ], env=env, expect=1)
+                assert "subtitles/libass" in unavailable_burn.stderr and "请安装" in unavailable_burn.stderr
+            invalid_sidecar_selector = run([
+                sys.executable, str(SCRIPT), "adopt", "无效外挂字幕路径", str(multi_track_source), "--type", "movie",
+                "--target", "movie", "--burn-sidecar", "../jpn.srt", "--offline",
+            ], env=env, expect=1)
+            assert "不能包含目录路径" in invalid_sidecar_selector.stderr
+            bitmap_burn = run([
+                sys.executable, str(SCRIPT), "adopt", "位图不可硬烧", str(multi_track_source), "--type", "movie",
+                "--target", "movie", "--burn-sidecar", "vobsub.idx", "--offline",
+            ], env=env, expect=1)
+            if module.subtitle_filter_available():
+                assert "位图/不支持文本字幕" in bitmap_burn.stderr or "不能安全烧录" in bitmap_burn.stderr, bitmap_burn.stderr
+            else:
+                # The binary without libass rejects burn before acquisition; direct inventory validation above
+                # verifies bitmap formats are not reported as burnable either.
+                assert "subtitles/libass" in bitmap_burn.stderr
+            no_transcode_sidecar_burn = run([
+                sys.executable, str(SCRIPT), "adopt", "原样烧录不支持", str(multi_track_source), "--type", "movie",
+                "--target", "movie", "--no-transcode", "--burn-sidecar", "jpn.srt", "--offline",
+            ], env=env, expect=1)
+            assert "只适用于转码模式" in no_transcode_sidecar_burn.stderr
+
+            run([
+                sys.executable, str(SCRIPT), "adopt", "明确选择音轨", str(multi_track_source), "--type", "movie",
+                "--target", "movie", "--audio-tracks", "1", "--track-review-seconds", "15", "--offline",
+            ], env=env)
+            selected_state = next(item for item in json.loads((root / "status.json").read_text()).values() if item.get("requestedTitle") == "明确选择音轨")
+            selected_info = module.ffprobe(root / "movie" / "明确选择音轨" / "明确选择音轨.mp4")
+            assert selected_info["audioStreams"] == 1 and selected_info["audioTracks"][0]["language"] == "jpn", selected_info
+            assert selected_state["trackReviewCompletedAt"] is None, selected_state
+            assert selected_state["audioTrackOrdinals"] == [1] and selected_state["audioTrackMode"] == "selected", selected_state
+            if module.subtitle_filter_available():
+                run([
+                    sys.executable, str(SCRIPT), "adopt", "实际硬烧字幕", str(multi_track_source), "--type", "movie",
+                    "--target", "movie", "--burn-subtitle", "0", "--audio-tracks", "1", "--offline",
+                ], env=env)
+                burned_video = root / "movie" / "实际硬烧字幕" / "实际硬烧字幕.mp4"
+                burned_info = module.ffprobe(burned_video)
+                assert burned_info["audioStreams"] == 1 and burned_info["subtitleStreams"] == 0, burned_info
+                assert decoded_frame_digest(burned_video, binary=module.ffmpeg_binary()) != decoded_frame_digest(
+                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=module.ffmpeg_binary(),
+                ), "hard-burn must alter a decoded frame, not merely add a filter option"
+                assert (burned_video.parent / "实际硬烧字幕.subtitle-00.default.chi.forced.srt").is_file()
+                assert (burned_video.parent / "实际硬烧字幕.subtitle-01.eng.ass").is_file()
+
+                run([
+                    sys.executable, str(SCRIPT), "adopt", "实际硬烧外挂", str(multi_track_source), "--type", "movie",
+                    "--target", "movie", "--burn-sidecar", "jpn.srt", "--audio-tracks", "1", "--offline",
+                ], env=env)
+                sidecar_burned_video = root / "movie" / "实际硬烧外挂" / "实际硬烧外挂.mp4"
+                assert decoded_frame_digest(sidecar_burned_video, binary=module.ffmpeg_binary()) != decoded_frame_digest(
+                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=module.ffmpeg_binary(),
+                ), "external-sidecar hard burn must alter a decoded frame"
+                sidecar_copy = sidecar_burned_video.with_name("实际硬烧外挂.jpn.srt")
+                assert module.file_digest(sidecar_copy) == module.file_digest(external_subtitle)
+                sidecar_burn_state = next(item for item in json.loads((root / "status.json").read_text()).values() if item.get("requestedTitle") == "实际硬烧外挂")
+                assert sidecar_burn_state["burnSidecarSuffix"] == "jpn.srt"
+                assert sidecar_burn_state["burnSubtitleOrdinal"] is None
+                assert all(Path(path).is_file() for path in sidecar_burn_state["subtitleSidecars"])
+
+            review_process = subprocess.Popen(
+                [
+                    sys.executable, str(SCRIPT), "adopt", "审核选轨", str(multi_track_source), "--type", "movie",
+                    "--target", "movie", "--track-review-seconds", "15", "--offline",
+                ],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                review_state = None
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    states = json.loads((root / "status.json").read_text())
+                    review_state = next((item for item in states.values() if item.get("requestedTitle") == "审核选轨"), None)
+                    if review_state and review_state.get("phase") == "track-review":
+                        break
+                    if review_process.poll() is not None:
+                        break
+                    time.sleep(0.1)
+                assert review_state and review_state.get("phase") == "track-review", review_state
+                review_choice = [sys.executable, str(SCRIPT), "choose-tracks", review_state["taskId"], "--audio-tracks", "1"]
+                if module.subtitle_filter_available():
+                    review_choice.extend(["--burn-sidecar", "jpn.srt"])
+                run(review_choice, env=env)
+                review_stdout, review_stderr = review_process.communicate(timeout=90)
+                assert review_process.returncode == 0, f"review pipeline failed:\n{review_stdout}\n{review_stderr}"
+            finally:
+                if review_process.poll() is None:
+                    review_process.terminate()
+                    review_process.communicate(timeout=30)
+            reviewed_state = next(item for item in json.loads((root / "status.json").read_text()).values() if item.get("requestedTitle") == "审核选轨")
+            reviewed_info = module.ffprobe(root / "movie" / "审核选轨" / "审核选轨.mp4")
+            assert reviewed_state["phase"] == "done" and reviewed_state["trackDecisionConsumed"] is True, reviewed_state
+            assert reviewed_state["audioTrackOrdinals"] == [1] and reviewed_state["audioTrackMode"] == "selected", reviewed_state
+            assert reviewed_info["audioStreams"] == 1 and reviewed_info["audioTracks"][0]["language"] == "jpn", reviewed_info
+            if module.subtitle_filter_available():
+                assert reviewed_state["burnSidecarSuffix"] == "jpn.srt", reviewed_state
+                reviewed_video = root / "movie" / "审核选轨" / "审核选轨.mp4"
+                assert decoded_frame_digest(reviewed_video, binary=module.ffmpeg_binary()) != decoded_frame_digest(
+                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=module.ffmpeg_binary(),
+                ), "review-selected external subtitle must actually be burned"
+                assert module.file_digest(reviewed_video.with_name("审核选轨.jpn.srt")) == module.file_digest(external_subtitle)
+            else:
+                assert reviewed_state["burnSidecarSuffix"] is None, reviewed_state
+
+            plain_review = run([
+                sys.executable, str(SCRIPT), "adopt", "无可选轨道", str(root / "source" / "Film.mkv"), "--type", "movie",
+                "--target", "movie", "--track-review-seconds", "15", "--offline",
+            ], env=env)
+            plain_state = next(item for item in json.loads((root / "status.json").read_text()).values() if item.get("requestedTitle") == "无可选轨道")
+            assert plain_state["trackReviewCompletedAt"] is None and "跳过轨道 review" in plain_review.stdout, plain_state
+
+            run([sys.executable, str(SCRIPT), "adopt", "多轨测试MKV", str(multi_track_source), "--type", "movie", "--profile", "movie-mkv", "--target", "movie", "--offline"], env=env)
+            mkv_multi = root / "movie" / "多轨测试MKV" / "多轨测试MKV.mkv"
+            mkv_info = module.ffprobe(mkv_multi)
+            assert mkv_info["audioStreams"] == 2 and mkv_info["subtitleStreams"] == 2 and mkv_info["attachmentStreams"] == 1, mkv_info
+            assert (mkv_multi.parent / "多轨测试MKV.subtitle-00.default.chi.forced.srt").is_file()
+            assert (mkv_multi.parent / "多轨测试MKV.subtitle-01.eng.ass").is_file()
+            for extension, source_path in (("srt", external_subtitle), ("idx", bitmap_index), ("sub", bitmap_data)):
+                retained = mkv_multi.with_name(f"{mkv_multi.stem}." + ("jpn." if extension == "srt" else "vobsub.") + extension)
+                assert module.file_digest(retained) == module.file_digest(source_path)
             local_subs = run([sys.executable, str(SCRIPT), "adopt", "字幕本地", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--write-subs", "--offline"], env=env, expect=1)
             assert "只适用于 yt-dlp" in local_subs.stderr
             orphan_sub_langs = run([sys.executable, str(SCRIPT), "adopt", "字幕本地", str(root / "source" / "Film.mkv"), "--type", "movie", "--target", "movie", "--sub-langs", "zh-CN", "--offline"], env=env, expect=1)

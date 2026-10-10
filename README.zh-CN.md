@@ -135,7 +135,24 @@ brew install ffmpeg aria2 yt-dlp
 
 转码默认清理继承的全局和章节元数据，但保留实际映射的视频、音频和字幕轨道的语言/名称标签，再由规范文件名、NFO 和本地图片提供 Plex 资料。免转码整理保持媒体字节不变，因此不会修改内嵌元数据。
 
-默认转换容器由 `defaultProfiles.tv|movie` 指向的 profile 决定（示例和当前部署默认均为 MP4）。转码 profile 只支持 `mp4` 和 `mkv`，其他容器名会在配置校验阶段拒绝。使用 `container: "mkv"` 的 profile 转码时会原样保留源的内嵌字幕流、语言/轨道名称以及 Matroska 附件（例如 ASS 字幕字体，不重编码）；MP4 为兼容性仍丢弃内嵌字幕/附件，同名字幕文件在两种模式下都会跟随。示例配置提供 `movie1080-mkv`、`tv1080-mkv`；现有私有配置不一定包含示例新增项，使用前先运行 `profiles`。
+默认转换容器由 `defaultProfiles.tv|movie` 指向的 profile 决定（示例为 MP4），只支持 `mp4` 和 `mkv`。转码默认将所有软字幕提取为成品旁的外挂字幕，并保留全部音轨。MKV 同时保留内封字幕和附件；MP4 使用外挂字幕，不再直接丢弃字幕。已有同名外挂字幕继续跟随。ASS 保留样式；图片字幕或不适合直接外挂的编码以仅含字幕的 Matroska 文件保留，但 Plex 不一定能直接识别这类外挂文件。音轨按 profile 的编码/码率转换并保留语言、名称和默认等标志，“全部音轨”不代表音频逐字节不变。示例有 `movie1080-mkv`、`tv1080-mkv`，私有配置可能没有这些名称，使用前运行 `profiles`。
+
+轨道检查报告内封轨道数量、语言、名称、编码、默认/强制标志、从 0 开始的编号，以及同名外挂字幕。电影和电视剧的已有外挂字幕都跟随成品视频的新文件名，保留语言、forced 等后缀，并复制到最终交付或归档目录，不是只留在缓存中。语言未知标为 `und`；外挂文件名中的语言标签只是提示，不等于识别了实际语言。明确选择烧录某条内封或外挂文字字幕才会生成**硬字幕**（一直显示、不能关闭），必须重新编码视频，且仍保留外挂字幕副本；MP4 和 MKV 都适用。FFprobe 不能可靠识别或提取原本已压进画面的硬字幕。免转码整理保留原文件字节和内封轨道，不支持烧录或筛选音轨；字幕保留失败会停止交付和缓存清理，保留任务来源。
+
+```bash
+./run.sh tracks "/path/to/Movie.mkv"
+./run.sh ingest "电影名" "VIDEO_URL" --type movie --no-archive --track-review-seconds 60
+# check 显示 track-review 时，根据明确选择提交：
+./run.sh choose-tracks TASK_ID --burn-subtitle 0 --audio-tracks 0,1
+# 也可启动前明确选择第 0 条字幕烧录：
+./run.sh adopt "电影名" "/path/to/Movie.mkv" --type movie --transcode --no-archive --burn-subtitle 0
+# 也可烧录 Movie.zh.srt，使用 tracks 列出的同名后缀：
+./run.sh adopt "电影名" "/path/to/Movie.mkv" --type movie --transcode --no-archive --burn-sidecar zh.srt
+```
+
+烧录后仍保留外挂副本。播放硬字幕成品时，请关闭播放器的可选字幕，避免再次叠加。
+
+询问窗口可选且有时限，普通 CLI 不等待。Agent 可在下载完成后询问，未回复则按原 profile 继续转换并保留全部轨道。批次选择应用于每个文件，先核对每集编号是否一致。`--burn-sidecar` 接收 `tracks` 列出的同名字幕后缀，不接受任意路径，批次每集都必须有该安全且未改变的字幕；它与 `--burn-subtitle` 互斥，也可用于 `choose-tracks`。过期选择会拒绝，不会假装已经生效。只有明确传入 `--audio-tracks` 才筛选音轨，外挂字幕副本始终保留。常见图片字幕（`.sup`、`.idx`/`.sub`）复制保留，不烧录、不做 OCR。文字烧录要求 FFmpeg 带 `subtitles`/libass 滤镜并有合适字体，`doctor` 单独报告此能力；可用 `MEDIA_DOWNLOADER_FFMPEG=/绝对路径/ffmpeg` 明确选择构建，不会自动借用其他应用的二进制，也不保证中文字体覆盖；不支持的图片字幕烧录会明确失败。
 
 yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时可使用 `--format "bv*[height<=720]+ba/b[height<=720]"`。它只控制下载源，不决定流水线是否转码：默认转码 profile 决定最终 MP4，`--no-transcode` 则保留 yt-dlp 下载后的编码和容器。播放列表及 Bilibili 分 P/合集必须使用 `--type tv --playlist`，并在核实顺序后从 `--season`/`--episode` 开始映射。
 

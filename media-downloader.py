@@ -31,11 +31,12 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.10"
+VERSION = "0.4.11"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
-SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt"}
+SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt", ".mks", ".sup", ".sub", ".idx"}
+TEXT_SUBTITLE_CODECS = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
 ARCHIVE_EXTS = VIDEO_EXTS | SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
 OUTPUT_CONTAINERS = {"mp4", "mkv"}
@@ -1075,6 +1076,9 @@ def source_fingerprint(ctx: dict, source: str) -> str:
         "cookies": getattr(ctx["args"], "cookies", None),
         "writeSubs": bool(getattr(ctx["args"], "write_subs", False)),
         "subtitleLanguages": subtitle_languages(ctx["config"], ctx["args"]),
+        "burnSubtitle": getattr(ctx["args"], "burn_subtitle", None),
+        "burnSidecar": getattr(ctx["args"], "burn_sidecar", None),
+        "audioTracks": getattr(ctx["args"], "audio_tracks", None),
     }
     value = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(value.encode()).hexdigest()
@@ -1272,13 +1276,13 @@ def log_tail(path: Path, lines: int = 5, limit: int = 600) -> str:
 def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: int | None = None, redactions: list[str] | None = None) -> None:
     require_mounted_volume(ctx["stateRoot"], "状态目录")
     ensure_private_file(ctx["logPath"])
-    status_update(ctx["id"], phase=operation, currentOperation=operation, childPid=None)
+    status_update(ctx["id"], phase=operation, currentOperation=operation, childPid=None, childExecutable=None)
     code = -1
     try:
         with open(ctx["logPath"], "a", encoding="utf-8", errors="replace") as handle:
             child = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                status_update(ctx["id"], childPid=child.pid)
+                status_update(ctx["id"], childPid=child.pid, childExecutable=str(command[0]))
                 started = time.monotonic()
                 while child.poll() is None:
                     if STOP_REQUESTED:
@@ -1291,7 +1295,7 @@ def run_child(ctx: dict, command: list[str], operation: str, timeout_seconds: in
                 stop_child(child)
     finally:
         scrub_log(ctx["logPath"], redactions or [])
-    status_update(ctx["id"], childPid=None)
+    status_update(ctx["id"], childPid=None, childExecutable=None)
     if STOP_REQUESTED:
         raise InterruptedError("任务已停止")
     if code != 0:
@@ -1639,6 +1643,368 @@ def command_probe(args) -> int:
     return 0
 
 
+def external_sidecar_files(video_path: Path) -> list[dict]:
+    prefix = f"{video_path.stem}."
+    files = []
+    if not video_path.parent.is_dir() or video_path.parent.is_symlink():
+        return files
+    for sidecar in sorted(video_path.parent.iterdir(), key=lambda item: item.name.casefold()):
+        if not sidecar.name.startswith(prefix) or sidecar.suffix.lower() not in SUBTITLE_EXTS:
+            continue
+        if not is_safe_file(video_path.parent, sidecar):
+            continue
+        probe_error = None
+        try:
+            info = ffprobe(sidecar)
+        except (RuntimeError, json.JSONDecodeError):
+            # Bitmap formats (notably VobSub .sub files) are not always
+            # independently probeable. Inventory/copy must still succeed.
+            info = {"subtitleTracks": []}
+            probe_error = f"ffprobe 无法识别字幕流；原文件仍会保留，不能确认可烧录（{sidecar.suffix.lower()}）"
+        suffix = sidecar.name[len(prefix):]
+        extension = sidecar.suffix.lower()
+        suffix_tags = suffix[:-len(extension)].split(".") if extension else []
+        tracks = []
+        for track in info.get("subtitleTracks", []):
+            entry = dict(track)
+            if entry.get("language") == "und":
+                for token in reversed(suffix_tags):
+                    if re.fullmatch(r"(?i)[a-z]{2,3}(?:-[a-z0-9]{1,8})?", token) and token.casefold() not in {"sdh", "cc", "hi"}:
+                        entry["language"] = token
+                        break
+            entry["default"] = bool(entry.get("default") or any(token.casefold() == "default" for token in suffix_tags))
+            entry["forced"] = bool(entry.get("forced") or any(token.casefold() == "forced" for token in suffix_tags))
+            delivery = subtitle_delivery(entry)
+            entry["sidecarFormat"] = delivery["extension"].lstrip(".")
+            entry["plexCompatibleSidecar"] = delivery["plexCompatible"]
+            tracks.append(entry)
+        stat_result = sidecar.stat()
+        paired_name = None
+        if extension in {".idx", ".sub"}:
+            paired_extension = ".sub" if extension == ".idx" else ".idx"
+            paired = sidecar.with_suffix(paired_extension)
+            if is_safe_file(video_path.parent, paired):
+                paired_name = paired.name
+        record = {
+            "externalOrdinal": len(files),
+            "path": str(sidecar.resolve()),
+            "fileName": sidecar.name,
+            "suffix": suffix,
+            "extension": extension.lstrip("."),
+            "sizeBytes": stat_result.st_size,
+            "mtimeNs": stat_result.st_mtime_ns,
+            "tracks": tracks,
+            "subtitleTrackCount": len(tracks),
+        }
+        if paired_name:
+            record["pairedFileName"] = paired_name
+        if probe_error:
+            record["probeNote"] = probe_error
+        elif not tracks:
+            record["probeNote"] = "未检测到字幕流；原文件仍会保留，不能用 --burn-sidecar 选择"
+        files.append(record)
+    return files
+
+
+def track_inventory_from_info(path: Path, info: dict) -> dict:
+    subtitles = []
+    for track in info.get("subtitleTracks", []):
+        entry = dict(track)
+        delivery = subtitle_delivery(track)
+        entry["sidecarFormat"] = delivery["extension"].lstrip(".")
+        entry["plexCompatibleSidecar"] = delivery["plexCompatible"]
+        if delivery["extension"] == ".mks":
+            entry["note"] = "编码无法直接外挂；转码时将保留为 Matroska .mks 字幕侧车，不保证 Plex 兼容，不进行 OCR"
+        elif str(track.get("codec", "")).casefold() in {"ass", "ssa"} and info.get("attachmentStreams", 0):
+            entry["fontFallbackSidecar"] = True
+        subtitles.append(entry)
+    external_files = info.get("externalSubtitleFiles")
+    if external_files is None:
+        external_files = external_sidecar_files(path)
+    return {
+        "path": str(path.resolve()),
+        "durationSeconds": info["duration"],
+        "audioTracks": info.get("audioTracks", []),
+        "subtitleTracks": subtitles,
+        "externalSubtitleFiles": external_files,
+        "externalSubtitleFileCount": len(external_files),
+        "externalSubtitleTrackCount": sum(len(item.get("tracks", [])) for item in external_files),
+        "audioTrackCount": len(info.get("audioTracks", [])),
+        "subtitleTrackCount": len(subtitles),
+        "attachmentStreams": info.get("attachmentStreams", 0),
+    }
+
+
+def track_inventory(path: Path) -> dict:
+    return track_inventory_from_info(path, ffprobe(path))
+
+
+def command_tracks(args) -> int:
+    path = Path(args.path).expanduser()
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"媒体路径不存在: {path}") from exc
+    if stat.S_ISLNK(path_info.st_mode):
+        raise RuntimeError(f"tracks 不接受符号链接: {path}")
+    if stat.S_ISREG(path_info.st_mode):
+        media_paths = [path]
+    elif stat.S_ISDIR(path_info.st_mode):
+        media_paths = media_files(path)
+    else:
+        raise RuntimeError(f"媒体路径必须是普通文件或目录: {path}")
+    payload = {"path": str(path.resolve()), "files": [track_inventory(item) for item in media_paths]}
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def update_task_state(task_id: str, transform):
+    path = status_file()
+    with json_lock(path):
+        states = read_json(path, {})
+        if task_id not in states:
+            raise RuntimeError(f"任务状态不存在: {task_id}")
+        state = states[task_id]
+        result = transform(state)
+        state["updatedAt"] = now()
+        states[task_id] = state
+        atomic_json(path, states, private=True)
+        return result
+
+
+def validate_sidecar_suffix(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 255
+        or "/" in value
+        or "\\" in value
+        or Path(value).name != value
+        or value in {".", ".."}
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or Path(value).suffix.lower() not in SUBTITLE_EXTS
+    ):
+        raise RuntimeError("--burn-sidecar 必须是 tracks 显示的同名字幕后缀（如 zh.srt），不能包含目录路径")
+    return value
+
+
+def sidecar_burn_record(inventory: dict, suffix: str) -> tuple[dict, dict]:
+    records = inventory.get("externalSubtitleFiles", [])
+    matching = [item for item in records if item.get("suffix") == suffix]
+    video_path = Path(inventory.get("path", "unknown"))
+    if not matching:
+        raise RuntimeError(f"--burn-sidecar {suffix} 未在 {video_path.name} 的轨道清单中找到同名字幕")
+    if len(matching) != 1:
+        raise RuntimeError(f"--burn-sidecar {suffix} 在 {video_path.name} 中匹配到多个外挂字幕，拒绝歧义选择")
+    record = matching[0]
+    expected_name = f"{video_path.stem}.{suffix}"
+    if record.get("fileName") != expected_name:
+        raise RuntimeError(f"--burn-sidecar {suffix} 与 {video_path.name} 的安全同名规则不符")
+    tracks = record.get("tracks", [])
+    if len(tracks) != 1:
+        note = record.get("probeNote") or "字幕流数量不是 1"
+        raise RuntimeError(f"--burn-sidecar {suffix} 不能安全烧录：{note}")
+    track = tracks[0]
+    codec = str(track.get("codec", "unknown")).casefold()
+    if codec not in TEXT_SUBTITLE_CODECS:
+        raise RuntimeError(f"--burn-sidecar {suffix} 的编码 {codec} 是位图/不支持文本字幕；不会 OCR 或忽略该选择")
+    return record, track
+
+
+def resolve_external_sidecar_selection(plan: dict, suffix: str) -> dict:
+    inventory = track_inventory_from_info(plan["source"], plan["sourceInfo"])
+    record, track = sidecar_burn_record(inventory, suffix)
+    source = plan["source"]
+    expected = source.parent / f"{source.stem}.{suffix}"
+    path = Path(record.get("path", ""))
+    try:
+        info = expected.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"--burn-sidecar {suffix} 在转码前已不可用: {expected.name}") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or not is_safe_file(source.parent, expected)
+        or path != expected.resolve()
+        or record.get("fileName") != expected.name
+    ):
+        raise RuntimeError(f"--burn-sidecar {suffix} 必须是源视频邻近、同名且非符号链接的普通文件")
+    if info.st_size != record.get("sizeBytes") or info.st_mtime_ns != record.get("mtimeNs"):
+        raise RuntimeError(f"--burn-sidecar {suffix} 自轨道清单生成后发生变化；为避免烧录错误已拒绝")
+    return {
+        "path": str(path),
+        "fileName": record["fileName"],
+        "suffix": suffix,
+        "subtitleOrdinal": int(track.get("subtitleOrdinal", track.get("ordinal", 0))),
+        "codec": track.get("codec", "unknown"),
+        "sizeBytes": info.st_size,
+        "mtimeNs": info.st_mtime_ns,
+    }
+
+
+def verify_sidecar_snapshot(path: Path, expected_size: int, expected_mtime_ns: int) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"外挂字幕在转码期间已不可用: {path.name}") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or not is_safe_file(path.parent, path):
+        raise RuntimeError(f"外挂字幕在转码期间不再是安全普通文件: {path.name}")
+    if info.st_size != expected_size or info.st_mtime_ns != expected_mtime_ns:
+        raise RuntimeError(f"外挂字幕在转码期间发生变化，已拒绝输出: {path.name}")
+
+
+def validate_review_choice(
+    inventories: list[dict],
+    audio_tracks: list[int] | None,
+    burn_subtitle: int | None,
+    burn_sidecar: str | None,
+) -> None:
+    for inventory in inventories:
+        audio = inventory.get("audioTracks", [])
+        if audio_tracks is not None:
+            invalid = [ordinal for ordinal in audio_tracks if ordinal >= len(audio)]
+            if invalid:
+                raise RuntimeError(f"--audio-tracks 超出 {Path(inventory['path']).name} 的音轨范围 (0-{len(audio) - 1}): {invalid}")
+        if burn_subtitle is not None:
+            subtitles = inventory.get("subtitleTracks", [])
+            if burn_subtitle < 0 or burn_subtitle >= len(subtitles):
+                raise RuntimeError(f"--burn-subtitle 超出 {Path(inventory['path']).name} 的字幕范围 (0-{len(subtitles) - 1}): {burn_subtitle}")
+            codec = str(subtitles[burn_subtitle].get("codec", "unknown")).casefold()
+            if codec not in TEXT_SUBTITLE_CODECS:
+                raise RuntimeError(f"--burn-subtitle {burn_subtitle} 的编码 {codec} 是位图/不支持文本字幕；不会 OCR 或忽略该选择")
+        if burn_sidecar is not None:
+            sidecar_burn_record(inventory, burn_sidecar)
+
+
+def command_choose_tracks(args) -> int:
+    if args.audio_tracks is None and args.burn_subtitle is None and args.burn_sidecar is None:
+        raise RuntimeError("choose-tracks 至少需要 --audio-tracks、--burn-subtitle 或 --burn-sidecar")
+    selected_audio = parse_track_indices(args.audio_tracks, "--audio-tracks") if args.audio_tracks is not None else None
+    if args.burn_subtitle is not None and args.burn_subtitle < 0:
+        raise RuntimeError("--burn-subtitle 必须是非负零基序号")
+    if args.burn_sidecar is not None:
+        validate_sidecar_suffix(args.burn_sidecar)
+
+    def record(state):
+        if state.get("phase") != "track-review":
+            raise RuntimeError(f"任务不在 track-review 阶段，当前阶段: {state.get('phase', 'unknown')}")
+        deadline = float(state.get("trackReviewDeadlineEpoch", 0))
+        if not deadline or time.time() >= deadline:
+            raise RuntimeError("轨道 review 已超时，未提交选择；任务将按默认保留所有音轨、输出全部外挂字幕继续")
+        inventories = state.get("trackInventories", [])
+        validate_review_choice(inventories, selected_audio, args.burn_subtitle, args.burn_sidecar)
+        if args.burn_subtitle is not None or args.burn_sidecar is not None:
+            if str(state.get("profileVideoCodec", "libx264")) == "copy":
+                raise RuntimeError("硬烧字幕不能与 videoCodec=copy 一起使用")
+            if not state.get("trackBurnAvailable", False):
+                raise RuntimeError("硬烧字幕需要带 subtitles/libass 滤镜的 FFmpeg；当前任务使用的 FFmpeg 未提供该滤镜，请安装启用 libass 的构建后重试")
+        decision = state.get("trackDecision") or {}
+        if args.burn_subtitle is not None and decision.get("burnSidecarSuffix") is not None:
+            raise RuntimeError("硬烧内封字幕与外挂字幕互斥；本次 review 已选择 --burn-sidecar")
+        if args.burn_sidecar is not None and decision.get("burnSubtitleOrdinal") is not None:
+            raise RuntimeError("硬烧内封字幕与外挂字幕互斥；本次 review 已选择 --burn-subtitle")
+        if selected_audio is not None:
+            decision["audioOrdinals"] = selected_audio
+        if args.burn_subtitle is not None:
+            decision["burnSubtitleOrdinal"] = args.burn_subtitle
+        if args.burn_sidecar is not None:
+            decision["burnSidecarSuffix"] = args.burn_sidecar
+        decision["receivedAt"] = now()
+        decision["fingerprint"] = state.get("sourceFingerprint")
+        state["trackDecision"] = decision
+        return {"taskId": args.task_id, "accepted": True, "trackDecision": decision}
+
+    print(json.dumps(update_task_state(args.task_id, record), ensure_ascii=False, indent=2))
+    return 0
+
+
+def track_inventories_for_plans(plans: list[dict]) -> list[dict]:
+    return [track_inventory_from_info(plan["source"], plan["sourceInfo"]) for plan in plans]
+
+
+def has_actionable_track_choices(inventories: list[dict]) -> bool:
+    return any(
+        inventory.get("subtitleTracks")
+        or inventory.get("externalSubtitleFiles")
+        or len(inventory.get("audioTracks", [])) > 1
+        for inventory in inventories
+    )
+
+
+def log_track_inventories(ctx: dict, inventories: list[dict]) -> None:
+    for inventory in inventories:
+        labels = []
+        for kind in ("audio", "subtitle"):
+            for track in inventory[f"{kind}Tracks"]:
+                label = f"{kind}#{track['ordinal']} stream={track['streamIndex']} {track['codec']} lang={track['language']}"
+                if track.get("title"):
+                    label += f" title={track['title']}"
+                if track.get("default"):
+                    label += " default"
+                if track.get("forced"):
+                    label += " forced"
+                labels.append(label)
+        for sidecar in inventory.get("externalSubtitleFiles", []):
+            path_label = f"external={sidecar['fileName']} suffix={sidecar['suffix']} path={sidecar['path']}"
+            if sidecar.get("pairedFileName"):
+                path_label += f" paired={sidecar['pairedFileName']}"
+            if sidecar.get("tracks"):
+                for track in sidecar["tracks"]:
+                    label = f"{path_label} {track['codec']} lang={track['language']}"
+                    if track.get("title"):
+                        label += f" title={track['title']}"
+                    if track.get("default"):
+                        label += " default"
+                    if track.get("forced"):
+                        label += " forced"
+                    labels.append(label)
+            else:
+                labels.append(f"{path_label} unprobed/non-burnable: {sidecar.get('probeNote', 'no subtitle stream')}")
+        summary = "; ".join(labels) if labels else "无音轨/字幕轨"
+        log(ctx, f"轨道清单 {Path(inventory['path']).name}: {summary}")
+
+
+def wait_for_track_review(ctx: dict, inventories: list[dict], seconds: int) -> dict | None:
+    if seconds <= 0:
+        return None
+    burn_available = subtitle_filter_available(ctx.get("ffmpegPath"))
+    deadline = time.time() + seconds
+    deadline_at = dt.datetime.fromtimestamp(deadline).astimezone().isoformat(timespec="seconds")
+    status_update(
+        ctx["id"], phase="track-review", currentOperation="track-review",
+        trackInventories=inventories, trackDecision=None, trackDecisionConsumed=False,
+        trackBurnAvailable=burn_available,
+        trackReviewDeadlineEpoch=deadline, trackReviewDeadlineAt=deadline_at,
+    )
+    log(ctx, f"轨道选择窗口开启 {seconds} 秒；可执行 choose-tracks {ctx['id']} 提交选择")
+    decision = None
+    while time.time() < deadline:
+        if STOP_REQUESTED:
+            raise InterruptedError("任务已停止")
+        state = status_read().get(ctx["id"], {})
+        if state.get("phase") != "track-review":
+            raise RuntimeError(f"轨道 review 阶段被意外改变: {state.get('phase', 'unknown')}")
+        decision = state.get("trackDecision")
+        if decision:
+            break
+        time.sleep(min(0.25, max(0, deadline - time.time())))
+
+    # Take the decision and close review under the same lock used by choose-tracks.
+    def consume(state):
+        if state.get("phase") != "track-review":
+            raise RuntimeError(f"轨道 review 阶段被意外改变: {state.get('phase', 'unknown')}")
+        chosen = state.get("trackDecision")
+        if not chosen and time.time() < float(state.get("trackReviewDeadlineEpoch", 0)):
+            raise RuntimeError("轨道 review 尚未结束")
+        state["phase"] = "transcoding"
+        state["currentOperation"] = "transcoding"
+        state["trackReviewCompletedAt"] = now()
+        state["trackDecisionConsumed"] = bool(chosen)
+        return chosen
+
+    return update_task_state(ctx["id"], consume)
+
+
 def command_add_source(args) -> int:
     path = config_file()
     if not path.is_file():
@@ -1831,7 +2197,11 @@ def episode_from_name(path: Path, default_season: int, offset: int = 0) -> tuple
 def ffprobe(path: Path) -> dict:
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type:format=duration,size", "-of", "json", str(path)],
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "format=duration,size:stream=index,codec_type,codec_name,codec_long_name:stream_tags=language,title,handler_name:stream_disposition",
+                "-of", "json", str(path),
+            ],
             capture_output=True, text=True, timeout=60,
         )
     except subprocess.TimeoutExpired as exc:
@@ -1841,6 +2211,32 @@ def ffprobe(path: Path) -> dict:
     data = json.loads(result.stdout or "{}")
     streams = data.get("streams", [])
     duration = float((data.get("format") or {}).get("duration") or 0)
+    tracks = {"audio": [], "subtitle": []}
+    for stream in sorted(streams, key=lambda item: int(item.get("index", 0))):
+        kind = stream.get("codec_type")
+        if kind not in tracks:
+            continue
+        ordinal = len(tracks[kind])
+        tags = stream.get("tags") or {}
+        disposition = stream.get("disposition") or {}
+        handler_name = tags.get("handler_name") or None
+        title = tags.get("title") or None
+        if not title and handler_name and str(handler_name).strip().casefold() not in {"soundhandler", "videohandler", "datahandler", "subtitlehandler"}:
+            title = handler_name
+        record = {
+            "streamIndex": int(stream.get("index", -1)),
+            "ordinal": ordinal,
+            "codec": stream.get("codec_name") or "unknown",
+            "codecLongName": stream.get("codec_long_name") or None,
+            "language": tags.get("language") or "und",
+            "title": title,
+            "handlerName": handler_name,
+            "default": bool(int(disposition.get("default", 0) or 0)),
+            "forced": bool(int(disposition.get("forced", 0) or 0)),
+            "dispositions": sorted(key for key, value in disposition.items() if bool(int(value or 0))),
+        }
+        record["audioOrdinal" if kind == "audio" else "subtitleOrdinal"] = ordinal
+        tracks[kind].append(record)
     return {
         "duration": duration,
         "hasVideo": any(item.get("codec_type") == "video" for item in streams),
@@ -1849,6 +2245,8 @@ def ffprobe(path: Path) -> dict:
         "audioStreams": sum(item.get("codec_type") == "audio" for item in streams),
         "subtitleStreams": sum(item.get("codec_type") == "subtitle" for item in streams),
         "attachmentStreams": sum(item.get("codec_type") == "attachment" for item in streams),
+        "audioTracks": tracks["audio"],
+        "subtitleTracks": tracks["subtitle"],
     }
 
 
@@ -1882,6 +2280,7 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
     seen_episodes = set()
     for position, source in enumerate(sources, start=ctx["args"].episode or 1):
         source_info = validate_video(source, minimum)
+        source_info["externalSubtitleFiles"] = external_sidecar_files(source)
         fields = {**ctx["namingFields"], "ext": source.suffix.lower().lstrip(".")} if ctx["args"].copy_original else ctx["namingFields"]
         if media_type == "movie":
             if len(sources) != 1:
@@ -1921,7 +2320,154 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
             "relative": relative, "season": season, "episode": episode,
             "episodeTitle": episode_title if media_type == "tv" else None,
         })
+    validate_sidecar_output_names(plans, ctx.get("outputRoot"))
     return plans
+
+
+def validate_sidecar_output_names(plans: list[dict], output_root: Path | None) -> None:
+    name_max = 255
+    if output_root is not None and Path(output_root).is_dir():
+        try:
+            name_max = int(os.pathconf(output_root, "PC_NAME_MAX"))
+        except (OSError, ValueError):
+            pass
+    for plan in plans:
+        source = plan["source"]
+        output = Path(plan["relative"])
+        for record in plan["sourceInfo"].get("externalSubtitleFiles", []):
+            file_name = record.get("fileName", "")
+            extension = Path(file_name).suffix.lower()
+            if not extension:
+                continue
+            prefix = f"{source.stem}."
+            if not file_name.startswith(prefix):
+                raise RuntimeError(f"外挂字幕不符合源视频同名规则，拒绝复制: {file_name}")
+            # Match copy_sidecars exactly: the copied tag starts at source.stem,
+            # so it includes the separator dot (if a language/tag is present).
+            tag = file_name[len(source.stem):-len(Path(file_name).suffix)]
+            target_name = f"{output.stem}{tag}{extension}"
+            if len(target_name.encode("utf-8")) > name_max:
+                raise RuntimeError(
+                    f"重命名后的外挂字幕文件名超过目标文件系统限制 ({name_max} 字节): {target_name[:64]}…"
+                )
+
+
+def parse_track_indices(value: str, label: str) -> list[int]:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{label} 必须是逗号分隔的零基序号")
+    result = []
+    for item in value.split(","):
+        token = item.strip()
+        if not re.fullmatch(r"[0-9]+", token):
+            raise RuntimeError(f"{label} 序号无效: {item!r}")
+        ordinal = int(token)
+        if ordinal in result:
+            raise RuntimeError(f"{label} 不得包含重复序号: {ordinal}")
+        result.append(ordinal)
+    return result
+
+
+def ffmpeg_binary() -> str:
+    configured = os.environ.get("MEDIA_DOWNLOADER_FFMPEG")
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+            raise RuntimeError("MEDIA_DOWNLOADER_FFMPEG 必须是存在且可执行的绝对路径")
+        return str(path)
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def selected_audio_ordinals(ctx: dict, stream_counts: dict | None) -> list[int] | None:
+    selected = ctx.get("audioTrackSelection")
+    if selected is not None:
+        return list(selected)
+    if stream_counts is None:
+        return None
+    return list(range(int(stream_counts.get("audioStreams", 0))))
+
+
+def subtitle_filter_available(binary: str | None = None) -> bool:
+    try:
+        result = subprocess.run(
+            [binary or ffmpeg_binary(), "-hide_banner", "-filters"], capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and bool(re.search(r"(?m)^\s*[.A-Z]{3}\s+subtitles\s+", result.stdout))
+
+
+def validate_track_options(ctx: dict, plans: list[dict]) -> None:
+    args = ctx["args"]
+    raw_audio = getattr(args, "audio_tracks", None)
+    selected_audio = parse_track_indices(raw_audio, "--audio-tracks") if raw_audio is not None else None
+    burn_ordinal = getattr(args, "burn_subtitle", None)
+    burn_sidecar = getattr(args, "burn_sidecar", None)
+    if burn_ordinal is not None and burn_sidecar is not None:
+        raise RuntimeError("--burn-subtitle 与 --burn-sidecar 互斥")
+    if getattr(args, "copy_original", False) and (raw_audio is not None or burn_ordinal is not None or burn_sidecar is not None):
+        raise RuntimeError("--audio-tracks/--burn-subtitle/--burn-sidecar 只适用于转码模式")
+    if burn_sidecar is not None:
+        validate_sidecar_suffix(burn_sidecar)
+    if burn_ordinal is not None or burn_sidecar is not None:
+        if str(ctx["profile"].get("videoCodec", "libx264")) == "copy":
+            raise RuntimeError("硬烧字幕不能与 videoCodec=copy 一起使用")
+    sidecar_selections = {}
+    for plan in plans:
+        info = plan["sourceInfo"]
+        tracks = info.get("audioTracks", [])
+        if selected_audio is not None:
+            if not selected_audio:
+                raise RuntimeError("--audio-tracks 至少需要一个音轨序号")
+            invalid = [item for item in selected_audio if item >= len(tracks)]
+            if invalid:
+                raise RuntimeError(f"--audio-tracks 超出 {plan['source'].name} 的音轨范围 (0-{len(tracks) - 1}): {invalid}")
+        subtitles = info.get("subtitleTracks", [])
+        if burn_ordinal is not None:
+            if isinstance(burn_ordinal, bool) or int(burn_ordinal) < 0 or int(burn_ordinal) >= len(subtitles):
+                raise RuntimeError(f"--burn-subtitle 超出 {plan['source'].name} 的字幕范围 (0-{len(subtitles) - 1}): {burn_ordinal}")
+            track = subtitles[int(burn_ordinal)]
+            if str(track.get("codec", "unknown")).casefold() not in TEXT_SUBTITLE_CODECS:
+                raise RuntimeError(
+                    f"--burn-subtitle {burn_ordinal} 的编码 {track.get('codec')} 是位图/不支持文本字幕；不会 OCR 或忽略该选择"
+                )
+        if burn_sidecar is not None:
+            selection = resolve_external_sidecar_selection(plan, burn_sidecar)
+            sidecar_selections[str(plan["source"].resolve())] = selection
+    if (burn_ordinal is not None or burn_sidecar is not None) and not subtitle_filter_available(ctx.get("ffmpegPath")):
+        raise RuntimeError("硬烧字幕需要带 subtitles/libass 滤镜的 FFmpeg；当前 FFmpeg 未提供该滤镜，请安装启用 libass 的构建后重试")
+    ctx["audioTrackSelection"] = selected_audio
+    ctx["externalSubtitleSelections"] = sidecar_selections
+
+
+def resumable_track_decision(
+    previous_state: dict,
+    current_fingerprint: str,
+    *,
+    reset_work: bool,
+    audio_tracks: str | None,
+    burn_subtitle: int | None,
+    burn_sidecar: str | None,
+    review_seconds: int,
+) -> dict | None:
+    decision = previous_state.get("trackDecision") or {}
+    phase = previous_state.get("phase")
+    if reset_work:
+        return None
+    if phase in {"failed", "stopped"} and decision.get("fingerprint") == current_fingerprint:
+        return decision
+    has_explicit_selection = audio_tracks is not None or burn_subtitle is not None or burn_sidecar is not None
+    if decision and phase not in {"done", "failed", "stopped"} and not has_explicit_selection and not review_seconds:
+        raise RuntimeError(
+            "发现未完成任务中已提交但未确认应用的轨道选择；为避免静默丢失，请显式传入 --audio-tracks/--burn-subtitle/--burn-sidecar、"
+            "开启 --track-review-seconds 重新选择，或确认后使用 --reset-work"
+        )
+    return None
+
+
+def escape_filter_option(value: str) -> str:
+    """Escape one filter option value, then the enclosing filtergraph syntax."""
+    option = "".join("\\" + char if char in "\\':" else char for char in value)
+    return "".join("\\" + char if char in "\\'[],;" else char for char in option)
 
 
 def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | None = None) -> list[str]:
@@ -1929,9 +2475,16 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | 
     codec = str(profile.get("videoCodec", "libx264"))
     audio_codec = str(profile.get("audioCodec", "aac"))
     # -nostats：进度统计未被解析，只会淹没任务日志；结束摘要与错误仍保留在 -hide_banner 之外。
-    command = ["ffmpeg", "-hide_banner", "-nostats", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-dn"]
+    audio_ordinals = selected_audio_ordinals(ctx, stream_counts)
+    command = [ffmpeg_binary(), "-hide_banner", "-nostats", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0"]
+    if audio_ordinals is None:
+        command += ["-map", "0:a?"]
+    else:
+        for ordinal in audio_ordinals:
+            command += ["-map", f"0:a:{ordinal}"]
+    command += ["-dn"]
     if profile["container"] == "mkv":
-        # MKV 支持字幕流原样保留（不重编码）；MP4 兼容性差，继续丢弃内嵌字幕。
+        # MKV 支持字幕流原样保留（不重编码）；旁边仍会为所有来源字幕建立外挂副本。
         command += ["-map", "0:s?", "-c:s", "copy"]
     else:
         command += ["-sn"]
@@ -1939,7 +2492,20 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | 
         command += ["-c:v", "copy"]
     else:
         resolution = int(profile.get("resolution", 1080))
-        command += ["-vf", f"scale=-2:min(ih\\,{resolution})", "-c:v", codec]
+        filters = []
+        burn_ordinal = getattr(ctx.get("args"), "burn_subtitle", None)
+        sidecar_selections = ctx.get("externalSubtitleSelections", {})
+        sidecar_selection = sidecar_selections.get(str(source.resolve()))
+        if burn_ordinal is not None and sidecar_selection is not None:
+            raise RuntimeError("内封字幕与外挂字幕硬烧配置互斥")
+        if burn_ordinal is not None:
+            filters.append(f"subtitles=filename={escape_filter_option(str(source))}:si={int(burn_ordinal)}")
+        if sidecar_selection is not None:
+            filters.append(
+                f"subtitles=filename={escape_filter_option(sidecar_selection['path'])}:si={int(sidecar_selection['subtitleOrdinal'])}"
+            )
+        filters.append(f"scale=-2:min(ih\\,{resolution})")
+        command += ["-vf", ",".join(filters), "-c:v", codec]
         if profile.get("preset"):
             command += ["-preset", str(profile["preset"])]
         if profile.get("crf") is not None:
@@ -1951,15 +2517,28 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | 
         command += ["-b:a", str(profile["audioBitrate"])]
     command += ["-map_metadata", "-1", "-map_chapters", "-1"]
     counts = stream_counts or {}
-    for kind, key in (("v", "videoStreams"), ("a", "audioStreams")):
-        mapped = min(int(counts.get(key, 0)), 1) if kind == "v" else int(counts.get(key, 0))
-        for index in range(mapped):
-            command += [f"-map_metadata:s:{kind}:{index}", f"0:s:{kind}:{index}"]
+    for index in range(min(int(counts.get("videoStreams", 0)), 1)):
+        command += [f"-map_metadata:s:v:{index}", f"0:s:v:{index}"]
+    for output_index, input_ordinal in enumerate(audio_ordinals or []):
+        command += [f"-map_metadata:s:a:{output_index}", f"0:s:a:{input_ordinal}"]
+        audio_tracks = counts.get("audioTracks", [])
+        if input_ordinal < len(audio_tracks):
+            audio_track = audio_tracks[input_ordinal]
+            dispositions = audio_tracks[input_ordinal].get("dispositions", [])
+            command += [f"-disposition:a:{output_index}", "+".join(dispositions) if dispositions else "0"]
+            if profile["container"] == "mp4":
+                display_label = audio_track.get("title") or audio_track.get("handlerName")
+                if display_label and str(display_label).strip().casefold() not in {"soundhandler", "videohandler", "datahandler", "subtitlehandler"}:
+                    command += [f"-metadata:s:a:{output_index}", f"handler_name={display_label}"]
     if profile["container"] == "mkv":
         if int(counts.get("attachmentStreams", 0)):
             command += ["-map", "0:t?", "-c:t", "copy"]
         for index in range(int(counts.get("subtitleStreams", 0))):
             command += [f"-map_metadata:s:s:{index}", f"0:s:s:{index}"]
+            subtitle_tracks = counts.get("subtitleTracks", [])
+            if index < len(subtitle_tracks):
+                dispositions = subtitle_tracks[index].get("dispositions", [])
+                command += [f"-disposition:s:{index}", "+".join(dispositions) if dispositions else "0"]
         for index in range(int(counts.get("attachmentStreams", 0))):
             command += [f"-map_metadata:s:t:{index}", f"0:s:t:{index}"]
     if profile["container"] == "mp4":
@@ -1968,26 +2547,174 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | 
     return command
 
 
-def validate_preserved_streams(source_info: dict, output_info: dict, container: str) -> None:
-    required = [("audioStreams", "音频")]
+def validate_preserved_streams(
+    source_info: dict,
+    output_info: dict,
+    container: str,
+    expected_audio_streams: int | None = None,
+) -> None:
+    expected_audio_streams = int(source_info.get("audioStreams", 0)) if expected_audio_streams is None else expected_audio_streams
+    if int(output_info.get("audioStreams", 0)) != expected_audio_streams:
+        raise RuntimeError(f"转码输出音频流数量不符: 期望 {expected_audio_streams}，实际 {output_info.get('audioStreams', 0)}")
     if container == "mkv":
-        required += [("subtitleStreams", "字幕"), ("attachmentStreams", "附件")]
-    for key, label in required:
-        if int(output_info.get(key, 0)) < int(source_info.get(key, 0)):
-            raise RuntimeError(f"转码输出缺少{label}流")
+        for key, label in (("subtitleStreams", "字幕"), ("attachmentStreams", "附件")):
+            if int(output_info.get(key, 0)) != int(source_info.get(key, 0)):
+                raise RuntimeError(f"转码输出{label}流数量不符: 期望 {source_info.get(key, 0)}，实际 {output_info.get(key, 0)}")
+    elif int(output_info.get("subtitleStreams", 0)):
+        raise RuntimeError("MP4 输出不应包含内嵌字幕；字幕应保留为外挂文件")
 
 
-def copy_sidecars(plan: dict) -> None:
+def safe_track_token(value: str | None) -> str:
+    token = re.sub(r"[^A-Za-z0-9_-]", "-", str(value or "und"))
+    token = re.sub(r"-+", "-", token).strip("-_") or "und"
+    return token[:12]
+
+
+def subtitle_delivery(track: dict) -> dict:
+    codec = str(track.get("codec", "unknown")).casefold()
+    if codec == "subrip":
+        return {"extension": ".srt", "codec": "copy", "plexCompatible": True}
+    if codec in {"ass", "ssa"}:
+        return {"extension": ".ass", "codec": "copy", "plexCompatible": True}
+    if codec == "mov_text":
+        return {"extension": ".srt", "codec": "srt", "plexCompatible": True}
+    if codec == "webvtt":
+        return {"extension": ".vtt", "codec": "copy", "plexCompatible": True}
+    return {"extension": ".mks", "codec": "copy", "plexCompatible": False}
+
+
+def embedded_subtitle_path(output: Path, track: dict, *, font_fallback: bool = False) -> Path:
+    ordinal = int(track.get("subtitleOrdinal", track.get("ordinal", 0)))
+    parts = [output.stem, f"subtitle-{ordinal:02d}"]
+    if track.get("default"):
+        parts.append("default")
+    if font_fallback:
+        parts.append("fonts")
+    parts.append(safe_track_token(track.get("language")))
+    if track.get("forced"):
+        parts.append("forced")
+    delivery = subtitle_delivery(track)
+    return output.with_name(".".join(parts) + delivery["extension"])
+
+
+def unique_partial_path(target: Path) -> Path:
+    descriptor, name = tempfile.mkstemp(prefix=".subtitle-partial-", suffix=target.suffix, dir=target.parent)
+    os.close(descriptor)
+    temp = Path(name)
+    temp.unlink()
+    return temp
+
+
+def install_no_clobber(temp: Path, target: Path) -> None:
+    try:
+        os.link(temp, target)
+    except FileExistsError as exc:
+        raise RuntimeError(f"外挂字幕目标已存在，拒绝覆盖: {target}") from exc
+    except OSError as exc:
+        if exc.errno not in {errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}:
+            raise
+        atomic_copy(temp, target, 0)
+    temp.unlink()
+
+
+def embedded_subtitle_command(source: Path, target: Path, track: dict, attachment_streams: int, *, font_fallback: bool = False) -> list[str]:
+    ordinal = int(track.get("subtitleOrdinal", track.get("ordinal", 0)))
+    delivery = subtitle_delivery(track)
+    command = [ffmpeg_binary(), "-hide_banner", "-nostats", "-nostdin", "-n", "-i", str(source), "-map", f"0:s:{ordinal}"]
+    if font_fallback or delivery["extension"] == ".mks":
+        command += ["-c:s", "copy"]
+        if attachment_streams:
+            command += ["-map", "0:t?", "-c:t", "copy"]
+            command += ["-map_metadata:s:s:0", f"0:s:s:{ordinal}"]
+            for index in range(attachment_streams):
+                command += [f"-map_metadata:s:t:{index}", f"0:s:t:{index}"]
+    else:
+        command += ["-c:s", delivery["codec"], "-map_metadata:s:s:0", f"0:s:s:{ordinal}"]
+    command += ["-map_metadata", "-1", "-map_chapters", "-1"]
+    if target.suffix.lower() == ".mks":
+        command += ["-f", "matroska"]
+    command.append(str(target))
+    return command
+
+
+def extract_embedded_subtitles(ctx: dict, plan: dict) -> list[Path]:
     output = plan["output"]
+    source_info = plan["sourceInfo"]
+    tracks = source_info.get("subtitleTracks", [])
+    result = []
+    for track in tracks:
+        has_fonts = str(track.get("codec", "")).casefold() in {"ass", "ssa"} and int(source_info.get("attachmentStreams", 0)) > 0
+        sidecar_paths = [(embedded_subtitle_path(output, track), False)]
+        if has_fonts:
+            sidecar_paths.append((embedded_subtitle_path(output, track, font_fallback=True).with_suffix(".mks"), True))
+        for target, font_fallback in sidecar_paths:
+            reuse_existing = os.path.lexists(target)
+            if reuse_existing and (target.is_symlink() or not target.is_file()):
+                raise RuntimeError(f"外挂字幕目标已存在但不是普通文件，拒绝覆盖: {target}")
+            temp = unique_partial_path(target)
+            ordinal = int(track.get("subtitleOrdinal", track.get("ordinal", 0)))
+            operation = f"提取字幕 {ordinal} ({track.get('codec', 'unknown')})"
+            log(ctx, f"{operation}: {plan['source'].name} -> {target.name}")
+            run_child(
+                ctx,
+                embedded_subtitle_command(plan["source"], temp, track, int(source_info.get("attachmentStreams", 0)), font_fallback=font_fallback),
+                operation,
+                task_timeout_seconds(ctx["config"]),
+            )
+            if not temp.is_file() or temp.stat().st_size <= 0:
+                raise RuntimeError(f"字幕提取输出为空: {target.name}")
+            sidecar_info = ffprobe(temp)
+            expected_attachments = int(source_info.get("attachmentStreams", 0)) if font_fallback or subtitle_delivery(track)["extension"] == ".mks" else 0
+            if int(sidecar_info.get("subtitleStreams", 0)) != 1 or int(sidecar_info.get("attachmentStreams", 0)) != expected_attachments:
+                raise RuntimeError(f"字幕侧车校验失败: {target.name}")
+            if reuse_existing:
+                if file_digest(temp) != file_digest(target):
+                    raise RuntimeError(f"已有外挂字幕与本次提取结果不同，拒绝覆盖: {target}")
+                temp.unlink()
+            else:
+                install_no_clobber(temp, target)
+            result.append(target)
+    return result
+
+
+def copy_sidecars(plan: dict) -> list[str]:
+    output = plan["output"]
+    copied = []
+    snapshots = {item["fileName"]: item for item in plan.get("sourceInfo", {}).get("externalSubtitleFiles", [])}
+    copied_names = set()
     for sidecar in plan["source"].parent.iterdir():
         if not sidecar.name.startswith(f"{plan['source'].stem}.") or not is_safe_file(plan["source"].parent, sidecar) or sidecar.suffix.lower() not in SUBTITLE_EXTS:
             continue
+        snapshot = snapshots.get(sidecar.name)
+        if snapshot is None:
+            raise RuntimeError(f"来源外挂字幕在轨道清单生成后新增，拒绝静默遗漏: {sidecar.name}")
+        verify_sidecar_snapshot(sidecar, int(snapshot["sizeBytes"]), int(snapshot["mtimeNs"]))
         tag = sidecar.name[len(plan["source"].stem):-len(sidecar.suffix)]
-        shutil.copy2(sidecar, output.with_name(f"{output.stem}{tag}{sidecar.suffix.lower()}"))
+        target = output.with_name(f"{output.stem}{tag}{sidecar.suffix.lower()}")
+        if os.path.lexists(target):
+            if target.is_symlink() or not target.is_file() or file_digest(sidecar) != file_digest(target):
+                raise RuntimeError(f"外挂字幕目标已存在且内容不同，拒绝覆盖: {target}")
+            verify_sidecar_snapshot(sidecar, int(snapshot["sizeBytes"]), int(snapshot["mtimeNs"]))
+            copied.append(str(target))
+            copied_names.add(sidecar.name)
+            continue
+        temp = unique_partial_path(target)
+        shutil.copy2(sidecar, temp)
+        install_no_clobber(temp, target)
+        if file_digest(sidecar) != file_digest(target):
+            raise RuntimeError(f"外挂字幕复制校验失败: {sidecar.name}")
+        verify_sidecar_snapshot(sidecar, int(snapshot["sizeBytes"]), int(snapshot["mtimeNs"]))
+        copied.append(str(target))
+        copied_names.add(sidecar.name)
+    missing = sorted(set(snapshots) - copied_names)
+    if missing:
+        raise RuntimeError(f"来源外挂字幕在轨道清单生成后消失，拒绝静默遗漏: {', '.join(missing)}")
+    return copied
 
 
 def transcode(ctx: dict, plans: list[dict]) -> None:
     minimum = float(ctx["config"].get("minMediaDurationSeconds", 120))
+    subtitle_sidecars = []
     for plan in plans:
         require_mounted_volume(ctx["baseRoot"], "工作目录")
         output = ctx["outputRoot"] / plan["relative"]
@@ -1997,13 +2724,22 @@ def transcode(ctx: dict, plans: list[dict]) -> None:
         status_update(ctx["id"], phase="transcoding", currentFile=plan["source"].name)
         log(ctx, f"转码: {plan['source'].name} -> {plan['relative']}")
         run_child(ctx, ffmpeg_command(ctx, plan["source"], temp, plan["sourceInfo"]), "transcoding", task_timeout_seconds(ctx["config"]))
+        selection = ctx.get("externalSubtitleSelections", {}).get(str(plan["source"].resolve()))
+        if selection:
+            try:
+                verify_sidecar_snapshot(Path(selection["path"]), int(selection["sizeBytes"]), int(selection["mtimeNs"]))
+            except RuntimeError:
+                temp.unlink(missing_ok=True)
+                raise
         source_stat = plan["source"].stat()
         if source_stat.st_size != plan["sourceSize"] or source_stat.st_mtime_ns != plan["sourceMtimeNs"]:
             temp.unlink(missing_ok=True)
             raise RuntimeError(f"转码期间来源仍在变化: {plan['source'].name}")
         output_info = validate_video(temp, minimum)
         try:
-            validate_preserved_streams(plan["sourceInfo"], output_info, ctx["profile"]["container"])
+            expected_audio = ctx.get("audioTrackSelection")
+            expected_audio_count = len(expected_audio) if expected_audio is not None else int(plan["sourceInfo"].get("audioStreams", 0))
+            validate_preserved_streams(plan["sourceInfo"], output_info, ctx["profile"]["container"], expected_audio_count)
         except RuntimeError:
             temp.unlink(missing_ok=True)
             raise
@@ -2013,7 +2749,13 @@ def transcode(ctx: dict, plans: list[dict]) -> None:
             raise RuntimeError(f"转码输出疑似截断: {plan['source'].name}")
         os.replace(temp, output)
         plan["output"] = output
-        copy_sidecars(plan)
+        subtitle_sidecars.extend(copy_sidecars(plan))
+        plan["embeddedSubtitleSidecars"] = [str(path) for path in extract_embedded_subtitles(ctx, plan)]
+        subtitle_sidecars.extend(plan["embeddedSubtitleSidecars"])
+        status_update(ctx["id"], subtitleSidecars=subtitle_sidecars)
+        source_stat = plan["source"].stat()
+        if source_stat.st_size != plan["sourceSize"] or source_stat.st_mtime_ns != plan["sourceMtimeNs"]:
+            raise RuntimeError(f"转码期间来源仍在变化: {plan['source'].name}")
 
 
 def organize(ctx: dict, plans: list[dict]) -> None:
@@ -2171,7 +2913,7 @@ def download_image(source: str, destination: Path, ctx: dict) -> None:
     try:
         run_child(
             ctx,
-            ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", str(source_path), "-frames:v", "1", str(temp_destination)],
+            [ffmpeg_binary(), "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", str(source_path), "-frames:v", "1", str(temp_destination)],
             "metadata",
             60,
         )
@@ -2523,7 +3265,7 @@ def existing_matches(source: Path, target: Path, minimum_duration: float) -> boo
 def atomic_copy(source: Path, target: Path, minimum_duration: float) -> None:
     if target.parent.is_symlink() or not target.parent.is_dir():
         raise RuntimeError(f"归档目录不可用: {target.parent}")
-    descriptor, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".partial", dir=target.parent)
+    descriptor, temp_name = tempfile.mkstemp(prefix=".media-copy-", suffix=".partial", dir=target.parent)
     temp = Path(temp_name)
     try:
         with open(source, "rb") as src, os.fdopen(descriptor, "wb") as dst:
@@ -2703,8 +3445,27 @@ def pipeline(args) -> int:
         args.no_archive = True
     if args.copy_original is None:
         args.copy_original = config.get("defaultModes", {}).get(args.media_type, "transcode") == "organize"
+    if not 0 <= args.track_review_seconds <= 300:
+        raise RuntimeError("--track-review-seconds 必须在 0-300 秒之间")
+    if args.audio_tracks is not None:
+        parse_track_indices(args.audio_tracks, "--audio-tracks")
+    if args.burn_subtitle is not None and args.burn_subtitle < 0:
+        raise RuntimeError("--burn-subtitle 必须是非负零基序号")
+    if args.burn_sidecar is not None:
+        validate_sidecar_suffix(args.burn_sidecar)
+    if args.burn_subtitle is not None and args.burn_sidecar is not None:
+        raise RuntimeError("--burn-subtitle 与 --burn-sidecar 互斥")
+    if args.copy_original and (args.audio_tracks is not None or args.burn_subtitle is not None or args.burn_sidecar is not None or args.track_review_seconds):
+        raise RuntimeError("--audio-tracks/--burn-subtitle/--burn-sidecar/--track-review-seconds 只适用于转码模式")
     source, requested_downloader = resolve_source(args)
     ctx = build_context(config, args, source)
+    selected_ffmpeg = ffmpeg_binary()
+    ctx["ffmpegPath"] = selected_ffmpeg
+    if args.burn_subtitle is not None or args.burn_sidecar is not None:
+        if str(ctx["profile"].get("videoCodec", "libx264")) == "copy":
+            raise RuntimeError("硬烧字幕不能与 videoCodec=copy 一起使用")
+        if not subtitle_filter_available(selected_ffmpeg):
+            raise RuntimeError("硬烧字幕需要带 subtitles/libass 滤镜的 FFmpeg；当前 FFmpeg 未提供该滤镜，请安装启用 libass 的构建后重试")
     downloader = classify_downloader(source, requested_downloader)
     if args.playlist and args.media_type != "tv":
         raise RuntimeError("--playlist 必须使用 --type tv，才能按播放顺序映射季集")
@@ -2728,6 +3489,10 @@ def pipeline(args) -> int:
         "format": args.format or "best available",
         "subs": bool(args.write_subs),
         "subtitleLanguages": selected_subtitles,
+        "burnSubtitleOrdinal": args.burn_subtitle,
+        "burnSidecarSuffix": args.burn_sidecar,
+        "audioTrackOrdinals": parse_track_indices(args.audio_tracks, "--audio-tracks") if args.audio_tracks is not None else None,
+        "trackReviewSeconds": args.track_review_seconds,
         "authenticated": bool(args.cookies),
         "downloadRetries": int(config.get("downloadRetries", 3)),
         "downloader": downloader,
@@ -2736,19 +3501,70 @@ def pipeline(args) -> int:
     if args.dry_run:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
+    source_fingerprint_value = source_fingerprint(ctx, source)
     with task_lock(ctx):
         ensure_work(ctx, source)
+        previous_state = status_read().get(ctx["id"], {})
+        previous_decision = resumable_track_decision(
+            previous_state, source_fingerprint_value,
+            reset_work=args.reset_work, audio_tracks=args.audio_tracks,
+            burn_subtitle=args.burn_subtitle, burn_sidecar=args.burn_sidecar,
+            review_seconds=args.track_review_seconds,
+        )
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
         status_update(
-            ctx["id"], **plan, phase="starting", pid=os.getpid(), childPid=None,
+            ctx["id"], **plan, phase="starting", pid=os.getpid(), childPid=None, childExecutable=None,
             currentOperation="starting", currentFile="", startedAt=now(), finishedAt=None,
             lastError="", archivedFiles=[], logPath=str(ctx["logPath"]), workPath=str(ctx["workRoot"]),
+            sourceFingerprint=source_fingerprint_value,
+            trackDecision=previous_decision,
+            trackDecisionConsumed=bool(previous_decision and previous_state.get("trackDecisionConsumed")),
+            subtitleSidecars=[], audioTrackMode="all",
+            trackInventories=[], trackReviewDeadlineEpoch=None, trackReviewDeadlineAt=None,
+            trackReviewCompletedAt=None, ffmpegPath=selected_ffmpeg,
+            profileVideoCodec=str(ctx["profile"].get("videoCodec", "libx264")),
         )
         try:
             sources = acquire(ctx, source, requested_downloader)
             ensure_required_artwork(ctx, source)
             plans = planned_outputs(ctx, sources)
+            inventories = track_inventories_for_plans(plans)
+            status_update(ctx["id"], phase="track-inventory", currentOperation="track-inventory", trackInventories=inventories)
+            log_track_inventories(ctx, inventories)
+
+            prior_state = status_read().get(ctx["id"], {})
+            saved_decision = prior_state.get("trackDecision") or {}
+            if saved_decision and saved_decision.get("fingerprint") == source_fingerprint_value:
+                if saved_decision.get("audioOrdinals") is not None:
+                    args.audio_tracks = ",".join(str(value) for value in saved_decision["audioOrdinals"])
+                if saved_decision.get("burnSubtitleOrdinal") is not None:
+                    args.burn_subtitle = int(saved_decision["burnSubtitleOrdinal"])
+                if saved_decision.get("burnSidecarSuffix") is not None:
+                    args.burn_sidecar = str(saved_decision["burnSidecarSuffix"])
+                log(ctx, "恢复已提交的轨道选择")
+            elif args.track_review_seconds and args.audio_tracks is None and args.burn_subtitle is None and args.burn_sidecar is None:
+                if has_actionable_track_choices(inventories):
+                    decision = wait_for_track_review(ctx, inventories, args.track_review_seconds)
+                    if decision:
+                        if decision.get("audioOrdinals") is not None:
+                            args.audio_tracks = ",".join(str(value) for value in decision["audioOrdinals"])
+                        if decision.get("burnSubtitleOrdinal") is not None:
+                            args.burn_subtitle = int(decision["burnSubtitleOrdinal"])
+                        if decision.get("burnSidecarSuffix") is not None:
+                            args.burn_sidecar = str(decision["burnSidecarSuffix"])
+                        log(ctx, "已接受轨道 review 选择")
+                    else:
+                        log(ctx, "轨道 review 超时；按默认全音轨、保留全部外挂字幕继续")
+                else:
+                    log(ctx, "没有需要选择的多音轨或字幕轨，跳过轨道 review")
+            validate_track_options(ctx, plans)
+            selected_audio = ctx.get("audioTrackSelection")
+            status_update(
+                ctx["id"], burnSubtitleOrdinal=args.burn_subtitle, burnSidecarSuffix=args.burn_sidecar,
+                audioTrackOrdinals=selected_audio,
+                audioTrackMode="unchanged" if args.copy_original else ("selected" if selected_audio is not None else "all"),
+            )
             (organize if args.copy_original else transcode)(ctx, plans)
             status_update(ctx["id"], phase="metadata", currentOperation="metadata", currentFile="")
             write_nfo(ctx, plans)
@@ -2767,6 +3583,10 @@ def pipeline(args) -> int:
             else:
                 status_update(ctx["id"], phase="archiving", currentOperation="archiving")
                 archived = archive(ctx)
+            status_update(
+                ctx["id"],
+                subtitleSidecars=[path for path in archived if Path(path).suffix.lower() in SUBTITLE_EXTS],
+            )
             # no-archive 配了 downloadDir 时成品已移走，工作区（含下载缓存）也可安全清理
             if not args.keep_work and (not args.no_archive or ctx["downloadRoot"] is not None):
                 remove_owned_work(ctx)
@@ -2774,11 +3594,11 @@ def pipeline(args) -> int:
             log(ctx, f"完成: {ctx['canonical']}")
             return 0
         except InterruptedError as exc:
-            status_update(ctx["id"], phase="stopped", currentOperation="stopped", lastError=str(exc), pid=None, childPid=None, finishedAt=now())
+            status_update(ctx["id"], phase="stopped", currentOperation="stopped", lastError=str(exc), pid=None, childPid=None, childExecutable=None, finishedAt=now())
             log(ctx, str(exc))
             return 130
         except Exception as exc:
-            status_update(ctx["id"], phase="failed", currentOperation="failed", lastError=str(exc), pid=None, childPid=None, finishedAt=now())
+            status_update(ctx["id"], phase="failed", currentOperation="failed", lastError=str(exc), pid=None, childPid=None, childExecutable=None, finishedAt=now())
             log(ctx, f"失败: {exc}")
             raise
 
@@ -2804,7 +3624,9 @@ def command_check(args) -> int:
         process_title = str(state.get("requestedTitle") or state.get("title", ""))
         pid, child_pid = state.get("pid"), state.get("childPid")
         parent_running = isinstance(pid, int) and process_matches(pid, process_title)
-        child_running = isinstance(child_pid, int) and bool(state.get("workPath")) and owned_child_matches(child_pid, str(state["workPath"]))
+        child_running = isinstance(child_pid, int) and bool(state.get("workPath")) and owned_child_matches(
+            child_pid, str(state["workPath"]), state.get("childExecutable")
+        )
         if not parent_running and not child_running:
             state["stale"] = True
         elif not parent_running:
@@ -2818,7 +3640,7 @@ def process_matches(pid: int, title: str) -> bool:
     return result.returncode == 0 and "media-downloader.py" in result.stdout and title in result.stdout
 
 
-def owned_child_matches(pid: int, work_path: str) -> bool:
+def owned_child_matches(pid: int, work_path: str, expected_executable: str | None = None) -> bool:
     if not work_path:
         return False
     result = subprocess.run(["ps", "-p", str(pid), "-o", "pgid=,command="], capture_output=True, text=True)
@@ -2827,16 +3649,35 @@ def owned_child_matches(pid: int, work_path: str) -> bool:
     fields = result.stdout.strip().split(maxsplit=1)
     if len(fields) != 2 or not fields[0].isdigit():
         return False
-    executables = {os.path.basename(token) for token in fields[1].split()[:3]}
     command = fields[1]
+    def token_position(value: str, *, allow_descendant: bool = False) -> int | None:
+        for candidate in (value, f"'{value}'", f'"{value}"'):
+            start = command.find(candidate)
+            while start >= 0:
+                end = start + len(candidate)
+                before_ok = start == 0 or command[start - 1].isspace() or command[start - 1] in "'\""
+                after_ok = end == len(command) or command[end].isspace() or command[end] in "'\""
+                if allow_descendant and end < len(command) and command[end] == os.sep:
+                    after_ok = True
+                if before_ok and after_ok:
+                    return start
+                start = command.find(candidate, end)
+        return None
+
     path = os.path.normpath(work_path)
-    start = command.find(path)
-    while start >= 0:
-        end = start + len(path)
-        if end == len(command) or command[end].isspace() or command[end] in {os.sep, "'", '"'}:
-            return int(fields[0]) == pid and bool(executables & {"aria2c", "ffmpeg", "yt-dlp"})
-        start = command.find(path, end)
-    return False
+    work_position = token_position(path, allow_descendant=True)
+    if work_position is None:
+        return False
+    if expected_executable and os.path.isabs(expected_executable):
+        executable = os.path.normpath(expected_executable)
+        executable_position = token_position(executable)
+        if executable_position is None or executable_position > work_position:
+            return False
+    else:
+        executables = {os.path.basename(token) for token in command.split()[:3]}
+        if not executables & {"aria2c", "ffmpeg", "yt-dlp"}:
+            return False
+    return int(fields[0]) == pid
 
 
 def signal_owned_child(pid: int, work_path: str, sig: signal.Signals, *, verified: bool = False) -> bool:
@@ -2869,7 +3710,9 @@ def command_stop(args) -> int:
         child_pid = state.get("childPid")
         process_title = str(state.get("requestedTitle") or state.get("title", ""))
         work_path = str(state.get("workPath") or (base_root / ".media-downloader-work" / identifier))
-        child_group = child_pid if isinstance(child_pid, int) and owned_child_matches(child_pid, work_path) else None
+        child_group = child_pid if isinstance(child_pid, int) and owned_child_matches(
+            child_pid, work_path, state.get("childExecutable")
+        ) else None
         if isinstance(pid, int) and process_matches(pid, process_title):
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -2902,7 +3745,7 @@ def command_stop(args) -> int:
             time.sleep(0.1)
         if (isinstance(pid, int) and process_matches(pid, process_title)) or (child_group is not None and process_group_running(child_group)):
             raise RuntimeError(f"停止任务失败，进程仍在运行: {state.get('title')}")
-        status_update(identifier, phase="stopped", currentOperation="stopped", lastError="任务已停止", pid=None, childPid=None, finishedAt=now())
+        status_update(identifier, phase="stopped", currentOperation="stopped", lastError="任务已停止", pid=None, childPid=None, childExecutable=None, finishedAt=now())
     return 0
 
 
@@ -2956,11 +3799,23 @@ def _doctor_error(exc: Exception) -> str:
 def command_doctor(args) -> int:
     config = load_config()
     checks = []
+    selected_ffmpeg = None
     for tool, required in (("ffmpeg", True), ("ffprobe", True), ("aria2c", False), ("yt-dlp", False), ("deno", False)):
-        location = shutil.which(tool)
+        if tool == "ffmpeg":
+            try:
+                location = ffmpeg_binary()
+            except RuntimeError as exc:
+                location = None
+                checks.append({"name": "ffmpeg", "status": "error", "path": os.environ.get("MEDIA_DOWNLOADER_FFMPEG", ""), "detail": str(exc)})
+            selected_ffmpeg = location
+        else:
+            location = shutil.which(tool)
+        if tool == "ffmpeg" and checks and checks[-1].get("name") == "ffmpeg":
+            continue
         item = {"name": tool, "status": "ok" if location else ("error" if required else "optional-missing"), "path": location or ""}
         if location:
             version_command = [tool, "--version"] if tool != "ffmpeg" and tool != "ffprobe" else [tool, "-version"]
+            version_command[0] = location
             version, probe_error = _probe_version(version_command)
             item["version"] = version or "unverified"
             if probe_error:
@@ -2968,6 +3823,18 @@ def command_doctor(args) -> int:
                 item["status"] = "error" if required else "unverified"
                 item["detail"] = "Tool could not report its version; check its installation"
         checks.append(item)
+    subtitle_filter_status = "unverified"
+    subtitle_filter_detail = "FFmpeg binary unavailable"
+    if selected_ffmpeg:
+        try:
+            filter_result = subprocess.run([selected_ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=15)
+            has_subtitles_filter = filter_result.returncode == 0 and bool(re.search(r"(?m)^\s*[.A-Z]{3}\s+subtitles\s+", filter_result.stdout))
+            subtitle_filter_status = "ok" if has_subtitles_filter else "optional-missing"
+            subtitle_filter_detail = "subtitles/libass filter available" if has_subtitles_filter else "Hard-burn requires an FFmpeg build with subtitles/libass; ordinary transcode is unaffected"
+        except (OSError, subprocess.TimeoutExpired):
+            subtitle_filter_status = "unverified"
+            subtitle_filter_detail = "Could not inspect FFmpeg filter list"
+    checks.append({"name": "ffmpeg:subtitles", "status": subtitle_filter_status, "path": selected_ffmpeg or "", "detail": subtitle_filter_detail})
     if shutil.which("yt-dlp"):
         # No URL is supplied: this stays offline while allowing yt-dlp to report its own EJS/runtime inventory.
         try:
@@ -3070,7 +3937,7 @@ def command_doctor(args) -> int:
                 checks.append({"name": f"online:search:{name}", "status": "ok", "detail": "caps validated"})
             except Exception as exc:
                 checks.append({"name": f"online:search:{name}", "status": "error", "detail": _doctor_error(exc)})
-    print(json.dumps({"version": VERSION, "configSchemaVersion": CONFIG_SCHEMA_VERSION, "config": str(config_file()), "checks": checks}, ensure_ascii=False, indent=2))
+    print(json.dumps({"version": VERSION, "configSchemaVersion": CONFIG_SCHEMA_VERSION, "config": str(config_file()), "ffmpeg": selected_ffmpeg or "", "checks": checks}, ensure_ascii=False, indent=2))
     return 1 if any(item["status"] == "error" for item in checks) else 0
 
 
@@ -3093,6 +3960,11 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--cookies", help="Browser name for --cookies-from-browser (e.g. chrome) or path to a cookies.txt for --cookies")
     parser.add_argument("--write-subs", action="store_true", help="Download external subtitles when the yt-dlp source provides them; unavailable subtitles are skipped")
     parser.add_argument("--sub-langs", help="Comma-separated subtitle language codes (e.g. zh-CN,en); defaults to the metadata language or zh-CN")
+    burns = parser.add_mutually_exclusive_group()
+    burns.add_argument("--burn-subtitle", type=int, help="Hard-burn one embedded text subtitle by its zero-based subtitle ordinal")
+    burns.add_argument("--burn-sidecar", help="Hard-burn one neighboring external subtitle using its exact tracks suffix (e.g. zh.srt)")
+    parser.add_argument("--audio-tracks", help="Keep only these zero-based audio ordinals (comma-separated); default keeps all")
+    parser.add_argument("--track-review-seconds", type=int, default=0, help="Wait this many seconds after acquisition for choose-tracks (0 disables review; maximum 300)")
     parser.add_argument("--no-archive", action="store_true", help="Skip archive transfer; deliver to downloadDir if configured, else keep output in the workspace")
     parser.add_argument("--no-deliver", action="store_true", help="Do not archive or deliver; keep Plex-ready output in the owned workspace")
     parser.add_argument("--keep-work", action="store_true", help="Keep the download cache/workspace after completion (cleaned by default after delivery/archive)")
@@ -3128,6 +4000,16 @@ def parser() -> argparse.ArgumentParser:
     probe.add_argument("--cookies", help="Browser name or private cookies.txt path")
     probe.add_argument("--timeout", type=int, default=120)
     probe.set_defaults(handler=command_probe)
+    tracks = commands.add_parser("tracks", help="Read detailed audio/subtitle tracks from a local media file or directory")
+    tracks.add_argument("path")
+    tracks.set_defaults(handler=command_tracks)
+    choose_tracks = commands.add_parser("choose-tracks", help="Submit track choices while a task is in track-review")
+    choose_tracks.add_argument("task_id")
+    review_burns = choose_tracks.add_mutually_exclusive_group()
+    review_burns.add_argument("--burn-subtitle", type=int, help="Hard-burn one embedded text subtitle by its zero-based subtitle ordinal")
+    review_burns.add_argument("--burn-sidecar", help="Hard-burn one external subtitle using its exact tracks suffix (e.g. zh.srt)")
+    choose_tracks.add_argument("--audio-tracks", help="Keep only these zero-based audio ordinals (comma-separated); unspecified keeps all")
+    choose_tracks.set_defaults(handler=command_choose_tracks)
     add_source = commands.add_parser("add-source", help="Add a user-confirmed search source to private config.json")
     add_source.add_argument("name")
     add_source.add_argument("url")
