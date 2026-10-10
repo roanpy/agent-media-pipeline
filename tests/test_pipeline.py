@@ -1196,6 +1196,187 @@ def main():
             assert inventory["externalSubtitleTrackCount"] == sum(
                 len(item["tracks"]) for item in inventory["externalSubtitleFiles"]
             )
+
+            def alternate_inventory(name, *, audio_language=None, subtitle_language=None, subtitle_forced=None, sidecar_language=None):
+                alternate = {**inventory, "path": str(root / name)}
+                alternate["audioTracks"] = [dict(track) for track in inventory["audioTracks"]]
+                alternate["subtitleTracks"] = [dict(track) for track in inventory["subtitleTracks"]]
+                alternate["externalSubtitleFiles"] = []
+                if audio_language is not None:
+                    alternate["audioTracks"][0]["language"] = audio_language
+                if subtitle_language is not None:
+                    alternate["subtitleTracks"][0]["language"] = subtitle_language
+                if subtitle_forced is not None:
+                    alternate["subtitleTracks"][0]["forced"] = subtitle_forced
+                for item in inventory["externalSubtitleFiles"]:
+                    copied = {**item, "fileName": f"{Path(name).stem}.{item['suffix']}", "tracks": [dict(track) for track in item["tracks"]]}
+                    if item["suffix"] == "jpn.srt" and sidecar_language is not None:
+                        copied["tracks"][0]["language"] = sidecar_language
+                    alternate["externalSubtitleFiles"].append(copied)
+                return alternate
+
+            def assert_track_choice_rejected(inventories, audio_tracks, burn_subtitle, burn_sidecar, expected):
+                try:
+                    module.validate_review_choice(inventories, audio_tracks, burn_subtitle, burn_sidecar)
+                except RuntimeError as exc:
+                    assert expected in str(exc), str(exc)
+                else:
+                    raise AssertionError(f"batch track selection should reject mismatched {expected}")
+
+            different_internal_language = alternate_inventory("Episode 02.mkv", subtitle_language="eng")
+            assert_track_choice_rejected([inventory, different_internal_language], None, 0, None, "字幕烧录")
+            different_forced_flag = alternate_inventory("Episode 02.mkv", subtitle_forced=False)
+            assert_track_choice_rejected([inventory, different_forced_flag], None, 0, None, "forced")
+            different_external_language = alternate_inventory("Episode 02.mkv", sidecar_language="eng")
+            assert_track_choice_rejected([inventory, different_external_language], None, None, "jpn.srt", "字幕烧录")
+            different_audio_language = alternate_inventory("Episode 02.mkv", audio_language="jpn")
+            assert_track_choice_rejected([inventory, different_audio_language], [0], None, None, "--audio-tracks")
+            # Equivalent language tags and unknown-vs-known are not evidence of a mismatch.
+            alias_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="zho")
+            module.validate_review_choice([inventory, alias_inventory], None, 0, None)
+            simplified_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="zh_CN")
+            simplified_bcp47_inventory = alternate_inventory("Episode 03.mkv", subtitle_language="zho-Hans")
+            module.validate_review_choice([simplified_inventory, simplified_bcp47_inventory], None, 0, None)
+            traditional_inventory = alternate_inventory("Episode 03.mkv", subtitle_language="zh_TW")
+            assert_track_choice_rejected([simplified_inventory, traditional_inventory], None, 0, None, "字幕文字系统")
+            cantonese_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="zh-yue")
+            cantonese_primary_inventory = alternate_inventory("Episode 03.mkv", subtitle_language="yue")
+            module.validate_review_choice([cantonese_inventory, cantonese_primary_inventory], None, 0, None)
+            zho_cantonese_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="zho-yue")
+            zho_cantonese_primary_inventory = alternate_inventory("Episode 03.mkv", subtitle_language="yue")
+            module.validate_review_choice([zho_cantonese_inventory, zho_cantonese_primary_inventory], None, 0, None)
+            mandarin_inventory = alternate_inventory("Episode 03.mkv", subtitle_language="zh-cmn")
+            assert_track_choice_rejected([cantonese_inventory, mandarin_inventory], None, 0, None, "字幕烧录")
+            zho_mandarin_inventory = alternate_inventory("Episode 03.mkv", subtitle_language="zho-cmn")
+            assert_track_choice_rejected([zho_cantonese_inventory, zho_mandarin_inventory], None, 0, None, "字幕烧录")
+            for legacy_tag, preferred_tag in (("no-bok", "nb"), ("no-nyn", "nn"), ("zh-guoyu", "cmn"), ("zh-min-nan", "nan")):
+                legacy_identity = module.track_identity({"language": legacy_tag}, include_script=True, include_forced=True)
+                preferred_identity = module.track_identity({"language": preferred_tag}, include_script=True, include_forced=True)
+                assert legacy_identity == preferred_identity, (legacy_tag, preferred_tag, legacy_identity, preferred_identity)
+            assert sum(len(codes) for codes in module.EXTLANG_CODES_BY_PREFIX.values()) == 258
+            assert len(module.BCP47_SCRIPT_CODES) == 224
+            for extlang_tag, primary_tag in (
+                ("ar-aao", "aao"), ("ar-abh", "abh"), ("ar-ary", "ary"), ("ar-arb", "arb"),
+                ("ms-zlm", "zlm"), ("kok-gom", "gom"), ("kok-knn", "knn"),
+                ("lv-ltg", "ltg"), ("lv-lvs", "lvs"), ("sw-swc", "swc"), ("sw-swh", "swh"),
+                ("uz-uzn", "uzn"), ("uz-uzs", "uzs"), ("zh-cmn", "cmn"), ("zh-yue", "yue"),
+            ):
+                extlang_identity = module.track_identity({"language": extlang_tag}, include_script=True, include_forced=True)
+                primary_identity = module.track_identity({"language": primary_tag}, include_script=True, include_forced=True)
+                assert extlang_identity == primary_identity, (extlang_tag, primary_tag, extlang_identity, primary_identity)
+            assert module.track_identity({"language": "ar-aao"}, include_script=True, include_forced=True) != module.track_identity(
+                {"language": "ar-abh"}, include_script=True, include_forced=True,
+            )
+            assert module.track_identity({"language": "sw-swh"}, include_script=True, include_forced=True) != module.track_identity(
+                {"language": "sw-swc"}, include_script=True, include_forced=True,
+            )
+            for unregistered_pair in ("ar-eng", "ar-cmn", "zh-eng", "zh-und", "ar-xyz"):
+                assert module.track_identity(
+                    {"language": unregistered_pair}, include_script=True, include_forced=True,
+                )[0] is None, unregistered_pair
+            unregistered_extlang_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="ar-eng")
+            english_inventory = alternate_inventory("Episode 03.mkv", subtitle_language="eng")
+            module.validate_review_choice([unregistered_extlang_inventory, english_inventory], None, 0, None)
+            private_hans_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="zh-x-hans")
+            module.validate_review_choice([private_hans_inventory, traditional_inventory], None, 0, None)
+            private_tw_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="zh-x-tw")
+            module.validate_review_choice([private_tw_inventory, simplified_inventory], None, 0, None)
+            for malformed_tag in ("zh-Hans-Hant", "zh-Abcd", "zh-yue-eng-Hans"):
+                malformed_identity = module.track_identity(
+                    {"language": malformed_tag, "forced": True}, include_script=True, include_forced=True,
+                )
+                assert malformed_identity == (None, None, True), (malformed_tag, malformed_identity)
+            for malformed_tag in ("i-", "i-foo!"):
+                malformed_identity = module.track_identity(
+                    {"language": malformed_tag, "forced": True}, include_script=True, include_forced=True,
+                )
+                assert malformed_identity == (None, None, True), (malformed_tag, malformed_identity)
+            assert module.track_identity(
+                {"language": "i-klingon"}, include_script=True, include_forced=True,
+            ) == module.track_identity({"language": "tlh"}, include_script=True, include_forced=True)
+            assert module.track_identity(
+                {"language": "i-default"}, include_script=True, include_forced=True,
+            )[0] == "tag:i-default"
+            assert module.track_identity(
+                {"language": "zh-Hans-CN-u-ca-chinese"}, include_script=True, include_forced=True,
+            ) == module.track_identity({"language": "zh-Hans-CN"}, include_script=True, include_forced=True)
+            assert module.track_identity(
+                {"language": "zh-Hans-x-hant"}, include_script=True, include_forced=True,
+            ) == module.track_identity({"language": "zh-Hans"}, include_script=True, include_forced=True)
+            assert module.track_identity(
+                {"language": "zh-x-hant"}, include_script=True, include_forced=True,
+            )[1] is None
+            simplified_sidecar = alternate_inventory("Episode 02.mkv", sidecar_language="zh_CN")
+            traditional_sidecar = alternate_inventory("Episode 03.mkv", sidecar_language="zh_TW")
+            for sidecar_inventory in (simplified_sidecar, traditional_sidecar):
+                sidecar_record = next(item for item in sidecar_inventory["externalSubtitleFiles"] if item["suffix"] == "jpn.srt")
+                sidecar_record["suffix"] = "zh.srt"
+                sidecar_record["fileName"] = f"{Path(sidecar_inventory['path']).stem}.zh.srt"
+            assert_track_choice_rejected(
+                [simplified_sidecar, traditional_sidecar], None, None, "zh.srt", "字幕文字系统",
+            )
+            for code3, code2 in (
+                ("swe", "sv"), ("pol", "pl"), ("hin", "hi"), ("ara", "ar"),
+                ("nor", "no"), ("nob", "nb"), ("nno", "nn"), ("tgl", "tl"),
+            ):
+                normalized3 = module.track_identity({"language": code3}, include_script=True, include_forced=True)
+                normalized2 = module.track_identity({"language": code2}, include_script=True, include_forced=True)
+                assert normalized3 == normalized2, (code3, code2, normalized3, normalized2)
+            for distinct3, distinct2 in (("nob", "nno"), ("nob", "no"), ("nno", "no"), ("fil", "tl")):
+                normalized3 = module.track_identity({"language": distinct3}, include_script=True, include_forced=True)
+                normalized2 = module.track_identity({"language": distinct2}, include_script=True, include_forced=True)
+                assert normalized3 != normalized2, (distinct3, distinct2, normalized3, normalized2)
+            unknown_language_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="und")
+            module.validate_review_choice([inventory, unknown_language_inventory], None, 0, None)
+
+            # Selection mismatches must fail in validation before this task can enter conversion.
+            preflight_inventory = alternate_inventory("Episode 02.mkv", subtitle_language="eng")
+            preflight_plans = [
+                {"source": Path(item["path"]), "sourceInfo": {"audioTracks": item["audioTracks"], "subtitleTracks": item["subtitleTracks"]}}
+                for item in (inventory, preflight_inventory)
+            ]
+            preflight_args = type("Args", (), {"audio_tracks": None, "burn_subtitle": 0, "burn_sidecar": None, "copy_original": False})()
+            try:
+                with patch.object(module, "subtitle_filter_available", side_effect=AssertionError("must reject before checking FFmpeg")):
+                    module.validate_track_options({"args": preflight_args, "profile": {"videoCodec": "libx264"}}, preflight_plans)
+            except RuntimeError as exc:
+                assert "字幕烧录" in str(exc) and "转码前停止" in str(exc), str(exc)
+            else:
+                raise AssertionError("pipeline preflight must reject a batch whose selected subtitle languages differ")
+            assert not (root / "Episode 02.mp4").exists()
+
+            audio_preflight_args = type("Args", (), {"audio_tracks": "0", "burn_subtitle": None, "burn_sidecar": None, "copy_original": False})()
+            audio_preflight_plans = [
+                {"source": Path(item["path"]), "sourceInfo": {"audioTracks": item["audioTracks"], "subtitleTracks": item["subtitleTracks"]}}
+                for item in (inventory, different_audio_language)
+            ]
+            try:
+                with patch.object(module, "subtitle_filter_available", side_effect=AssertionError("must reject before checking FFmpeg")):
+                    module.validate_track_options({"args": audio_preflight_args, "profile": {"videoCodec": "libx264"}}, audio_preflight_plans)
+            except RuntimeError as exc:
+                assert "--audio-tracks" in str(exc) and "转码前停止" in str(exc), str(exc)
+            else:
+                raise AssertionError("pipeline preflight must reject batch audio ordinals with different languages")
+
+            sidecar_preflight_args = type("Args", (), {"audio_tracks": None, "burn_subtitle": None, "burn_sidecar": "jpn.srt", "copy_original": False})()
+            sidecar_preflight_plans = [
+                {"source": multi_track_source, "sourceInfo": {}},
+                {"source": root / "Episode 02.mkv", "sourceInfo": {}},
+            ]
+            with patch.object(
+                module, "resolve_external_sidecar_selection",
+                side_effect=[
+                    {"subtitleOrdinal": 0, "language": "jpn", "forced": False},
+                    {"subtitleOrdinal": 0, "language": "eng", "forced": False},
+                ],
+            ), patch.object(module, "subtitle_filter_available", side_effect=AssertionError("must reject before checking FFmpeg")):
+                try:
+                    module.validate_track_options({"args": sidecar_preflight_args, "profile": {"videoCodec": "libx264"}}, sidecar_preflight_plans)
+                except RuntimeError as exc:
+                    assert "字幕烧录" in str(exc) and "转码前停止" in str(exc), str(exc)
+                else:
+                    raise AssertionError("pipeline preflight must reject external subtitle ordinals with different languages")
+
             try:
                 module.validate_review_choice([inventory], None, None, "missing.srt")
             except RuntimeError as exc:

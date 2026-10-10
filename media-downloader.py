@@ -37,6 +37,80 @@ USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
 SUBTITLE_EXTS = {".srt", ".smi", ".ass", ".ssa", ".vtt", ".mks", ".sup", ".sub", ".idx"}
 TEXT_SUBTITLE_CODECS = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
+# Compare common ISO 639-2 and BCP-47 spellings as one language in batch choices.
+TRACK_LANGUAGE_ALIASES = {
+    "chi": "zh", "zho": "zh",
+    "eng": "en", "jpn": "ja", "kor": "ko", "fre": "fr", "fra": "fr", "ger": "de", "deu": "de",
+    "spa": "es", "ita": "it", "por": "pt", "rus": "ru",
+    "ara": "ar", "nld": "nl", "dut": "nl", "ces": "cs", "cze": "cs", "ell": "el", "gre": "el",
+    "ron": "ro", "rum": "ro", "slk": "sk", "slo": "sk", "sqi": "sq", "alb": "sq", "hye": "hy", "arm": "hy",
+    "eus": "eu", "baq": "eu", "mya": "my", "bur": "my", "fas": "fa", "per": "fa", "isl": "is", "ice": "is",
+    "mkd": "mk", "mac": "mk", "mri": "mi", "mao": "mi", "msa": "ms", "may": "ms", "bod": "bo", "tib": "bo",
+    "cym": "cy", "wel": "cy", "swe": "sv", "pol": "pl", "hin": "hi", "dan": "da", "ukr": "uk",
+    "vie": "vi", "tur": "tr", "tha": "th", "heb": "he", "ind": "id", "hrv": "hr", "scr": "hr",
+    "srp": "sr", "scc": "sr", "bul": "bg", "hun": "hu", "fin": "fi", "cat": "ca", "tgl": "tl",
+    "nor": "no", "nob": "nb", "nno": "nn",
+}
+GRANDFATHERED_LANGUAGE_TAGS = {
+    "art-lojban": "jbo", "en-gb-oed": "en-gb-oxendict", "i-ami": "ami", "i-bnn": "bnn", "i-hak": "hak",
+    "i-klingon": "tlh", "i-lux": "lb", "i-navajo": "nv", "i-pwn": "pwn", "i-tao": "tao", "i-tay": "tay",
+    "i-tsu": "tsu", "no-bok": "nb", "no-nyn": "nn", "sgn-be-fr": "sfb", "sgn-be-nl": "vgt", "sgn-ch-de": "sgg",
+    "zh-guoyu": "cmn", "zh-hakka": "hak", "zh-min-nan": "nan", "zh-xiang": "hsn",
+}
+UNRESOLVED_GRANDFATHERED_TAGS = {"cel-gaulish", "i-default", "i-enochian", "i-mingo", "zh-min"}
+# IANA language-subtag registry File-Date 2026-09-17. Only registered
+# prefix/extlang pairs are canonicalized; a three-letter shape alone is not enough.
+EXTLANG_CODES_BY_PREFIX = {
+    "ar": frozenset(
+        """\
+        aao abh abv acm acq acw acx acy adf aeb aec afb ajp apc apd arb arq ars ary arz auz
+        avl ayh ayl ayn ayp bbz pga shu ssh
+        """.split()
+    ),
+    "kok": frozenset("gom knn".split()),
+    "lv": frozenset("ltg lvs".split()),
+    "ms": frozenset(
+        """\
+        bjn btj bve bvu coa dup hji jak jax kvb kvr kxd lce lcf liw max meo mfa mfb min mqg
+        msi mui orn ors pel pse tmw urk vkk vkt xmm zlm zmi zsm
+        """.split()
+    ),
+    "sgn": frozenset(
+        """\
+        ads aed aen afg ajs ase asf asp asq asw bfi bfk bog bqn bqy bvl bzs cds csc csd cse
+        csf csg csl csn csq csr csx doq dse dsl dsz dyl ecs ehs esl esn eso eth fcs fse fsl
+        fss gds gse gsg gsm gss gus hab haf hds hks hos hps hsh hsl icl iks ils inl ins ise
+        isg isr jcs jhs jks jls jos jsl jus kgi kvk lbs lgs lls lsb lsc lsg lsl lsn lso lsp
+        lst lsv lsw lsy lws mdl mfs mre msd msr mzc mzg mzy nbs ncs nsi nsl nsp nsr nzs okl
+        pgz pks prl prz psc psd psg psl pso psp psr pys rib rms rnb rsi rsl rsm rsn sdl sfb
+        sfs sgg sgx slf sls sqk sqs sqx ssp ssr svk swl syy szs tse tsm tsq tss tsy tza ugn
+        ugy ukl uks vgt vsi vsl vsv wbs xki xml xms yds ygs yhs ysl ysm zhk zib zsl
+        """.split()
+    ),
+    "sw": frozenset("swc swh".split()),
+    "uz": frozenset("uzn uzs".split()),
+    "zh": frozenset(
+        """\
+        cdo cjy cmn cnp cpx csp czh czo gan hak hnm hsn luh lzh mnp nan sjc wuu yue
+        """.split()
+    ),
+}
+# IANA language-subtag registry File-Date 2026-09-17; qaaa–qabx is private use.
+BCP47_SCRIPT_CODES = frozenset(
+    """\
+    adlm afak aghb ahom arab aran armi armn avst bali bamu bass batk beng berf bhks blis bopo brah brai bugi
+    buhd cakm cans cari cham cher chis chrs cirt copt cpmn cprt cyrl cyrs deva diak dogr dsrt dupl egyd egyh
+    egyp elba elym ethi gara geok geor glag gong gonm goth gran grek gujr gukh guru hanb hang hani hano hans
+    hant hatr hebr hira hluw hmng hmnp hntl hrkt hung inds ital jamo java jpan jurc kali kana kawi khar khmr khoj
+    kitl kits knda kore kpel krai kthi lana laoo latf latg latn leke lepc limb lina linb lisu loma lyci lydi
+    mahj maka mand mani marc maya medf mend merc mero mlym modi mong moon mroo mtei mult mymr nagm nand narb
+    nbat newa nkdb nkgb nkoo nshu ogam olck onao orkh orya osge osma ougr palm pauc pcun pelm perm phag phli
+    phlp phlv phnx piqd plrd prti psin ranj rjng rohg roro runr samr sara sarb saur seal sgnw shaw
+    shrd shui sidd sidt sind sinh sogd sogo sora soyo sund sunu sylo syrc syre syrj syrn tagb takr tale talu
+    taml tang tavt tayo telu teng tfng tglg thaa thai tibt tirh tnsa todr tols toto tutg ugar vaii visp vith
+    wara wcho wole xpeo xsux yezi yiii zanb zinh zmth zsye zsym zxxx zyyy zzzz
+    """.split()
+)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tbn"}
 ARCHIVE_EXTS = VIDEO_EXTS | SUBTITLE_EXTS | IMAGE_EXTS | {".nfo"}
 OUTPUT_CONTAINERS = {"mp4", "mkv"}
@@ -1837,6 +1911,8 @@ def resolve_external_sidecar_selection(plan: dict, suffix: str) -> dict:
         "suffix": suffix,
         "subtitleOrdinal": int(track.get("subtitleOrdinal", track.get("ordinal", 0))),
         "codec": track.get("codec", "unknown"),
+        "language": track.get("language", "und"),
+        "forced": bool(track.get("forced", False)),
         "sizeBytes": info.st_size,
         "mtimeNs": info.st_mtime_ns,
     }
@@ -1853,18 +1929,148 @@ def verify_sidecar_snapshot(path: Path, expected_size: int, expected_mtime_ns: i
         raise RuntimeError(f"外挂字幕在转码期间发生变化，已拒绝输出: {path.name}")
 
 
+def parse_bcp47_script_region(parts: list[str], position: int) -> tuple[str | None, str | None] | None:
+    """Validate tag structure around script/region and return those subtags, if present."""
+    script = None
+    region = None
+    if position < len(parts) and re.fullmatch(r"[a-z]{4}", parts[position]):
+        candidate = parts[position]
+        if candidate not in BCP47_SCRIPT_CODES and not "qaaa" <= candidate <= "qabx":
+            return None
+        script = candidate.title()
+        position += 1
+    if position < len(parts) and re.fullmatch(r"(?:[a-z]{2}|[0-9]{3})", parts[position]):
+        region = parts[position].upper()
+        position += 1
+
+    variants = set()
+    extensions = set()
+    while position < len(parts):
+        part = parts[position]
+        if part == "x":
+            private_use = parts[position + 1:]
+            if not private_use or any(not re.fullmatch(r"[a-z0-9]{1,8}", item) for item in private_use):
+                return None
+            return script, region
+        if re.fullmatch(r"[a-wy-z0-9]", part):
+            if part in extensions:
+                return None
+            extensions.add(part)
+            position += 1
+            first_extension_subtag = position
+            while position < len(parts) and re.fullmatch(r"[a-z0-9]{2,8}", parts[position]):
+                position += 1
+            if position == first_extension_subtag:
+                return None
+            continue
+        if re.fullmatch(r"(?:[a-z0-9]{5,8}|[0-9][a-z0-9]{3})", part):
+            if part in variants:
+                return None
+            variants.add(part)
+            position += 1
+            continue
+        return None
+    return script, region
+
+
+def track_identity(
+    track: dict,
+    *,
+    include_script: bool,
+    include_forced: bool,
+) -> tuple[str | None, str | None, bool | None]:
+    tag = str(track.get("language") or "und").strip().casefold().replace("_", "-") or "und"
+    tag = GRANDFATHERED_LANGUAGE_TAGS.get(tag, tag)
+    if tag in UNRESOLVED_GRANDFATHERED_TAGS:
+        language = f"tag:{tag}"
+        return language, None, bool(track.get("forced")) if include_forced else None
+    parts = tag.split("-")
+    primary = parts[0]
+    if primary == "x":
+        return None, None, bool(track.get("forced")) if include_forced else None
+    if not re.fullmatch(r"(?:[a-z]{2,3}|[a-z]{4}|[a-z]{5,8})", primary):
+        return None, None, bool(track.get("forced")) if include_forced else None
+    primary = TRACK_LANGUAGE_ALIASES.get(primary, primary)
+    position = 1
+    # Extlangs are accepted only for registered prefix/code pairs. If metadata
+    # looks like an unregistered extlang, keep it unknown instead of stripping
+    # the prefix and accidentally equating it with an unrelated primary language.
+    if primary in EXTLANG_CODES_BY_PREFIX and position < len(parts) and len(parts[position]) == 3 and parts[position].isalpha():
+        if parts[position] not in EXTLANG_CODES_BY_PREFIX[primary]:
+            return None, None, bool(track.get("forced")) if include_forced else None
+        primary = parts[position]
+        position += 1
+    language = TRACK_LANGUAGE_ALIASES.get(primary, primary)
+    parsed_suffix = parse_bcp47_script_region(parts, position)
+    if parsed_suffix is None:
+        return None, None, bool(track.get("forced")) if include_forced else None
+    script, region = parsed_suffix
+    if not include_script:
+        script = None
+    if include_script and language == "zh" and script is None:
+        script = {"CN": "Hans", "SG": "Hans", "TW": "Hant", "HK": "Hant", "MO": "Hant"}.get(region)
+    known_language = None if language == "und" else language
+    if known_language is None:
+        script = None
+    return known_language, script, bool(track.get("forced")) if include_forced else None
+
+
+def validate_batch_track_consistency(
+    selections: list[dict],
+    label: str,
+    *,
+    include_forced: bool,
+    include_script: bool = False,
+) -> None:
+    if len(selections) < 2:
+        return
+    identities = []
+    descriptions = []
+    for selection in selections:
+        tracks = selection["tracks"]
+        identities.append(tuple(
+            track_identity(track, include_script=include_script, include_forced=include_forced)
+            for track in tracks
+        ))
+        details = ", ".join(
+            f"#{track.get('ordinal', track.get('audioOrdinal', track.get('subtitleOrdinal', '?')))} "
+            f"{track.get('language') or 'und'}" + (" forced" if include_forced and track.get("forced") else "")
+            for track in tracks
+        )
+        descriptions.append(f"{Path(selection['path']).name}=[{details}]")
+    inconsistent = any(
+        len({identity[position][0] for identity in identities if identity[position][0] is not None}) > 1
+        or (include_script and len({identity[position][1] for identity in identities if identity[position][1] is not None}) > 1)
+        or (include_forced and len({identity[position][2] for identity in identities}) > 1)
+        for position in range(len(identities[0]))
+    )
+    if inconsistent:
+        fields = ["语言"]
+        if include_script:
+            fields.append("字幕文字系统")
+        if include_forced:
+            fields.append("forced 标志")
+        raise RuntimeError(
+            f"批次选择的 {label} 在文件间{'/'.join(fields)}不一致，已在转码前停止: {'; '.join(descriptions)}。"
+            "请按每集核对轨道后拆分任务，或选择在所有文件中语义一致的轨道"
+        )
+
+
 def validate_review_choice(
     inventories: list[dict],
     audio_tracks: list[int] | None,
     burn_subtitle: int | None,
     burn_sidecar: str | None,
 ) -> None:
+    audio_selections = []
+    subtitle_selections = []
     for inventory in inventories:
         audio = inventory.get("audioTracks", [])
         if audio_tracks is not None:
             invalid = [ordinal for ordinal in audio_tracks if ordinal >= len(audio)]
             if invalid:
                 raise RuntimeError(f"--audio-tracks 超出 {Path(inventory['path']).name} 的音轨范围 (0-{len(audio) - 1}): {invalid}")
+            audio_selections.append({"path": inventory["path"], "tracks": [audio[ordinal] for ordinal in audio_tracks]})
         if burn_subtitle is not None:
             subtitles = inventory.get("subtitleTracks", [])
             if burn_subtitle < 0 or burn_subtitle >= len(subtitles):
@@ -1872,8 +2078,12 @@ def validate_review_choice(
             codec = str(subtitles[burn_subtitle].get("codec", "unknown")).casefold()
             if codec not in TEXT_SUBTITLE_CODECS:
                 raise RuntimeError(f"--burn-subtitle {burn_subtitle} 的编码 {codec} 是位图/不支持文本字幕；不会 OCR 或忽略该选择")
+            subtitle_selections.append({"path": inventory["path"], "tracks": [subtitles[burn_subtitle]]})
         if burn_sidecar is not None:
-            sidecar_burn_record(inventory, burn_sidecar)
+            _record, track = sidecar_burn_record(inventory, burn_sidecar)
+            subtitle_selections.append({"path": inventory["path"], "tracks": [track]})
+    validate_batch_track_consistency(audio_selections, "--audio-tracks", include_forced=False)
+    validate_batch_track_consistency(subtitle_selections, "字幕烧录", include_forced=True, include_script=True)
 
 
 def command_choose_tracks(args) -> int:
@@ -2412,6 +2622,8 @@ def validate_track_options(ctx: dict, plans: list[dict]) -> None:
         if str(ctx["profile"].get("videoCodec", "libx264")) == "copy":
             raise RuntimeError("硬烧字幕不能与 videoCodec=copy 一起使用")
     sidecar_selections = {}
+    audio_selections = []
+    subtitle_selections = []
     for plan in plans:
         info = plan["sourceInfo"]
         tracks = info.get("audioTracks", [])
@@ -2421,6 +2633,7 @@ def validate_track_options(ctx: dict, plans: list[dict]) -> None:
             invalid = [item for item in selected_audio if item >= len(tracks)]
             if invalid:
                 raise RuntimeError(f"--audio-tracks 超出 {plan['source'].name} 的音轨范围 (0-{len(tracks) - 1}): {invalid}")
+            audio_selections.append({"path": plan["source"], "tracks": [tracks[ordinal] for ordinal in selected_audio]})
         subtitles = info.get("subtitleTracks", [])
         if burn_ordinal is not None:
             if isinstance(burn_ordinal, bool) or int(burn_ordinal) < 0 or int(burn_ordinal) >= len(subtitles):
@@ -2430,9 +2643,17 @@ def validate_track_options(ctx: dict, plans: list[dict]) -> None:
                 raise RuntimeError(
                     f"--burn-subtitle {burn_ordinal} 的编码 {track.get('codec')} 是位图/不支持文本字幕；不会 OCR 或忽略该选择"
                 )
+            subtitle_selections.append({"path": plan["source"], "tracks": [track]})
         if burn_sidecar is not None:
             selection = resolve_external_sidecar_selection(plan, burn_sidecar)
             sidecar_selections[str(plan["source"].resolve())] = selection
+            subtitle_selections.append({"path": plan["source"], "tracks": [{
+                "ordinal": selection["subtitleOrdinal"],
+                "language": selection.get("language", "und"),
+                "forced": selection.get("forced", False),
+            }]})
+    validate_batch_track_consistency(audio_selections, "--audio-tracks", include_forced=False)
+    validate_batch_track_consistency(subtitle_selections, "字幕烧录", include_forced=True, include_script=True)
     if (burn_ordinal is not None or burn_sidecar is not None) and not subtitle_filter_available(ctx.get("ffmpegPath")):
         raise RuntimeError("硬烧字幕需要带 subtitles/libass 滤镜的 FFmpeg；当前 FFmpeg 未提供该滤镜，请安装启用 libass 的构建后重试")
     ctx["audioTrackSelection"] = selected_audio
