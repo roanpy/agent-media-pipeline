@@ -8,6 +8,7 @@ import contextlib
 import datetime as dt
 import errno
 import fcntl
+from functools import lru_cache
 import hashlib
 import ipaddress
 import json
@@ -31,7 +32,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.11"
+VERSION = "0.4.12"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
@@ -1979,6 +1980,10 @@ def track_identity(
     include_script: bool,
     include_forced: bool,
 ) -> tuple[str | None, str | None, bool | None]:
+    if "_resolvedLanguage" in track:
+        language = track.get("_resolvedLanguage")
+        script = track.get("_resolvedScript")
+        return language, script if include_script else None, bool(track.get("forced")) if include_forced else None
     tag = str(track.get("language") or "und").strip().casefold().replace("_", "-") or "und"
     tag = GRANDFATHERED_LANGUAGE_TAGS.get(tag, tag)
     if tag in UNRESOLVED_GRANDFATHERED_TAGS:
@@ -2013,6 +2018,108 @@ def track_identity(
     if known_language is None:
         script = None
     return known_language, script, bool(track.get("forced")) if include_forced else None
+
+
+def subtitle_language_selector_identity(value: str) -> tuple[str, str | None]:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("--burn-subtitle-lang 需要语言代码或字幕标题语言名")
+    normalized_name = re.sub(r"[\s_-]+", " ", value.strip().casefold())
+    chinese_names = {
+        "chinese": ("zh", None), "中文": ("zh", None), "chi": ("zh", None),
+        "simplified": ("zh", "Hans"), "simplified chinese": ("zh", "Hans"),
+        "chinese simplified": ("zh", "Hans"), "简体": ("zh", "Hans"),
+        "简中": ("zh", "Hans"), "简体中文": ("zh", "Hans"),
+        "traditional": ("zh", "Hant"), "traditional chinese": ("zh", "Hant"),
+        "chinese traditional": ("zh", "Hant"), "繁体": ("zh", "Hant"),
+        "繁體": ("zh", "Hant"), "繁中": ("zh", "Hant"),
+        "繁体中文": ("zh", "Hant"), "繁體中文": ("zh", "Hant"),
+    }
+    if normalized_name in chinese_names:
+        return chinese_names[normalized_name]
+    identity = track_identity({"language": value}, include_script=True, include_forced=False)
+    if identity[0] is None:
+        raise RuntimeError(f"--burn-subtitle-lang 不是可识别的语言标签: {value!r}")
+    return identity[0], identity[1]
+
+
+def subtitle_title_language_identity(value: str | None) -> tuple[str, str | None] | None:
+    title = str(value or "").strip().casefold()
+    if not title:
+        return None
+    simplified = any(token in title for token in ("simplified", "简体", "简中"))
+    traditional = any(token in title for token in ("traditional", "繁体", "繁體", "繁中"))
+    chinese = simplified or traditional or any(token in title for token in ("chinese", "中文", "简体", "简中", "繁体", "繁體", "繁中"))
+    if not chinese or (simplified and traditional):
+        return None
+    return "zh", "Hans" if simplified else "Hant" if traditional else None
+
+
+def resolved_embedded_subtitle_track(track: dict) -> dict:
+    """Return a copy whose identity includes safe language/script hints from its title."""
+    language, script, _forced = track_identity(track, include_script=True, include_forced=True)
+    title_identity = subtitle_title_language_identity(track.get("title"))
+    raw_language = str(track.get("language") or "").strip().casefold().replace("_", "-")
+    if language is None and raw_language in {"", "und"} and title_identity is not None:
+        language, script = title_identity
+    elif language == "zh" and script is None and title_identity is not None:
+        script = title_identity[1]
+    resolved = dict(track)
+    resolved["_resolvedLanguage"] = language
+    resolved["_resolvedScript"] = script
+    return resolved
+
+
+def select_embedded_subtitle_by_language(subtitles: list[dict], selector: str, source: Path) -> dict:
+    requested_language, requested_script = subtitle_language_selector_identity(selector)
+    language_matches = []
+    for track in subtitles:
+        resolved_track = resolved_embedded_subtitle_track(track)
+        language, script = resolved_track["_resolvedLanguage"], resolved_track["_resolvedScript"]
+        if language != requested_language:
+            continue
+        if requested_script is not None and script is not None and script != requested_script:
+            continue
+        language_matches.append(resolved_track)
+
+    burnable = [track for track in language_matches if str(track.get("codec", "unknown")).casefold() in TEXT_SUBTITLE_CODECS]
+    def describe(track: dict) -> str:
+        ordinal = track.get("subtitleOrdinal", track.get("ordinal", "?"))
+        return f"#{ordinal} {track.get('language') or 'und'} {track.get('title') or ''} [{track.get('codec', 'unknown')}]".strip()
+
+    if not burnable:
+        if language_matches:
+            details = "; ".join(describe(track) for track in language_matches)
+            raise RuntimeError(f"{source.name} 中匹配到的字幕不是可硬烧文本格式: {details}")
+        raise RuntimeError(f"{source.name} 中没有匹配 --burn-subtitle-lang {selector!r} 的可硬烧字幕")
+    if len(burnable) != 1:
+        details = "; ".join(describe(track) for track in burnable)
+        raise RuntimeError(f"{source.name} 中 --burn-subtitle-lang {selector!r} 匹配到多条字幕，请按序号选择: {details}")
+    return burnable[0]
+
+
+def ffmpeg_for_track_selection(ctx: dict) -> str:
+    args = ctx["args"]
+    burn_requested = any(getattr(args, name, None) is not None for name in (
+        "burn_subtitle", "burn_subtitle_lang", "burn_sidecar",
+    ))
+    if burn_requested:
+        return ffmpeg_binary(require_subtitles=True)
+    return str(ctx.get("ffmpegPath") or ffmpeg_binary())
+
+
+def validate_subtitle_style(args) -> None:
+    font = getattr(args, "sub_font", None)
+    size = getattr(args, "sub_size", None)
+    margin = getattr(args, "sub_margin_v", None)
+    if font is not None and (
+        not str(font).strip() or len(str(font)) > 100
+        or any(ord(char) < 32 or ord(char) == 127 or char in ":,;'\\[]" for char in str(font))
+    ):
+        raise RuntimeError("--sub-font 不能为空或超过 100 字符，且不能包含 FFmpeg filter 分隔符")
+    if size is not None and not 1 <= int(size) <= 200:
+        raise RuntimeError("--sub-size 必须在 1-200 之间")
+    if margin is not None and not 0 <= int(margin) <= 1000:
+        raise RuntimeError("--sub-margin-v 必须在 0-1000 之间")
 
 
 def validate_batch_track_consistency(
@@ -2061,7 +2168,10 @@ def validate_review_choice(
     audio_tracks: list[int] | None,
     burn_subtitle: int | None,
     burn_sidecar: str | None,
+    burn_subtitle_lang: str | None = None,
 ) -> None:
+    if sum(value is not None for value in (burn_subtitle, burn_subtitle_lang, burn_sidecar)) > 1:
+        raise RuntimeError("--burn-subtitle/--burn-subtitle-lang/--burn-sidecar 互斥")
     audio_selections = []
     subtitle_selections = []
     for inventory in inventories:
@@ -2078,7 +2188,12 @@ def validate_review_choice(
             codec = str(subtitles[burn_subtitle].get("codec", "unknown")).casefold()
             if codec not in TEXT_SUBTITLE_CODECS:
                 raise RuntimeError(f"--burn-subtitle {burn_subtitle} 的编码 {codec} 是位图/不支持文本字幕；不会 OCR 或忽略该选择")
-            subtitle_selections.append({"path": inventory["path"], "tracks": [subtitles[burn_subtitle]]})
+            subtitle_selections.append({"path": inventory["path"], "tracks": [resolved_embedded_subtitle_track(subtitles[burn_subtitle])]})
+        if burn_subtitle_lang is not None:
+            track = select_embedded_subtitle_by_language(
+                inventory.get("subtitleTracks", []), burn_subtitle_lang, Path(inventory["path"]),
+            )
+            subtitle_selections.append({"path": inventory["path"], "tracks": [track]})
         if burn_sidecar is not None:
             _record, track = sidecar_burn_record(inventory, burn_sidecar)
             subtitle_selections.append({"path": inventory["path"], "tracks": [track]})
@@ -2087,11 +2202,18 @@ def validate_review_choice(
 
 
 def command_choose_tracks(args) -> int:
-    if args.audio_tracks is None and args.burn_subtitle is None and args.burn_sidecar is None:
-        raise RuntimeError("choose-tracks 至少需要 --audio-tracks、--burn-subtitle 或 --burn-sidecar")
+    if args.audio_tracks is None and args.burn_subtitle is None and args.burn_subtitle_lang is None and args.burn_sidecar is None:
+        raise RuntimeError("choose-tracks 至少需要 --audio-tracks、--burn-subtitle、--burn-subtitle-lang 或 --burn-sidecar")
     selected_audio = parse_track_indices(args.audio_tracks, "--audio-tracks") if args.audio_tracks is not None else None
     if args.burn_subtitle is not None and args.burn_subtitle < 0:
         raise RuntimeError("--burn-subtitle 必须是非负零基序号")
+    if sum(value is not None for value in (args.burn_subtitle, args.burn_subtitle_lang, args.burn_sidecar)) > 1:
+        raise RuntimeError("--burn-subtitle/--burn-subtitle-lang/--burn-sidecar 互斥")
+    validate_subtitle_style(args)
+    if any(getattr(args, name, None) is not None for name in ("sub_font", "sub_size", "sub_margin_v")) and not (
+        args.burn_subtitle is not None or args.burn_subtitle_lang is not None or args.burn_sidecar is not None
+    ):
+        raise RuntimeError("--sub-font/--sub-size/--sub-margin-v 需要本次选择硬烧字幕")
     if args.burn_sidecar is not None:
         validate_sidecar_suffix(args.burn_sidecar)
 
@@ -2102,8 +2224,8 @@ def command_choose_tracks(args) -> int:
         if not deadline or time.time() >= deadline:
             raise RuntimeError("轨道 review 已超时，未提交选择；任务将按默认保留所有音轨、输出全部外挂字幕继续")
         inventories = state.get("trackInventories", [])
-        validate_review_choice(inventories, selected_audio, args.burn_subtitle, args.burn_sidecar)
-        if args.burn_subtitle is not None or args.burn_sidecar is not None:
+        validate_review_choice(inventories, selected_audio, args.burn_subtitle, args.burn_sidecar, args.burn_subtitle_lang)
+        if args.burn_subtitle is not None or args.burn_subtitle_lang is not None or args.burn_sidecar is not None:
             if str(state.get("profileVideoCodec", "libx264")) == "copy":
                 raise RuntimeError("硬烧字幕不能与 videoCodec=copy 一起使用")
             if not state.get("trackBurnAvailable", False):
@@ -2111,14 +2233,28 @@ def command_choose_tracks(args) -> int:
         decision = state.get("trackDecision") or {}
         if args.burn_subtitle is not None and decision.get("burnSidecarSuffix") is not None:
             raise RuntimeError("硬烧内封字幕与外挂字幕互斥；本次 review 已选择 --burn-sidecar")
+        if args.burn_subtitle is not None and decision.get("burnSubtitleLanguage") is not None:
+            raise RuntimeError("硬烧内封字幕与外挂字幕选择互斥；本次 review 已选择 --burn-subtitle-lang")
+        if args.burn_subtitle_lang is not None and decision.get("burnSubtitleOrdinal") is not None:
+            raise RuntimeError("硬烧内封字幕选择互斥；本次 review 已选择 --burn-subtitle")
+        if args.burn_subtitle_lang is not None and decision.get("burnSidecarSuffix") is not None:
+            raise RuntimeError("硬烧内封字幕与外挂字幕互斥；本次 review 已选择 --burn-sidecar")
         if args.burn_sidecar is not None and decision.get("burnSubtitleOrdinal") is not None:
             raise RuntimeError("硬烧内封字幕与外挂字幕互斥；本次 review 已选择 --burn-subtitle")
+        if args.burn_sidecar is not None and decision.get("burnSubtitleLanguage") is not None:
+            raise RuntimeError("硬烧内封字幕与外挂字幕互斥；本次 review 已选择 --burn-subtitle-lang")
         if selected_audio is not None:
             decision["audioOrdinals"] = selected_audio
         if args.burn_subtitle is not None:
             decision["burnSubtitleOrdinal"] = args.burn_subtitle
+        if args.burn_subtitle_lang is not None:
+            decision["burnSubtitleLanguage"] = args.burn_subtitle_lang
         if args.burn_sidecar is not None:
             decision["burnSidecarSuffix"] = args.burn_sidecar
+        for argument, key in (("sub_font", "subFont"), ("sub_size", "subSize"), ("sub_margin_v", "subMarginV")):
+            value = getattr(args, argument, None)
+            if value is not None:
+                decision[key] = value
         decision["receivedAt"] = now()
         decision["fingerprint"] = state.get("sourceFingerprint")
         state["trackDecision"] = decision
@@ -2172,6 +2308,12 @@ def log_track_inventories(ctx: dict, inventories: list[dict]) -> None:
                 labels.append(f"{path_label} unprobed/non-burnable: {sidecar.get('probeNote', 'no subtitle stream')}")
         summary = "; ".join(labels) if labels else "无音轨/字幕轨"
         log(ctx, f"轨道清单 {Path(inventory['path']).name}: {summary}")
+    if (
+        not getattr(ctx.get("args"), "copy_original", False)
+        and ctx.get("profile", {}).get("container") == "mp4"
+        and any(item.get("subtitleTracks") or item.get("externalSubtitleFiles") for item in inventories)
+    ):
+        log(ctx, "MP4 不内封软字幕；内封轨与同名外挂字幕会作为外挂文件随成品交付，硬字幕需明确选择 burn 选项")
 
 
 def wait_for_track_review(ctx: dict, inventories: list[dict], seconds: int) -> dict | None:
@@ -2577,14 +2719,56 @@ def parse_track_indices(value: str, label: str) -> list[int]:
     return result
 
 
-def ffmpeg_binary() -> str:
+def ffmpeg_fallback_candidates() -> list[str]:
+    """Known, opt-in-by-context FFmpeg locations; never scan arbitrary applications."""
+    return [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        str(Path.home() / "Library" / "Application Support" / "tinyMediaManager" / "addons" / "ffmpeg"),
+    ]
+
+
+@lru_cache(maxsize=32)
+def _ffmpeg_has_subtitles_filter(binary: str) -> bool:
+    try:
+        result = subprocess.run(
+            [binary, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and bool(re.search(r"(?m)^\s*[.A-Z]{3}\s+subtitles\s+", result.stdout))
+
+
+def ffmpeg_binary(*, require_subtitles: bool = False) -> str:
     configured = os.environ.get("MEDIA_DOWNLOADER_FFMPEG")
     if configured:
         path = Path(configured).expanduser()
         if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
             raise RuntimeError("MEDIA_DOWNLOADER_FFMPEG 必须是存在且可执行的绝对路径")
+        if require_subtitles and not _ffmpeg_has_subtitles_filter(str(path)):
+            raise RuntimeError(
+                f"MEDIA_DOWNLOADER_FFMPEG 显式指定的 FFmpeg 不含 subtitles/libass 滤镜: {path}；"
+                "已尊重显式配置，不会自动换用其他构建"
+            )
         return str(path)
-    return shutil.which("ffmpeg") or "ffmpeg"
+    selected = shutil.which("ffmpeg") or "ffmpeg"
+    if not require_subtitles or _ffmpeg_has_subtitles_filter(selected):
+        return selected
+
+    attempted = [selected]
+    seen = {selected}
+    for candidate in ffmpeg_fallback_candidates():
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        attempted.append(candidate)
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK) and _ffmpeg_has_subtitles_filter(candidate):
+            return candidate
+    raise RuntimeError(
+        "硬烧字幕需要带 subtitles/libass 滤镜的 FFmpeg；探测过的候选路径: " + ", ".join(attempted)
+        + "。请安装启用 libass 的构建，或通过 MEDIA_DOWNLOADER_FFMPEG 显式指定"
+    )
 
 
 def selected_audio_ordinals(ctx: dict, stream_counts: dict | None) -> list[int] | None:
@@ -2598,12 +2782,9 @@ def selected_audio_ordinals(ctx: dict, stream_counts: dict | None) -> list[int] 
 
 def subtitle_filter_available(binary: str | None = None) -> bool:
     try:
-        result = subprocess.run(
-            [binary or ffmpeg_binary(), "-hide_banner", "-filters"], capture_output=True, text=True, timeout=15,
-        )
-    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return _ffmpeg_has_subtitles_filter(binary or ffmpeg_binary())
+    except RuntimeError:
         return False
-    return result.returncode == 0 and bool(re.search(r"(?m)^\s*[.A-Z]{3}\s+subtitles\s+", result.stdout))
 
 
 def validate_track_options(ctx: dict, plans: list[dict]) -> None:
@@ -2611,19 +2792,26 @@ def validate_track_options(ctx: dict, plans: list[dict]) -> None:
     raw_audio = getattr(args, "audio_tracks", None)
     selected_audio = parse_track_indices(raw_audio, "--audio-tracks") if raw_audio is not None else None
     burn_ordinal = getattr(args, "burn_subtitle", None)
+    burn_language = getattr(args, "burn_subtitle_lang", None)
     burn_sidecar = getattr(args, "burn_sidecar", None)
-    if burn_ordinal is not None and burn_sidecar is not None:
-        raise RuntimeError("--burn-subtitle 与 --burn-sidecar 互斥")
-    if getattr(args, "copy_original", False) and (raw_audio is not None or burn_ordinal is not None or burn_sidecar is not None):
-        raise RuntimeError("--audio-tracks/--burn-subtitle/--burn-sidecar 只适用于转码模式")
+    selected_burn_modes = sum(value is not None for value in (burn_ordinal, burn_language, burn_sidecar))
+    if selected_burn_modes > 1:
+        raise RuntimeError("--burn-subtitle/--burn-subtitle-lang/--burn-sidecar 互斥")
+    if getattr(args, "copy_original", False) and (raw_audio is not None or selected_burn_modes):
+        raise RuntimeError("--audio-tracks/--burn-subtitle/--burn-subtitle-lang/--burn-sidecar 只适用于转码模式")
+    validate_subtitle_style(args)
+    style_requested = any(getattr(args, name, None) is not None for name in ("sub_font", "sub_size", "sub_margin_v"))
+    if style_requested and not selected_burn_modes and not getattr(args, "track_review_seconds", 0):
+        raise RuntimeError("--sub-font/--sub-size/--sub-margin-v 需要本次任务选择硬烧字幕")
     if burn_sidecar is not None:
         validate_sidecar_suffix(burn_sidecar)
-    if burn_ordinal is not None or burn_sidecar is not None:
+    if selected_burn_modes:
         if str(ctx["profile"].get("videoCodec", "libx264")) == "copy":
             raise RuntimeError("硬烧字幕不能与 videoCodec=copy 一起使用")
     sidecar_selections = {}
     audio_selections = []
     subtitle_selections = []
+    embedded_selections = {}
     for plan in plans:
         info = plan["sourceInfo"]
         tracks = info.get("audioTracks", [])
@@ -2643,7 +2831,16 @@ def validate_track_options(ctx: dict, plans: list[dict]) -> None:
                 raise RuntimeError(
                     f"--burn-subtitle {burn_ordinal} 的编码 {track.get('codec')} 是位图/不支持文本字幕；不会 OCR 或忽略该选择"
                 )
+            track = resolved_embedded_subtitle_track(track)
             subtitle_selections.append({"path": plan["source"], "tracks": [track]})
+            embedded_selections[str(plan["source"].resolve())] = {
+                "ordinal": int(track.get("subtitleOrdinal", track.get("ordinal", burn_ordinal))), "track": track,
+            }
+        if burn_language is not None:
+            track = select_embedded_subtitle_by_language(subtitles, burn_language, plan["source"])
+            ordinal = int(track.get("subtitleOrdinal", track.get("ordinal", -1)))
+            subtitle_selections.append({"path": plan["source"], "tracks": [track]})
+            embedded_selections[str(plan["source"].resolve())] = {"ordinal": ordinal, "track": track}
         if burn_sidecar is not None:
             selection = resolve_external_sidecar_selection(plan, burn_sidecar)
             sidecar_selections[str(plan["source"].resolve())] = selection
@@ -2654,10 +2851,11 @@ def validate_track_options(ctx: dict, plans: list[dict]) -> None:
             }]})
     validate_batch_track_consistency(audio_selections, "--audio-tracks", include_forced=False)
     validate_batch_track_consistency(subtitle_selections, "字幕烧录", include_forced=True, include_script=True)
-    if (burn_ordinal is not None or burn_sidecar is not None) and not subtitle_filter_available(ctx.get("ffmpegPath")):
+    if selected_burn_modes and not subtitle_filter_available(ctx.get("ffmpegPath")):
         raise RuntimeError("硬烧字幕需要带 subtitles/libass 滤镜的 FFmpeg；当前 FFmpeg 未提供该滤镜，请安装启用 libass 的构建后重试")
     ctx["audioTrackSelection"] = selected_audio
     ctx["externalSubtitleSelections"] = sidecar_selections
+    ctx["embeddedSubtitleSelections"] = embedded_selections
 
 
 def resumable_track_decision(
@@ -2669,6 +2867,7 @@ def resumable_track_decision(
     burn_subtitle: int | None,
     burn_sidecar: str | None,
     review_seconds: int,
+    burn_subtitle_lang: str | None = None,
 ) -> dict | None:
     decision = previous_state.get("trackDecision") or {}
     phase = previous_state.get("phase")
@@ -2676,10 +2875,10 @@ def resumable_track_decision(
         return None
     if phase in {"failed", "stopped"} and decision.get("fingerprint") == current_fingerprint:
         return decision
-    has_explicit_selection = audio_tracks is not None or burn_subtitle is not None or burn_sidecar is not None
+    has_explicit_selection = audio_tracks is not None or burn_subtitle is not None or burn_subtitle_lang is not None or burn_sidecar is not None
     if decision and phase not in {"done", "failed", "stopped"} and not has_explicit_selection and not review_seconds:
         raise RuntimeError(
-            "发现未完成任务中已提交但未确认应用的轨道选择；为避免静默丢失，请显式传入 --audio-tracks/--burn-subtitle/--burn-sidecar、"
+            "发现未完成任务中已提交但未确认应用的轨道选择；为避免静默丢失，请显式传入 --audio-tracks/--burn-subtitle/--burn-subtitle-lang/--burn-sidecar、"
             "开启 --track-review-seconds 重新选择，或确认后使用 --reset-work"
         )
     return None
@@ -2691,13 +2890,30 @@ def escape_filter_option(value: str) -> str:
     return "".join("\\" + char if char in "\\'[],;" else char for char in option)
 
 
+def append_subtitle_style(filter_expression: str, args) -> str:
+    validate_subtitle_style(args)
+    style = []
+    font = getattr(args, "sub_font", None)
+    size = getattr(args, "sub_size", None)
+    margin = getattr(args, "sub_margin_v", None)
+    if font is not None:
+        style.append(f"FontName={font}")
+    if size is not None:
+        style.append(f"FontSize={int(size)}")
+    if margin is not None:
+        style.append(f"MarginV={int(margin)}")
+    if not style:
+        return filter_expression
+    return f"{filter_expression}:force_style='{','.join(style)}'"
+
+
 def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | None = None) -> list[str]:
     profile = ctx["profile"]
     codec = str(profile.get("videoCodec", "libx264"))
     audio_codec = str(profile.get("audioCodec", "aac"))
     # -nostats：进度统计未被解析，只会淹没任务日志；结束摘要与错误仍保留在 -hide_banner 之外。
     audio_ordinals = selected_audio_ordinals(ctx, stream_counts)
-    command = [ffmpeg_binary(), "-hide_banner", "-nostats", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0"]
+    command = [ctx.get("ffmpegPath") or ffmpeg_binary(), "-hide_banner", "-nostats", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0"]
     if audio_ordinals is None:
         command += ["-map", "0:a?"]
     else:
@@ -2715,16 +2931,19 @@ def ffmpeg_command(ctx: dict, source: Path, target: Path, stream_counts: dict | 
         resolution = int(profile.get("resolution", 1080))
         filters = []
         burn_ordinal = getattr(ctx.get("args"), "burn_subtitle", None)
+        embedded_selections = ctx.get("embeddedSubtitleSelections", {})
+        embedded_selection = embedded_selections.get(str(source.resolve()))
         sidecar_selections = ctx.get("externalSubtitleSelections", {})
         sidecar_selection = sidecar_selections.get(str(source.resolve()))
-        if burn_ordinal is not None and sidecar_selection is not None:
+        if (burn_ordinal is not None or embedded_selection is not None) and sidecar_selection is not None:
             raise RuntimeError("内封字幕与外挂字幕硬烧配置互斥")
-        if burn_ordinal is not None:
-            filters.append(f"subtitles=filename={escape_filter_option(str(source))}:si={int(burn_ordinal)}")
+        if burn_ordinal is not None or embedded_selection is not None:
+            selected_ordinal = int(embedded_selection["ordinal"]) if embedded_selection else int(burn_ordinal)
+            subtitle_filter = f"subtitles=filename={escape_filter_option(str(source))}:si={selected_ordinal}"
+            filters.append(append_subtitle_style(subtitle_filter, ctx.get("args")))
         if sidecar_selection is not None:
-            filters.append(
-                f"subtitles=filename={escape_filter_option(sidecar_selection['path'])}:si={int(sidecar_selection['subtitleOrdinal'])}"
-            )
+            subtitle_filter = f"subtitles=filename={escape_filter_option(sidecar_selection['path'])}:si={int(sidecar_selection['subtitleOrdinal'])}"
+            filters.append(append_subtitle_style(subtitle_filter, ctx.get("args")))
         filters.append(f"scale=-2:min(ih\\,{resolution})")
         command += ["-vf", ",".join(filters), "-c:v", codec]
         if profile.get("preset"):
@@ -2838,10 +3057,10 @@ def install_no_clobber(temp: Path, target: Path) -> None:
     temp.unlink()
 
 
-def embedded_subtitle_command(source: Path, target: Path, track: dict, attachment_streams: int, *, font_fallback: bool = False) -> list[str]:
+def embedded_subtitle_command(source: Path, target: Path, track: dict, attachment_streams: int, *, font_fallback: bool = False, binary: str | None = None) -> list[str]:
     ordinal = int(track.get("subtitleOrdinal", track.get("ordinal", 0)))
     delivery = subtitle_delivery(track)
-    command = [ffmpeg_binary(), "-hide_banner", "-nostats", "-nostdin", "-n", "-i", str(source), "-map", f"0:s:{ordinal}"]
+    command = [binary or ffmpeg_binary(), "-hide_banner", "-nostats", "-nostdin", "-n", "-i", str(source), "-map", f"0:s:{ordinal}"]
     if font_fallback or delivery["extension"] == ".mks":
         command += ["-c:s", "copy"]
         if attachment_streams:
@@ -2878,7 +3097,10 @@ def extract_embedded_subtitles(ctx: dict, plan: dict) -> list[Path]:
             log(ctx, f"{operation}: {plan['source'].name} -> {target.name}")
             run_child(
                 ctx,
-                embedded_subtitle_command(plan["source"], temp, track, int(source_info.get("attachmentStreams", 0)), font_fallback=font_fallback),
+                embedded_subtitle_command(
+                    plan["source"], temp, track, int(source_info.get("attachmentStreams", 0)),
+                    font_fallback=font_fallback, binary=ctx.get("ffmpegPath"),
+                ),
                 operation,
                 task_timeout_seconds(ctx["config"]),
             )
@@ -3180,6 +3402,9 @@ def ensure_required_artwork(ctx: dict, source: str) -> None:
         return
     if poster_artwork_source(ctx["metadata"], artwork_source_images(local_artwork_roots(ctx, source))):
         return
+    if getattr(ctx.get("args"), "allow_missing_artwork", False):
+        log(ctx, "警告: --allow-missing-artwork 已生效；当前任务在缺少海报时继续，NFO/媒体处理不受影响")
+        return
     raise RuntimeError("requireArtwork 已开启但找不到任何海报来源；请用 --metadata 提供海报、修正标题/年份，或关闭 requireArtwork")
 
 
@@ -3192,7 +3417,7 @@ def write_artwork(ctx: dict, plans: list[dict]) -> None:
     fanart = metadata.get("fanartPath") or metadata.get("fanartUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"fanart", "backdrop", "background", "art"}), "")
     banner = metadata.get("bannerPath") or metadata.get("bannerUrl") or next((str(path) for path in source_images if path.stem.casefold() == "banner"), "")
     clearlogo = metadata.get("clearlogoPath") or metadata.get("clearlogoUrl") or next((str(path) for path in source_images if path.stem.casefold() in {"clearlogo", "logo"}), "")
-    required = bool(ctx["config"].get("metadata", {}).get("requireArtwork", False))
+    required = bool(ctx["config"].get("metadata", {}).get("requireArtwork", False)) and not getattr(ctx.get("args"), "allow_missing_artwork", False)
     for kind, source, filename in (("poster", poster, "poster.jpg"), ("fanart", fanart, "fanart.jpg"), ("banner", banner, "banner.jpg"), ("clearlogo", clearlogo, "clearlogo.png")):
         if not source:
             if required and kind == "poster":
@@ -3672,21 +3897,35 @@ def pipeline(args) -> int:
         parse_track_indices(args.audio_tracks, "--audio-tracks")
     if args.burn_subtitle is not None and args.burn_subtitle < 0:
         raise RuntimeError("--burn-subtitle 必须是非负零基序号")
+    if args.burn_subtitle_lang is not None:
+        subtitle_language_selector_identity(args.burn_subtitle_lang)
     if args.burn_sidecar is not None:
         validate_sidecar_suffix(args.burn_sidecar)
-    if args.burn_subtitle is not None and args.burn_sidecar is not None:
-        raise RuntimeError("--burn-subtitle 与 --burn-sidecar 互斥")
-    if args.copy_original and (args.audio_tracks is not None or args.burn_subtitle is not None or args.burn_sidecar is not None or args.track_review_seconds):
-        raise RuntimeError("--audio-tracks/--burn-subtitle/--burn-sidecar/--track-review-seconds 只适用于转码模式")
+    if sum(value is not None for value in (args.burn_subtitle, args.burn_subtitle_lang, args.burn_sidecar)) > 1:
+        raise RuntimeError("--burn-subtitle/--burn-subtitle-lang/--burn-sidecar 互斥")
+    validate_subtitle_style(args)
+    style_requested = any(getattr(args, name, None) is not None for name in ("sub_font", "sub_size", "sub_margin_v"))
+    if style_requested and not (args.burn_subtitle is not None or args.burn_subtitle_lang is not None or args.burn_sidecar is not None or args.track_review_seconds):
+        raise RuntimeError("--sub-font/--sub-size/--sub-margin-v 需要本次任务选择硬烧字幕")
+    if args.copy_original and (args.audio_tracks is not None or args.burn_subtitle is not None or args.burn_subtitle_lang is not None or args.burn_sidecar is not None or args.track_review_seconds):
+        raise RuntimeError("--audio-tracks/--burn-subtitle/--burn-subtitle-lang/--burn-sidecar/--track-review-seconds 只适用于转码模式")
     source, requested_downloader = resolve_source(args)
     ctx = build_context(config, args, source)
-    selected_ffmpeg = ffmpeg_binary()
+    burn_requested = args.burn_subtitle is not None or args.burn_subtitle_lang is not None or args.burn_sidecar is not None
+    if burn_requested:
+        selected_ffmpeg = ffmpeg_binary(require_subtitles=True)
+    elif args.track_review_seconds:
+        try:
+            selected_ffmpeg = ffmpeg_binary(require_subtitles=True)
+        except RuntimeError:
+            # A review window must not make an ordinary transcode fail when the user may choose no burn.
+            selected_ffmpeg = ffmpeg_binary()
+    else:
+        selected_ffmpeg = ffmpeg_binary()
     ctx["ffmpegPath"] = selected_ffmpeg
-    if args.burn_subtitle is not None or args.burn_sidecar is not None:
+    if args.burn_subtitle is not None or args.burn_subtitle_lang is not None or args.burn_sidecar is not None:
         if str(ctx["profile"].get("videoCodec", "libx264")) == "copy":
             raise RuntimeError("硬烧字幕不能与 videoCodec=copy 一起使用")
-        if not subtitle_filter_available(selected_ffmpeg):
-            raise RuntimeError("硬烧字幕需要带 subtitles/libass 滤镜的 FFmpeg；当前 FFmpeg 未提供该滤镜，请安装启用 libass 的构建后重试")
     downloader = classify_downloader(source, requested_downloader)
     if args.playlist and args.media_type != "tv":
         raise RuntimeError("--playlist 必须使用 --type tv，才能按播放顺序映射季集")
@@ -3711,7 +3950,12 @@ def pipeline(args) -> int:
         "subs": bool(args.write_subs),
         "subtitleLanguages": selected_subtitles,
         "burnSubtitleOrdinal": args.burn_subtitle,
+        "burnSubtitleLanguage": args.burn_subtitle_lang,
         "burnSidecarSuffix": args.burn_sidecar,
+        "subtitleFont": args.sub_font,
+        "subtitleFontSize": args.sub_size,
+        "subtitleMarginV": args.sub_margin_v,
+        "allowMissingArtwork": bool(args.allow_missing_artwork),
         "audioTrackOrdinals": parse_track_indices(args.audio_tracks, "--audio-tracks") if args.audio_tracks is not None else None,
         "trackReviewSeconds": args.track_review_seconds,
         "authenticated": bool(args.cookies),
@@ -3729,7 +3973,8 @@ def pipeline(args) -> int:
         previous_decision = resumable_track_decision(
             previous_state, source_fingerprint_value,
             reset_work=args.reset_work, audio_tracks=args.audio_tracks,
-            burn_subtitle=args.burn_subtitle, burn_sidecar=args.burn_sidecar,
+            burn_subtitle=args.burn_subtitle, burn_subtitle_lang=args.burn_subtitle_lang,
+            burn_sidecar=args.burn_sidecar,
             review_seconds=args.track_review_seconds,
         )
         signal.signal(signal.SIGTERM, signal_handler)
@@ -3761,10 +4006,15 @@ def pipeline(args) -> int:
                     args.audio_tracks = ",".join(str(value) for value in saved_decision["audioOrdinals"])
                 if saved_decision.get("burnSubtitleOrdinal") is not None:
                     args.burn_subtitle = int(saved_decision["burnSubtitleOrdinal"])
+                if saved_decision.get("burnSubtitleLanguage") is not None:
+                    args.burn_subtitle_lang = str(saved_decision["burnSubtitleLanguage"])
                 if saved_decision.get("burnSidecarSuffix") is not None:
                     args.burn_sidecar = str(saved_decision["burnSidecarSuffix"])
+                for argument, key in (("sub_font", "subFont"), ("sub_size", "subSize"), ("sub_margin_v", "subMarginV")):
+                    if saved_decision.get(key) is not None:
+                        setattr(args, argument, saved_decision[key])
                 log(ctx, "恢复已提交的轨道选择")
-            elif args.track_review_seconds and args.audio_tracks is None and args.burn_subtitle is None and args.burn_sidecar is None:
+            elif args.track_review_seconds and args.audio_tracks is None and args.burn_subtitle is None and args.burn_subtitle_lang is None and args.burn_sidecar is None:
                 if has_actionable_track_choices(inventories):
                     decision = wait_for_track_review(ctx, inventories, args.track_review_seconds)
                     if decision:
@@ -3772,17 +4022,35 @@ def pipeline(args) -> int:
                             args.audio_tracks = ",".join(str(value) for value in decision["audioOrdinals"])
                         if decision.get("burnSubtitleOrdinal") is not None:
                             args.burn_subtitle = int(decision["burnSubtitleOrdinal"])
+                        if decision.get("burnSubtitleLanguage") is not None:
+                            args.burn_subtitle_lang = str(decision["burnSubtitleLanguage"])
                         if decision.get("burnSidecarSuffix") is not None:
                             args.burn_sidecar = str(decision["burnSidecarSuffix"])
+                        for argument, key in (("sub_font", "subFont"), ("sub_size", "subSize"), ("sub_margin_v", "subMarginV")):
+                            if decision.get(key) is not None:
+                                setattr(args, argument, decision[key])
                         log(ctx, "已接受轨道 review 选择")
                     else:
                         log(ctx, "轨道 review 超时；按默认全音轨、保留全部外挂字幕继续")
                 else:
                     log(ctx, "没有需要选择的多音轨或字幕轨，跳过轨道 review")
+            if style_requested and not (args.burn_subtitle is not None or args.burn_subtitle_lang is not None or args.burn_sidecar is not None):
+                log(ctx, "本次没有选择硬烧字幕；--sub-font/--sub-size/--sub-margin-v 样式选项未应用")
+            selected_ffmpeg = ffmpeg_for_track_selection(ctx)
+            ctx["ffmpegPath"] = selected_ffmpeg
+            status_update(ctx["id"], ffmpegPath=selected_ffmpeg)
+            if args.burn_subtitle is not None or args.burn_subtitle_lang is not None or args.burn_sidecar is not None:
+                default_ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+                if os.environ.get("MEDIA_DOWNLOADER_FFMPEG"):
+                    log(ctx, f"硬烧字幕使用显式指定的 FFmpeg: {selected_ffmpeg}")
+                elif selected_ffmpeg != default_ffmpeg:
+                    log(ctx, f"硬烧字幕自动选择带 subtitles/libass 的 FFmpeg: {selected_ffmpeg}（默认 FFmpeg 不含该滤镜）")
             validate_track_options(ctx, plans)
             selected_audio = ctx.get("audioTrackSelection")
             status_update(
-                ctx["id"], burnSubtitleOrdinal=args.burn_subtitle, burnSidecarSuffix=args.burn_sidecar,
+                ctx["id"], burnSubtitleOrdinal=args.burn_subtitle, burnSubtitleLanguage=args.burn_subtitle_lang,
+                burnSubtitleOrdinals={key: value["ordinal"] for key, value in ctx.get("embeddedSubtitleSelections", {}).items()},
+                burnSidecarSuffix=args.burn_sidecar,
                 audioTrackOrdinals=selected_audio,
                 audioTrackMode="unchanged" if args.copy_original else ("selected" if selected_audio is not None else "all"),
             )
@@ -4046,16 +4314,19 @@ def command_doctor(args) -> int:
         checks.append(item)
     subtitle_filter_status = "unverified"
     subtitle_filter_detail = "FFmpeg binary unavailable"
+    burn_ffmpeg = None
     if selected_ffmpeg:
         try:
-            filter_result = subprocess.run([selected_ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=15)
-            has_subtitles_filter = filter_result.returncode == 0 and bool(re.search(r"(?m)^\s*[.A-Z]{3}\s+subtitles\s+", filter_result.stdout))
-            subtitle_filter_status = "ok" if has_subtitles_filter else "optional-missing"
-            subtitle_filter_detail = "subtitles/libass filter available" if has_subtitles_filter else "Hard-burn requires an FFmpeg build with subtitles/libass; ordinary transcode is unaffected"
-        except (OSError, subprocess.TimeoutExpired):
-            subtitle_filter_status = "unverified"
-            subtitle_filter_detail = "Could not inspect FFmpeg filter list"
-    checks.append({"name": "ffmpeg:subtitles", "status": subtitle_filter_status, "path": selected_ffmpeg or "", "detail": subtitle_filter_detail})
+            burn_ffmpeg = ffmpeg_binary(require_subtitles=True)
+            subtitle_filter_status = "ok"
+            if burn_ffmpeg == selected_ffmpeg:
+                subtitle_filter_detail = "subtitles/libass filter available in the default FFmpeg"
+            else:
+                subtitle_filter_detail = f"auto-selected {burn_ffmpeg} (default ffmpeg lacks libass/subtitles)"
+        except RuntimeError as exc:
+            subtitle_filter_status = "optional-missing"
+            subtitle_filter_detail = str(exc)
+    checks.append({"name": "ffmpeg:subtitles", "status": subtitle_filter_status, "path": burn_ffmpeg or selected_ffmpeg or "", "detail": subtitle_filter_detail})
     if shutil.which("yt-dlp"):
         # No URL is supplied: this stays offline while allowing yt-dlp to report its own EJS/runtime inventory.
         try:
@@ -4183,7 +4454,12 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser, source_required: boo
     parser.add_argument("--sub-langs", help="Comma-separated subtitle language codes (e.g. zh-CN,en); defaults to the metadata language or zh-CN")
     burns = parser.add_mutually_exclusive_group()
     burns.add_argument("--burn-subtitle", type=int, help="Hard-burn one embedded text subtitle by its zero-based subtitle ordinal")
+    burns.add_argument("--burn-subtitle-lang", help="Hard-burn one embedded text subtitle by language tag (e.g. zh-CN, chi); ambiguous matches fail")
     burns.add_argument("--burn-sidecar", help="Hard-burn one neighboring external subtitle using its exact tracks suffix (e.g. zh.srt)")
+    parser.add_argument("--sub-font", help="Optional font family for a burned subtitle (no platform-specific default)")
+    parser.add_argument("--sub-size", type=int, help="Optional burned subtitle font size (1-200)")
+    parser.add_argument("--sub-margin-v", type=int, help="Optional burned subtitle vertical margin (0-1000)")
+    parser.add_argument("--allow-missing-artwork", action="store_true", help="For this task only, continue when required poster artwork is unavailable")
     parser.add_argument("--audio-tracks", help="Keep only these zero-based audio ordinals (comma-separated); default keeps all")
     parser.add_argument("--track-review-seconds", type=int, default=0, help="Wait this many seconds after acquisition for choose-tracks (0 disables review; maximum 300)")
     parser.add_argument("--no-archive", action="store_true", help="Skip archive transfer; deliver to downloadDir if configured, else keep output in the workspace")
@@ -4228,7 +4504,11 @@ def parser() -> argparse.ArgumentParser:
     choose_tracks.add_argument("task_id")
     review_burns = choose_tracks.add_mutually_exclusive_group()
     review_burns.add_argument("--burn-subtitle", type=int, help="Hard-burn one embedded text subtitle by its zero-based subtitle ordinal")
+    review_burns.add_argument("--burn-subtitle-lang", help="Hard-burn one embedded text subtitle by language tag; ambiguous matches fail")
     review_burns.add_argument("--burn-sidecar", help="Hard-burn one external subtitle using its exact tracks suffix (e.g. zh.srt)")
+    choose_tracks.add_argument("--sub-font", help="Optional font family for a burned subtitle")
+    choose_tracks.add_argument("--sub-size", type=int, help="Optional burned subtitle font size (1-200)")
+    choose_tracks.add_argument("--sub-margin-v", type=int, help="Optional burned subtitle vertical margin (0-1000)")
     choose_tracks.add_argument("--audio-tracks", help="Keep only these zero-based audio ordinals (comma-separated); unspecified keeps all")
     choose_tracks.set_defaults(handler=command_choose_tracks)
     add_source = commands.add_parser("add-source", help="Add a user-confirmed search source to private config.json")

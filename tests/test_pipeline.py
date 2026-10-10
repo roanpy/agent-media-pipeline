@@ -1107,12 +1107,131 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.11 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.12 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
         assert "tracks" in root_help and "choose-tracks" in root_help
         module = assert_atomic_copy_never_overwrites(root)
+        # Hard-burn language selection is resolved per file, not as one batch-wide ordinal.
+        language_args = module.parser().parse_args([
+            "adopt", "Language Batch", str(root / "lang-source.mkv"), "--type", "movie",
+            "--burn-subtitle-lang", "zh-CN", "--sub-font", "Noto Sans CJK SC", "--sub-size", "20", "--sub-margin-v", "30",
+        ])
+        language_plans = []
+        for name, subtitles in (
+            ("lang-episode-1.mkv", [
+                {"ordinal": 0, "subtitleOrdinal": 0, "language": "eng", "title": "English", "codec": "subrip", "forced": False},
+                {"ordinal": 1, "subtitleOrdinal": 1, "language": "chi", "title": "简体中文", "codec": "subrip", "forced": False},
+            ]),
+            ("lang-episode-2.mkv", [
+                {"ordinal": 0, "subtitleOrdinal": 0, "language": "zho-Hans", "title": "Simplified", "codec": "subrip", "forced": False},
+                {"ordinal": 1, "subtitleOrdinal": 1, "language": "eng", "title": "English", "codec": "subrip", "forced": False},
+            ]),
+        ):
+            language_plans.append({
+                "source": root / name,
+                "sourceInfo": {"audioTracks": [], "subtitleTracks": subtitles, "audioStreams": 0},
+            })
+        language_ctx = {
+            "args": language_args,
+            "profile": {"videoCodec": "libx264", "audioCodec": "aac", "container": "mp4", "resolution": 720},
+            "ffmpegPath": "/mock/ffmpeg-with-libass",
+        }
+        with patch.object(module, "subtitle_filter_available", return_value=True):
+            module.validate_track_options(language_ctx, language_plans)
+        language_selections = language_ctx["embeddedSubtitleSelections"]
+        assert [language_selections[str(plan["source"].resolve())]["ordinal"] for plan in language_plans] == [1, 0]
+        language_commands = [
+            module.ffmpeg_command(language_ctx, plan["source"], root / f"{plan['source'].stem}.mp4", plan["sourceInfo"])
+            for plan in language_plans
+        ]
+        filter_args = [command[command.index("-vf") + 1] for command in language_commands]
+        assert "si=1" in filter_args[0] and "si=0" in filter_args[1], filter_args
+        assert all("FontName=Noto Sans CJK SC,FontSize=20,MarginV=30" in value for value in filter_args), filter_args
+        assert module.subtitle_language_selector_identity("chi") == ("zh", None)
+        assert module.subtitle_language_selector_identity("zho-Hans") == ("zh", "Hans")
+        title_script_mismatch = [
+            {"path": root / "S01E01.mkv", "subtitleTracks": [
+                {"ordinal": 0, "subtitleOrdinal": 0, "language": "chi", "title": "简体中文", "codec": "subrip", "forced": False},
+            ]},
+            {"path": root / "S01E02.mkv", "subtitleTracks": [
+                {"ordinal": 0, "subtitleOrdinal": 0, "language": "chi", "title": "繁體中文", "codec": "subrip", "forced": False},
+            ]},
+        ]
+        try:
+            module.validate_review_choice(title_script_mismatch, None, None, None, burn_subtitle_lang="zh")
+        except RuntimeError as exc:
+            assert "字幕文字系统" in str(exc), str(exc)
+        else:
+            raise AssertionError("title-inferred Simplified/Traditional mismatch must be rejected in track review")
+        mismatch_args = module.parser().parse_args([
+            "adopt", "Mismatch", str(root / "S01E01.mkv"), "--type", "tv", "--burn-subtitle-lang", "zh",
+        ])
+        mismatch_plans = [
+            {"source": inventory["path"], "sourceInfo": {"audioTracks": [], "subtitleTracks": inventory["subtitleTracks"]}}
+            for inventory in title_script_mismatch
+        ]
+        mismatch_ctx = {"args": mismatch_args, "profile": {"videoCodec": "libx264"}, "ffmpegPath": "/mock/ffmpeg"}
+        with patch.object(module, "subtitle_filter_available", return_value=True):
+            try:
+                module.validate_track_options(mismatch_ctx, mismatch_plans)
+            except RuntimeError as exc:
+                assert "字幕文字系统" in str(exc), str(exc)
+            else:
+                raise AssertionError("title-inferred script mismatch must be rejected before transcode")
+        try:
+            module.select_embedded_subtitle_by_language(
+                [
+                    {"subtitleOrdinal": 0, "language": "chi", "title": "简体中文", "codec": "subrip"},
+                    {"subtitleOrdinal": 1, "language": "zho-Hant", "title": "繁體中文", "codec": "subrip"},
+                ], "zh", root / "ambiguous.mkv",
+            )
+        except RuntimeError as exc:
+            assert "匹配到多条字幕" in str(exc)
+        else:
+            raise AssertionError("generic Chinese selection must reject Simplified/Traditional ambiguity")
+        try:
+            module.validate_subtitle_style(module.parser().parse_args([
+                "adopt", "Unsafe Font", "source.mkv", "--sub-font", "Arial:;movie",
+            ]))
+        except RuntimeError as exc:
+            assert "filter 分隔符" in str(exc)
+        else:
+            raise AssertionError("subtitle font must reject filtergraph delimiters")
+
+        # Explicit FFmpeg selection is never bypassed; fallback is restricted to known paths and burn requests.
+        fake_default = root / "ffmpeg-default"
+        fake_default.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_default.chmod(0o700)
+        fake_fallback = root / "ffmpeg-with-subtitles"
+        fake_fallback.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_fallback.chmod(0o700)
+        with patch.dict(os.environ, {}, clear=True), patch.object(module.shutil, "which", return_value=str(fake_default)), patch.object(
+            module, "ffmpeg_fallback_candidates", return_value=[str(fake_fallback)],
+        ), patch.object(module, "_ffmpeg_has_subtitles_filter", side_effect=lambda binary: binary == str(fake_fallback)):
+            assert module.ffmpeg_binary() == str(fake_default)
+            assert module.ffmpeg_binary(require_subtitles=True) == str(fake_fallback)
+            recovered_args = module.parser().parse_args(["adopt", "Resume", "source.mkv", "--type", "movie"])
+            recovered_decision = {"burnSubtitleLanguage": "zh"}
+            recovered_args.burn_subtitle_lang = recovered_decision["burnSubtitleLanguage"]
+            assert module.ffmpeg_for_track_selection({"args": recovered_args, "ffmpegPath": str(fake_default)}) == str(fake_fallback)
+        with patch.dict(os.environ, {"MEDIA_DOWNLOADER_FFMPEG": str(fake_default)}, clear=True), patch.object(
+            module, "_ffmpeg_has_subtitles_filter", return_value=False,
+        ), patch.object(module, "ffmpeg_fallback_candidates") as fallback_candidates:
+            try:
+                module.ffmpeg_binary(require_subtitles=True)
+            except RuntimeError as exc:
+                assert "不含 subtitles/libass" in str(exc)
+            else:
+                raise AssertionError("explicit FFmpeg must not be silently replaced")
+            fallback_candidates.assert_not_called()
+
+        try:
+            burn_ffmpeg_for_tests = module.ffmpeg_binary(require_subtitles=True)
+        except RuntimeError:
+            burn_ffmpeg_for_tests = None
+
         saved_choice = {"fingerprint": "same-source", "audioOrdinals": [1]}
         resume = module.resumable_track_decision
         assert resume({"phase": "failed", "trackDecision": saved_choice}, "same-source", reset_work=False, audio_tracks=None, burn_subtitle=None, burn_sidecar=None, review_seconds=0) == saved_choice
@@ -1470,7 +1589,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.11"
+            assert doctor_payload["version"] == "0.4.12"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -1594,7 +1713,7 @@ def main():
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
             assert delivery_plan["downloadRetries"] == 3
-            assert delivery_plan["version"] == "0.4.11" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.12" and delivery_plan["configSchemaVersion"] == 1
             # Read the private source once: identity and acquisition must use the same snapshot.
             private_source = root / "single-read-source.txt"
             private_source.write_text(delivery_url, encoding="utf-8")
@@ -1740,6 +1859,23 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             no_poster_work = Path(no_poster_state["workPath"])
             assert list((no_poster_work / "source").rglob("*.mp4")), "下载应已完成，素材保留在任务工作区"
             assert not list((no_poster_work / "output").rglob("*.mp4")), "必须在转码之前失败"
+            no_poster_source = root / "no-poster-source"
+            no_poster_source.mkdir()
+            shutil.copy2(root / "source" / "Film.mkv", no_poster_source / "Film.mkv")
+            allowed_missing_artwork = run([
+                sys.executable, str(SCRIPT), "adopt", "缺海报单次放行", str(no_poster_source / "Film.mkv"),
+                "--type", "movie", "--target", "movie", "--allow-missing-artwork",
+            ], env=no_poster_env)
+            assert "--allow-missing-artwork 已生效" in allowed_missing_artwork.stdout, (
+                allowed_missing_artwork.stdout, allowed_missing_artwork.stderr,
+            )
+            allowed_output = root / "movie" / "缺海报单次放行" / "缺海报单次放行.mp4"
+            assert allowed_output.is_file() and (allowed_output.parent / "movie.nfo").is_file(), (
+                allowed_missing_artwork.stdout, allowed_missing_artwork.stderr,
+                list((root / "movie").rglob("*")),
+            )
+            assert not (allowed_output.parent / "poster.jpg").exists()
+            assert json.loads(no_poster_cfg.read_text(encoding="utf-8"))["metadata"]["requireArtwork"] is True
 
             relative_env = {**no_archive_env, "MEDIA_DOWNLOADER_STATUS_FILE": str(root / "relative-status.json")}
             relative = run([str(PROJECT / "run.sh"), "adopt", "Relative Background", "Film.mkv", "--type", "movie", "--no-transcode", "--no-archive", "--offline"], env=relative_env, cwd=root / "source")
@@ -2052,7 +2188,8 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert attachment_streams and attachment_streams[0].get("tags") == {"filename": "font.txt", "mimetype": "text/plain"}, subtitle_payload
             assert (mkv_movie.parent / "带字幕电影.subtitle-00.chi.srt").is_file()
 
-            run([sys.executable, str(SCRIPT), "adopt", "多轨测试", str(multi_track_source), "--type", "movie", "--profile", "movie", "--target", "movie", "--offline"], env=env)
+            mp4_track_run = run([sys.executable, str(SCRIPT), "adopt", "多轨测试", str(multi_track_source), "--type", "movie", "--profile", "movie", "--target", "movie", "--offline"], env=env)
+            assert "MP4 不内封软字幕" in mp4_track_run.stdout
             mp4_movie = root / "movie" / "多轨测试" / "多轨测试.mp4"
             mp4_info = module.ffprobe(mp4_movie)
             assert mp4_info["audioStreams"] == 2 and mp4_info["subtitleStreams"] == 0, mp4_info
@@ -2082,7 +2219,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
                 "--target", "movie", "--audio-tracks", "0,0", "--offline",
             ], env=env, expect=1)
             assert "不得包含重复序号" in duplicate_audio.stderr
-            if not module.subtitle_filter_available():
+            if burn_ffmpeg_for_tests is None:
                 unavailable_burn = run([
                     sys.executable, str(SCRIPT), "adopt", "无法硬烧字幕", str(multi_track_source), "--type", "movie",
                     "--target", "movie", "--burn-subtitle", "0", "--offline",
@@ -2097,7 +2234,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
                 sys.executable, str(SCRIPT), "adopt", "位图不可硬烧", str(multi_track_source), "--type", "movie",
                 "--target", "movie", "--burn-sidecar", "vobsub.idx", "--offline",
             ], env=env, expect=1)
-            if module.subtitle_filter_available():
+            if burn_ffmpeg_for_tests is not None:
                 assert "位图/不支持文本字幕" in bitmap_burn.stderr or "不能安全烧录" in bitmap_burn.stderr, bitmap_burn.stderr
             else:
                 # The binary without libass rejects burn before acquisition; direct inventory validation above
@@ -2118,7 +2255,7 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert selected_info["audioStreams"] == 1 and selected_info["audioTracks"][0]["language"] == "jpn", selected_info
             assert selected_state["trackReviewCompletedAt"] is None, selected_state
             assert selected_state["audioTrackOrdinals"] == [1] and selected_state["audioTrackMode"] == "selected", selected_state
-            if module.subtitle_filter_available():
+            if burn_ffmpeg_for_tests is not None:
                 run([
                     sys.executable, str(SCRIPT), "adopt", "实际硬烧字幕", str(multi_track_source), "--type", "movie",
                     "--target", "movie", "--burn-subtitle", "0", "--audio-tracks", "1", "--offline",
@@ -2126,19 +2263,35 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
                 burned_video = root / "movie" / "实际硬烧字幕" / "实际硬烧字幕.mp4"
                 burned_info = module.ffprobe(burned_video)
                 assert burned_info["audioStreams"] == 1 and burned_info["subtitleStreams"] == 0, burned_info
-                assert decoded_frame_digest(burned_video, binary=module.ffmpeg_binary()) != decoded_frame_digest(
-                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=module.ffmpeg_binary(),
+                assert decoded_frame_digest(burned_video, binary=burn_ffmpeg_for_tests) != decoded_frame_digest(
+                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=burn_ffmpeg_for_tests,
                 ), "hard-burn must alter a decoded frame, not merely add a filter option"
                 assert (burned_video.parent / "实际硬烧字幕.subtitle-00.default.chi.forced.srt").is_file()
                 assert (burned_video.parent / "实际硬烧字幕.subtitle-01.eng.ass").is_file()
+
+                run([
+                    sys.executable, str(SCRIPT), "adopt", "按语言硬烧字幕", str(multi_track_source), "--type", "movie",
+                    "--target", "movie", "--burn-subtitle-lang", "zh-CN", "--sub-size", "18", "--sub-margin-v", "5", "--offline",
+                ], env=env)
+                language_burned_video = root / "movie" / "按语言硬烧字幕" / "按语言硬烧字幕.mp4"
+                language_burn_state = next(
+                    item for item in json.loads((root / "status.json").read_text()).values()
+                    if item.get("requestedTitle") == "按语言硬烧字幕"
+                )
+                assert language_burn_state["burnSubtitleLanguage"] == "zh-CN", language_burn_state
+                assert language_burn_state["burnSubtitleOrdinals"][str(multi_track_source.resolve())] == 0, language_burn_state
+                assert decoded_frame_digest(language_burned_video, binary=burn_ffmpeg_for_tests) != decoded_frame_digest(
+                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=burn_ffmpeg_for_tests,
+                ), "language-selected subtitle must alter decoded video frames"
+                assert (language_burned_video.parent / "按语言硬烧字幕.subtitle-00.default.chi.forced.srt").is_file()
 
                 run([
                     sys.executable, str(SCRIPT), "adopt", "实际硬烧外挂", str(multi_track_source), "--type", "movie",
                     "--target", "movie", "--burn-sidecar", "jpn.srt", "--audio-tracks", "1", "--offline",
                 ], env=env)
                 sidecar_burned_video = root / "movie" / "实际硬烧外挂" / "实际硬烧外挂.mp4"
-                assert decoded_frame_digest(sidecar_burned_video, binary=module.ffmpeg_binary()) != decoded_frame_digest(
-                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=module.ffmpeg_binary(),
+                assert decoded_frame_digest(sidecar_burned_video, binary=burn_ffmpeg_for_tests) != decoded_frame_digest(
+                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=burn_ffmpeg_for_tests,
                 ), "external-sidecar hard burn must alter a decoded frame"
                 sidecar_copy = sidecar_burned_video.with_name("实际硬烧外挂.jpn.srt")
                 assert module.file_digest(sidecar_copy) == module.file_digest(external_subtitle)
@@ -2167,8 +2320,8 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
                     time.sleep(0.1)
                 assert review_state and review_state.get("phase") == "track-review", review_state
                 review_choice = [sys.executable, str(SCRIPT), "choose-tracks", review_state["taskId"], "--audio-tracks", "1"]
-                if module.subtitle_filter_available():
-                    review_choice.extend(["--burn-sidecar", "jpn.srt"])
+                if burn_ffmpeg_for_tests is not None:
+                    review_choice.extend(["--burn-subtitle-lang", "zh-CN", "--sub-size", "18"])
                 run(review_choice, env=env)
                 review_stdout, review_stderr = review_process.communicate(timeout=90)
                 assert review_process.returncode == 0, f"review pipeline failed:\n{review_stdout}\n{review_stderr}"
@@ -2181,13 +2334,13 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert reviewed_state["phase"] == "done" and reviewed_state["trackDecisionConsumed"] is True, reviewed_state
             assert reviewed_state["audioTrackOrdinals"] == [1] and reviewed_state["audioTrackMode"] == "selected", reviewed_state
             assert reviewed_info["audioStreams"] == 1 and reviewed_info["audioTracks"][0]["language"] == "jpn", reviewed_info
-            if module.subtitle_filter_available():
-                assert reviewed_state["burnSidecarSuffix"] == "jpn.srt", reviewed_state
+            if burn_ffmpeg_for_tests is not None:
+                assert reviewed_state["burnSubtitleLanguage"] == "zh-CN", reviewed_state
                 reviewed_video = root / "movie" / "审核选轨" / "审核选轨.mp4"
-                assert decoded_frame_digest(reviewed_video, binary=module.ffmpeg_binary()) != decoded_frame_digest(
-                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=module.ffmpeg_binary(),
+                assert decoded_frame_digest(reviewed_video, binary=burn_ffmpeg_for_tests) != decoded_frame_digest(
+                    root / "movie" / "明确选择音轨" / "明确选择音轨.mp4", binary=burn_ffmpeg_for_tests,
                 ), "review-selected external subtitle must actually be burned"
-                assert module.file_digest(reviewed_video.with_name("审核选轨.jpn.srt")) == module.file_digest(external_subtitle)
+                assert (reviewed_video.parent / "审核选轨.subtitle-00.default.chi.forced.srt").is_file()
             else:
                 assert reviewed_state["burnSidecarSuffix"] is None, reviewed_state
 

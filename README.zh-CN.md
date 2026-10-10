@@ -146,19 +146,22 @@ brew install ffmpeg aria2 yt-dlp
 ./run.sh choose-tracks TASK_ID --burn-subtitle 0 --audio-tracks 0,1
 # 也可启动前明确选择第 0 条字幕烧录：
 ./run.sh adopt "电影名" "/path/to/Movie.mkv" --type movie --transcode --no-archive --burn-subtitle 0
+# 或按语言选择；每集独立解析编号，歧义时会拒绝：
+./run.sh adopt "电影名" "/path/to/Movie.mkv" --type movie --transcode --no-archive \
+  --burn-subtitle-lang zh-CN --sub-size 24 --sub-margin-v 24
 # 也可烧录 Movie.zh.srt，使用 tracks 列出的同名后缀：
 ./run.sh adopt "电影名" "/path/to/Movie.mkv" --type movie --transcode --no-archive --burn-sidecar zh.srt
 ```
 
 烧录后仍保留外挂副本。播放硬字幕成品时，请关闭播放器的可选字幕，避免再次叠加。
 
-询问窗口可选且有时限，普通 CLI 不等待。Agent 可在下载完成后询问，未回复则按原 profile 继续转换并保留全部轨道。批次选择应用于每个文件，先核对每集编号是否一致。`--burn-sidecar` 接收 `tracks` 列出的同名字幕后缀，不接受任意路径，批次每集都必须有该安全且未改变的字幕；它与 `--burn-subtitle` 互斥，也可用于 `choose-tracks`。过期选择会拒绝，不会假装已经生效。只有明确传入 `--audio-tracks` 才筛选音轨，外挂字幕副本始终保留。常见图片字幕（`.sup`、`.idx`/`.sub`）复制保留，不烧录、不做 OCR。文字烧录要求 FFmpeg 带 `subtitles`/libass 滤镜并有合适字体，`doctor` 单独报告此能力；可用 `MEDIA_DOWNLOADER_FFMPEG=/绝对路径/ffmpeg` 明确选择构建，不会自动借用其他应用的二进制，也不保证中文字体覆盖；不支持的图片字幕烧录会明确失败。
+询问窗口可选且有时限，普通 CLI 不等待。Agent 可在下载完成后询问，未回复则按原 profile 继续转换并保留全部轨道。`--burn-subtitle N`、`--burn-subtitle-lang zh-CN` 和 `--burn-sidecar zh.srt` 三者互斥，也都可用于 `choose-tracks`。按语言时逐文件匹配一条内封文字字幕，因此每集的序号可以不同；找不到、匹配多条、只有位图字幕或批次间语言/简繁/forced 不一致，都会在转码前失败。支持 `zh`、`zh-CN`、`chi`、`zh-Hans`，以及标题里的 Simplified/简体/简中、Traditional/繁體/繁中等标记；若 `zh` 同时匹配简体和繁体则会提示歧义。可选 `--sub-font`、`--sub-size`（1-200）和 `--sub-margin-v`（0-1000）调整硬字幕样式，不假定某种操作系统字体。`--burn-sidecar` 只接收 `tracks` 列出的安全同名字幕后缀，不接受任意路径，批次每集都必须有该安全且未改变的字幕。过期选择会拒绝，不会假装已经生效。只有明确传入 `--audio-tracks` 才筛选音轨，外挂字幕副本始终保留。常见图片字幕（`.sup`、`.idx`/`.sub`）复制保留，不烧录、不做 OCR。文字烧录要求 FFmpeg 带 `subtitles`/libass 滤镜并有合适字体，`doctor` 单独报告此能力；`MEDIA_DOWNLOADER_FFMPEG=/绝对路径/ffmpeg` 是权威显式选择，不会被绕过。普通转码继续使用配置/PATH 的 FFmpeg；只有明确要求硬烧且未显式配置时，才会尝试有限的已知候选路径，不扫描任意应用目录。失败会列出探测路径。不会保证中文字体覆盖；不支持的图片字幕烧录会明确失败。
 
 yt-dlp 来源不写 `--format` 时选择最佳可用流；需要限制质量时可使用 `--format "bv*[height<=720]+ba/b[height<=720]"`。它只控制下载源，不决定流水线是否转码：默认转码 profile 决定最终 MP4，`--no-transcode` 则保留 yt-dlp 下载后的编码和容器。播放列表及 Bilibili 分 P/合集必须使用 `--type tv --playlist`，并在核实顺序后从 `--season`/`--episode` 开始映射。
 
 `--write-subs` 只对 yt-dlp 来源生效：下载手动/自动外挂字幕、转换为 `srt` 并随媒体一起整理，源没有字幕时跳过；`--sub-langs` 必须与它一起使用，用逗号分隔语言代码（如 `zh-CN,en`），默认取 `metadata.subtitleLanguages`、元数据语言或 `zh-CN`。项目不接入任何第三方字幕库。
 
-默认 Plex 电视剧模板在取得可靠单集标题时命名为 `剧名 - S01E03 - 单集标题.ext`；没有标题则保持 `剧名 - S01E03.ext`。同一个标题和该集自己的来源 ID 写入单集 NFO；`tvshow.nfo` 只保存整部剧资料，不重复塞入全季集数清单。元数据查询默认按需启用：`metadata.provider: "none"` 会禁用所有 provider 请求，省略 `metadata` 配置也不会隐式访问 TVMaze。`provider: "tmdb"` 仍默认保留 TVMaze fallback；省略 provider 时需显式设置 `tvFallback: "tvmaze"` 才启用。TMDB、TVMaze fallback、Jackett 和 Prowlarr 都是可选项，缺少凭据不会阻塞直链、本地文件或网页媒体主流程。
+默认 Plex 电视剧模板在取得可靠单集标题时命名为 `剧名 - S01E03 - 单集标题.ext`；没有标题则保持 `剧名 - S01E03.ext`。同一个标题和该集自己的来源 ID 写入单集 NFO；`tvshow.nfo` 只保存整部剧资料，不重复塞入全季集数清单。元数据查询默认按需启用：`metadata.provider: "none"` 会禁用所有 provider 请求，省略 `metadata` 配置也不会隐式访问 TVMaze。若 `metadata.requireArtwork` 开启但找不到海报，可用 `--allow-missing-artwork` 对单次任务放行；它不会修改私有配置。`provider: "tmdb"` 仍默认保留 TVMaze fallback；省略 provider 时需显式设置 `tvFallback: "tvmaze"` 才启用。TMDB、TVMaze fallback、Jackett 和 Prowlarr 都是可选项，缺少凭据不会阻塞直链、本地文件或网页媒体主流程。
 
 `repair` 只接受单部剧目录，默认仅输出 JSON 预览；显式 `--apply` 才执行。它支持 Season 0，将同名字幕、单集图片和 NFO 随媒体一起处理；没有可靠集标题就保留原路径，`tvshow.nfo` 不修改。新路径全部复制并逐字节校验后才移除旧路径，中断最多留下副本。多集单文件（如 `S01E01-E02`）仍要求先拆分。
 
