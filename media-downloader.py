@@ -32,7 +32,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.12"
+VERSION = "0.4.13"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
@@ -1132,7 +1132,13 @@ def local_source_snapshot(source: str) -> dict | None:
     }
 
 
-def source_fingerprint(ctx: dict, source: str) -> str:
+def source_fingerprint(
+    ctx: dict,
+    source: str,
+    *,
+    include_track_options: bool = True,
+    include_new_track_options: bool = True,
+) -> str:
     payload = {
         "source": source,
         "localSource": local_source_snapshot(source),
@@ -1151,10 +1157,23 @@ def source_fingerprint(ctx: dict, source: str) -> str:
         "cookies": getattr(ctx["args"], "cookies", None),
         "writeSubs": bool(getattr(ctx["args"], "write_subs", False)),
         "subtitleLanguages": subtitle_languages(ctx["config"], ctx["args"]),
-        "burnSubtitle": getattr(ctx["args"], "burn_subtitle", None),
-        "burnSidecar": getattr(ctx["args"], "burn_sidecar", None),
-        "audioTracks": getattr(ctx["args"], "audio_tracks", None),
     }
+    if include_track_options:
+        payload.update({
+            "burnSubtitle": getattr(ctx["args"], "burn_subtitle", None),
+            "burnSidecar": getattr(ctx["args"], "burn_sidecar", None),
+            "audioTracks": getattr(ctx["args"], "audio_tracks", None),
+        })
+        if include_new_track_options:
+            for key, attribute in (
+                ("burnSubtitleLanguage", "burn_subtitle_lang"),
+                ("subtitleFont", "sub_font"),
+                ("subtitleFontSize", "sub_size"),
+                ("subtitleMarginV", "sub_margin_v"),
+            ):
+                value = getattr(ctx["args"], attribute, None)
+                if value is not None:
+                    payload[key] = value
     value = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -1184,6 +1203,8 @@ def ensure_work(ctx: dict, source: str) -> None:
     work = ctx["workRoot"]
     marker = ctx["marker"]
     fingerprint = source_fingerprint(ctx, source)
+    work_fingerprint = source_fingerprint(ctx, source, include_track_options=False)
+    legacy_fingerprint = source_fingerprint(ctx, source, include_new_track_options=False)
     work_parent = ctx["baseRoot"] / ".media-downloader-work"
     require_mounted_volume(work_parent, "工作目录")
     work_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1196,11 +1217,28 @@ def ensure_work(ctx: dict, source: str) -> None:
         existing = read_json(marker, {}) if marker.exists() else {}
         if existing.get("taskId") != ctx["id"]:
             raise RuntimeError(f"拒绝接管无所有权标记的工作目录: {work}")
-        if existing.get("sourceFingerprint") != fingerprint:
+        if existing.get("workFingerprint"):
+            compatible = existing.get("workFingerprint") == work_fingerprint
+        else:
+            # Upgrade markers written before workFingerprint existed. The legacy
+            # fingerprint intentionally retains the old track-selection fields.
+            compatible = existing.get("sourceFingerprint") in {fingerprint, legacy_fingerprint}
+        if not compatible:
             raise RuntimeError("失败任务的来源已变化；确认后使用 --reset-work 重建工作区")
+        atomic_json(marker, {
+            **existing,
+            "taskId": ctx["id"],
+            "title": ctx["title"],
+            "sourceFingerprint": fingerprint,
+            "workFingerprint": work_fingerprint,
+            "createdAt": existing.get("createdAt") or now(),
+        }, private=True)
     else:
         work.mkdir(parents=True, mode=0o700)
-        atomic_json(marker, {"taskId": ctx["id"], "title": ctx["title"], "sourceFingerprint": fingerprint, "createdAt": now()})
+        atomic_json(marker, {
+            "taskId": ctx["id"], "title": ctx["title"], "sourceFingerprint": fingerprint,
+            "workFingerprint": work_fingerprint, "createdAt": now(),
+        }, private=True)
     os.chmod(work, 0o700)
     ctx["sourceRoot"].mkdir(parents=True, exist_ok=True, mode=0o700)
     ctx["outputRoot"].mkdir(parents=True, exist_ok=True, mode=0o700)

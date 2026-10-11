@@ -21,10 +21,11 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
 ## Workflow
 
 1. Run `./run.sh --version`, then `./run.sh doctor`. Record the pipeline version/config schema and confirm FFmpeg/FFprobe, the required downloader, and `download:output` when using local delivery. Archive targets are optional; an unused missing target may remain `unavailable`. For YouTube, inspect the reported Deno/EJS checks; `unverified` requires a source `probe` before assuming readiness. Use `doctor --online` to investigate configured provider connectivity, or `doctor --cookies SPEC` to check the selected credential input without opening a browser session.
-2. Establish media type, verified title/year, playlist scope, transcode mode, local-delivery/archive choice and target, profile, naming preset, and quality requirements.
+2. Establish media type, verified title/year, playlist scope, transcode mode, delivery/archive target, profile, naming preset, and quality requirements.
    - Run `profiles` to inspect `defaultModes.tv|movie`.
-   - If the user says “use the default,” apply it directly.
-   - If the user only supplies media and does not specify type, transcode mode, or archive choice, explain the relevant defaults and ask for the missing decisions.
+   - Once the media type is known, use its configured `defaultModes` and profile without asking the user to repeat established defaults; report the selected mode/profile in the plan.
+   - If the user has not requested library archival and `downloadDir` is configured, use local no-archive delivery there and let the pipeline clean its task cache after validation. A profile target is only a candidate archive location, not proof that the user requested archival; use it when archival is requested or clearly established by prior user instruction.
+   - Ask only when media type, quality, or the intended destination cannot be determined safely from the request and configuration; explain available defaults before asking.
    - For YouTube/Bilibili, run `probe` before acquisition when the item count, ordering, login requirement, or available quality is uncertain.
 3. Discover sources.
    - Run `./run.sh sources` to inspect configured sources.

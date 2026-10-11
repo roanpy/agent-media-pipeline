@@ -471,6 +471,99 @@ def assert_path_and_naming_guards(module, root: Path):
     first_fingerprint = module.source_fingerprint(fingerprint_ctx, "https://example.test/video")
     fingerprint_args.sub_langs = "en"
     assert first_fingerprint != module.source_fingerprint(fingerprint_ctx, "https://example.test/video")
+    fingerprint_args.burn_subtitle_lang = "zh-CN"
+    fingerprint_args.sub_font = "Noto Sans CJK SC"
+    fingerprint_args.sub_size = 20
+    fingerprint_args.sub_margin_v = 24
+    reviewed_fingerprint = module.source_fingerprint(fingerprint_ctx, "https://example.test/video")
+    for attribute, changed_value in (
+        ("burn_subtitle_lang", "en"),
+        ("sub_font", "Arial"),
+        ("sub_size", 30),
+        ("sub_margin_v", 40),
+    ):
+        original_value = getattr(fingerprint_args, attribute)
+        setattr(fingerprint_args, attribute, changed_value)
+        assert reviewed_fingerprint != module.source_fingerprint(fingerprint_ctx, "https://example.test/video"), attribute
+        setattr(fingerprint_args, attribute, original_value)
+
+    saved_track_decision = {
+        "fingerprint": reviewed_fingerprint,
+        "burnSubtitleLanguage": "zh-CN",
+        "subFont": "Noto Sans CJK SC",
+        "subSize": 20,
+        "subMarginV": 24,
+    }
+    assert module.resumable_track_decision(
+        {"phase": "failed", "trackDecision": saved_track_decision}, reviewed_fingerprint,
+        reset_work=False, audio_tracks=None, burn_subtitle=None, burn_sidecar=None,
+        review_seconds=0, burn_subtitle_lang="zh-CN",
+    ) == saved_track_decision
+    for attribute, changed_value in (
+        ("burn_subtitle_lang", "en"),
+        ("sub_font", "Arial"),
+        ("sub_size", 30),
+        ("sub_margin_v", 40),
+    ):
+        original_value = getattr(fingerprint_args, attribute)
+        setattr(fingerprint_args, attribute, changed_value)
+        changed_track_fingerprint = module.source_fingerprint(fingerprint_ctx, "https://example.test/video")
+        assert module.resumable_track_decision(
+            {"phase": "failed", "trackDecision": saved_track_decision}, changed_track_fingerprint,
+            reset_work=False, audio_tracks=None, burn_subtitle=None, burn_sidecar=None,
+            review_seconds=0, burn_subtitle_lang=getattr(fingerprint_args, "burn_subtitle_lang"),
+        ) is None, attribute
+        setattr(fingerprint_args, attribute, original_value)
+
+    work_args = type("Args", (), {
+        "downloader": "yt-dlp", "copy_original": False, "season": None, "episode": None,
+        "playlist": False, "format": None, "cookies": None, "write_subs": False, "sub_langs": None,
+        "burn_subtitle": None, "burn_sidecar": None, "audio_tracks": None,
+        "no_archive": False, "reset_work": False,
+    })()
+    work_base = root / "resume-work-root"
+    work = work_base / ".media-downloader-work" / "resume-task"
+    marker = work / ".media-downloader-owned.json"
+    work_context = {
+        "canonical": "Show", "mediaType": "tv", "profile": {"container": "mp4"},
+        "naming": {"episodeFile": "x"}, "metadata": {}, "config": {"metadata": {}},
+        "args": work_args, "baseRoot": work_base, "workRoot": work, "marker": marker,
+        "id": "resume-task", "title": "Show", "sourceRoot": work / "source",
+        "outputRoot": work / "output", "stateRoot": work_base / ".state",
+        "logPath": work_base / "logs" / "resume-task.log", "downloadRoot": None,
+    }
+    source_url = "https://example.test/resume-video"
+    legacy_fingerprint = module.source_fingerprint(
+        work_context, source_url, include_new_track_options=False,
+    )
+    assert module.source_fingerprint(work_context, source_url) == legacy_fingerprint
+    work.mkdir(parents=True)
+    module.atomic_json(marker, {
+        "taskId": "resume-task", "title": "Show", "sourceFingerprint": legacy_fingerprint,
+        "createdAt": "2026-01-01T00:00:00+00:00",
+    }, private=True)
+    module.ensure_work(work_context, source_url)
+    marker_state = module.read_json(marker)
+    assert marker_state["workFingerprint"] == module.source_fingerprint(
+        work_context, source_url, include_track_options=False,
+    )
+    cached_source = work_context["sourceRoot"] / "cached-video.mkv"
+    cached_source.write_bytes(b"already downloaded")
+    work_args.burn_subtitle_lang = "en"
+    work_args.sub_font = "Noto Sans CJK SC"
+    work_args.sub_size = 30
+    work_args.sub_margin_v = 40
+    assert module.source_fingerprint(work_context, source_url) != legacy_fingerprint
+    assert module.source_fingerprint(work_context, source_url, include_track_options=False) == marker_state["workFingerprint"]
+    module.ensure_work(work_context, source_url)
+    assert cached_source.read_bytes() == b"already downloaded"
+    changed_work_retry_fingerprint = module.source_fingerprint(work_context, source_url)
+    assert module.resumable_track_decision(
+        {"phase": "failed", "trackDecision": {"fingerprint": legacy_fingerprint, "burnSubtitleLanguage": "zh-CN"}},
+        changed_work_retry_fingerprint, reset_work=False, audio_tracks=None, burn_subtitle=None,
+        burn_sidecar=None, review_seconds=0, burn_subtitle_lang="en",
+    ) is None
+
     local_file = root / "fingerprint-source.mkv"
     local_file.write_bytes(b"source-v1")
     local_first = module.source_fingerprint(fingerprint_ctx, str(local_file))
@@ -1107,7 +1200,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.12 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.13 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
@@ -1589,7 +1682,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.12"
+            assert doctor_payload["version"] == "0.4.13"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -1713,7 +1806,7 @@ def main():
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
             assert delivery_plan["downloadRetries"] == 3
-            assert delivery_plan["version"] == "0.4.12" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.13" and delivery_plan["configSchemaVersion"] == 1
             # Read the private source once: identity and acquisition must use the same snapshot.
             private_source = root / "single-read-source.txt"
             private_source.write_text(delivery_url, encoding="utf-8")
