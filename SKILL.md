@@ -35,9 +35,9 @@ Separate agent judgment from deterministic execution. The agent searches, verifi
    - The agent may use browser search for one-off public discovery. Before saving a reusable site, show its name, domain, type, URL template, and credential requirements. Save it with `add-source` only after explicit confirmation. Never silently add sites or secrets to `SKILL.md`, code, or `config.example.json`.
 4. Compare title, season/episode, year, resolution, codec, size, publication time, seeders, and source trust. Do not select by seed count alone.
 5. After authorization, run `ingest`. Use `--candidate` for cached structured results and a URL for web/direct sources.
-   - For YouTube/Bilibili, issue one `ingest --playlist` command. Never run raw yt-dlp and then manually schedule `adopt`; the pipeline must continue through processing, NFO/artwork, delivery/archive, and cleanup under one task/status record.
+   - For YouTube/Bilibili, issue one `ingest --playlist` command. Never run raw yt-dlp and then manually schedule `adopt`; the pipeline must continue through processing, NFO/artwork, delivery/archive, and cleanup under one task/status record. Explicit episode markers such as SxxExx, EPxx, E##, or Chinese forms are retained; otherwise the playlist position is authoritative, not yt-dlp's leading filename ordinal.
    - Add `--write-subs` (optionally `--sub-langs "zh-CN,en"`) only for yt-dlp web sources that provide subtitles. Never pass `--sub-langs` alone. Unavailable subtitle tracks are skipped; no third-party subtitle service is contacted.
-   - A TV file without a season/episode token requires explicit `--season`/`--episode`.
+   - TV names with explicit SxxExx/EPxx/E##/Chinese episode tokens are recognized. A leading 1–3 digit number followed by a separator (for example `01.1080p`) is a heuristic episode number and uses `--season`; confirm ambiguous title-led names such as `12.Monkeys.1995` before adopting or repairing. If no episode token is recognizable, supply `--season`/`--episode` for a single-file task.
    - Split unsupported multi-episode files before processing.
    - Prefer one task per show: one `adopt` for a local directory, one `ingest --playlist` for a playlist. If episodes must be split, use `--merge` and consistent metadata/profile/target settings. Prefer serial execution for tasks sharing a TV folder to reduce shared artwork/NFO contention; separate shows can run concurrently.
    - When separate tasks add episodes to the same existing TV show, use `--merge`. It keeps existing different artwork (show-level poster/fanart/banner/clearlogo, episode thumbnails, season posters) and `tvshow.nfo`, but still rejects different media, subtitles, and episode NFO files.
@@ -126,7 +126,7 @@ Run `./run.sh --help` or a command-specific `--help` for the CLI contract.
 chmod 600 /private/tmp/source-url
 ./run.sh ingest "Movie Name" --source-file /private/tmp/source-url --type movie
 
-# Adopt manually downloaded media; SxxExx is inferred when present
+# Adopt manually downloaded media; SxxExx or a leading episode number (e.g. 01.1080p) is inferred
 ./run.sh adopt "Show Name" "/path/to/files" --type tv --year 2026 \
   --metadata "/path/to/metadata.json"
 

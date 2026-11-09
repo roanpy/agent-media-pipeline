@@ -784,13 +784,18 @@ def assert_path_and_naming_guards(module, root: Path):
     original_validate = module.validate_video
     module.validate_video = lambda _path, _minimum: {"duration": 1, "hasVideo": True, "hasAudio": False}
     try:
-        plans = module.planned_outputs({
+        playlist_ctx = {
             "mediaType": "tv", "config": {"minMediaDurationSeconds": 0}, "args": playlist_args,
             "namingFields": {"canonical": "课程", "ext": "mkv"},
             "naming": {"seasonDir": "Season {season:02d}", "episodeFile": "{canonical} - S{season:02d}E{episode:02d}{episodeTitleSuffix}.{ext}"},
-        }, playlist_files)
+        }
+        plans = module.planned_outputs(playlist_ctx, playlist_files)
         assert [(plan["season"], plan["episode"]) for plan in plans] == [(3, 5), (3, 6)]
         assert plans[0]["relative"].name == "课程 - S03E05 - 开场.mkv"
+        explicit_playlist_file = playlist_root / "Show.S02E03.mkv"
+        explicit_playlist_file.write_bytes(b"x")
+        explicit_playlist_plan = module.planned_outputs(playlist_ctx, [explicit_playlist_file])[0]
+        assert (explicit_playlist_plan["season"], explicit_playlist_plan["episode"]) == (2, 3)
         titled = playlist_root / "Show.S02E03.mkv"
         untitled = playlist_root / "Show.S02E04.mkv"
         titled.write_bytes(b"x")
@@ -958,6 +963,32 @@ def assert_path_and_naming_guards(module, root: Path):
         assert "偏移" in str(exc)
     else:
         raise AssertionError("offset producing episode < 1 must be rejected")
+
+    # BT-style episode packs may use a bare leading ordinal; explicit markers keep precedence.
+    for name, expected in (
+        ("01.1080p.HD国语中字无水印[最新电影www.dyg7.com].mkv", (2, 1)),
+        ("02.1080p.WEB-DL.mkv", (2, 2)),
+        ("40.1080p.BluRay.mkv", (2, 40)),
+        ("1 720p.mkv", (2, 1)),
+        ("7 - 标题.mkv", (2, 7)),
+        ("123_1080p.mkv", (2, 123)),
+        ("Show.S01E05.mkv", (1, 5)),
+        ("Show.S02E13.mkv", (2, 13)),
+        ("Show.S02E13/01.1080p.mkv", (2, 13)),
+        ("Show.3x07.mkv", (3, 7)),
+        ("Show.EP09.mkv", (2, 9)),
+        ("Show.E09.mkv", (2, 9)),
+        ("Show.第12集.mkv", (2, 12)),
+    ):
+        actual = module.episode_from_name(Path(name), 2)
+        assert actual == expected, (name, actual, expected)
+    for name in (
+        "2012.1080p.BluRay.mkv", "1080p.WEB-DL.mkv",
+        "玉簟秋.01.1080p.mkv", "Some.Movie.2024.2160p.mkv",
+    ):
+        assert module.episode_from_name(Path(name), 1) is None, name
+    assert module.episode_from_name(Path("001 title.mkv"), 3, allow_bare_number=False) is None
+    assert module.episode_from_name(Path("Show.S02E03.mkv"), 3, allow_bare_number=False) == (2, 3)
 
     # 缺集报告：空洞检测 + 不计更大集号
     report_ctx = {
@@ -1200,7 +1231,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="media-downloader-test.") as temp:
         root = Path(temp)
         version = run([sys.executable, str(SCRIPT), "--version"])
-        assert version.stdout.strip() == "Agent Media Pipeline 0.4.13 (config schema 1)"
+        assert version.stdout.strip() == "Agent Media Pipeline 0.4.14 (config schema 1)"
         root_help = run([sys.executable, str(SCRIPT), "--help"]).stdout
         for command_help in ("List configured defaults", "Show all tasks", "Stop matching owned", "Check tools"):
             assert command_help in root_help, root_help
@@ -1682,7 +1713,7 @@ def main():
             (root / "movie").rmdir()
             doctor = run([sys.executable, str(SCRIPT), "doctor"], env=env)
             doctor_payload = json.loads(doctor.stdout)
-            assert doctor_payload["version"] == "0.4.13"
+            assert doctor_payload["version"] == "0.4.14"
             assert doctor_payload["configSchemaVersion"] == 1
             checks = {item["name"]: item["status"] for item in doctor_payload["checks"]}
             assert checks["work:base"] == "ok"
@@ -1806,7 +1837,7 @@ def main():
             delivery_command = [sys.executable, str(SCRIPT), "ingest", "交付电影", delivery_url, "--type", "movie", "--year", "2026", "--no-transcode", "--no-archive", "--offline"]
             delivery_plan = json.loads(run([*delivery_command, "--dry-run"], env=delivery_env).stdout)
             assert delivery_plan["downloadRetries"] == 3
-            assert delivery_plan["version"] == "0.4.13" and delivery_plan["configSchemaVersion"] == 1
+            assert delivery_plan["version"] == "0.4.14" and delivery_plan["configSchemaVersion"] == 1
             # Read the private source once: identity and acquisition must use the same snapshot.
             private_source = root / "single-read-source.txt"
             private_source.write_text(delivery_url, encoding="utf-8")
@@ -2200,6 +2231,24 @@ for index, title in enumerate(("开端", "相逢", "归途"), 1):
             assert repair_tvshow.read_bytes() == b"existing show nfo"
             repair_repeat = json.loads(run(repair_command, env=env).stdout)
             assert repair_repeat["renameCount"] == 0 and repair_repeat["nfoUpdateCount"] == 1
+
+            bare_repair_show = repair_library / "裸数字剧"
+            bare_repair_season = bare_repair_show / "Season 01"
+            bare_repair_season.mkdir(parents=True)
+            bare_repair_source = bare_repair_season / "01.1080p.HD国语中字无水印[最新电影www.dyg7.com].mkv"
+            shutil.copy2(root / "source" / "Example.S02E03.mkv", bare_repair_source)
+            bare_repair_metadata = root / "bare-repair-metadata.json"
+            bare_repair_metadata.write_text(json.dumps({
+                "title": "裸数字剧", "year": 2026,
+                "episodes": [{"season": 1, "episode": 1, "title": "第一集"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            bare_repair_preview = json.loads(run([
+                sys.executable, str(SCRIPT), "repair", "裸数字剧", str(bare_repair_show), "--year", "2026",
+                "--season", "1", "--naming", "plex-title", "--metadata", str(bare_repair_metadata), "--offline",
+            ], env=env).stdout)
+            assert bare_repair_preview["renameCount"] == 1
+            assert bare_repair_preview["items"][0]["season"] == 1 and bare_repair_preview["items"][0]["episode"] == 1
+            assert bare_repair_source.is_file(), "repair preview must not modify bare-number files"
 
             titled_metadata.write_text(json.dumps({
                 "title": "标题剧", "year": 2026,

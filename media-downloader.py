@@ -32,7 +32,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SKILL_DIR / ".runtime"
 DEFAULT_CONFIG_FILE = SKILL_DIR / "config.json"
-VERSION = "0.4.13"
+VERSION = "0.4.14"
 CONFIG_SCHEMA_VERSION = 1
 USER_AGENT = f"agent-media-pipeline/{VERSION}"
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".rm", ".rmvb", ".3gp"}
@@ -2550,6 +2550,8 @@ EPISODE_PATTERNS = [
     re.compile(r"(?i)(?P<season>\d{1,2})x(?P<episode>\d{1,3})"),
     re.compile(r"(?i)(?:^|[ ._\-\[])EP?(?P<episode>\d{1,3})(?:$|[ ._\-\]])"),
     re.compile(r"第\s*(?P<episode>\d{1,3})\s*集"),
+    # Keep this last: it is intentionally lower priority than explicit episode markers.
+    re.compile(r"^(?P<episode>\d{1,3})(?:[._ -]|$)"),
 ]
 MULTI_EPISODE_PATTERN = re.compile(r"(?i)S\d{1,2}[ ._-]*E\d{1,3}(?:[ ._-]*(?:-|E)E?\d{1,3}(?![0-9p]))+")
 
@@ -2569,11 +2571,15 @@ def apply_custom_words(config: dict, media_type: str, title: str) -> tuple[str, 
     return re.sub(r"\s+", " ", title).strip(), offset
 
 
-def episode_from_name(path: Path, default_season: int, offset: int = 0) -> tuple[int, int] | None:
-    for text in (path.stem, path.parent.name):
+def episode_from_name(
+    path: Path, default_season: int, offset: int = 0, *, allow_bare_number: bool = True,
+) -> tuple[int, int] | None:
+    texts = (path.stem, path.parent.name)
+    explicit_patterns = EPISODE_PATTERNS[:-1]
+    for text in texts:
         if MULTI_EPISODE_PATTERN.search(text):
             raise RuntimeError(f"暂不支持多集单文件: {path.name}；请先拆分为单集文件")
-        for pattern in EPISODE_PATTERNS:
+        for pattern in explicit_patterns:
             match = pattern.search(text)
             if match:
                 season = int(match.groupdict().get("season") or default_season)
@@ -2581,6 +2587,14 @@ def episode_from_name(path: Path, default_season: int, offset: int = 0) -> tuple
                 if episode < 1:
                     raise RuntimeError(f"集数偏移后无效: {path.name} (E{int(match.group('episode'))}{offset:+d})")
                 return season, episode
+    if allow_bare_number:
+        for text in texts:
+            match = EPISODE_PATTERNS[-1].search(text)
+            if match:
+                episode = int(match.group("episode")) + offset
+                if episode < 1:
+                    raise RuntimeError(f"集数偏移后无效: {path.name} (E{int(match.group('episode'))}{offset:+d})")
+                return default_season, episode
     return None
 
 
@@ -2678,14 +2692,18 @@ def planned_outputs(ctx: dict, sources: list[Path]) -> list[dict]:
             relative = render_path(ctx["naming"]["movieFile"], fields)
             season = episode = None
         else:
-            parsed = episode_from_name(source, ctx["args"].season, getattr(ctx["args"], "episode_offset", 0))
-            if not parsed and getattr(ctx["args"], "playlist", False):
+            is_playlist = getattr(ctx["args"], "playlist", False)
+            parsed = episode_from_name(
+                source, ctx["args"].season, getattr(ctx["args"], "episode_offset", 0),
+                allow_bare_number=not is_playlist,
+            )
+            if not parsed and is_playlist:
                 parsed = (ctx["args"].season, position)
             if not parsed:
                 if len(sources) == 1 and ctx["args"].episode is not None:
                     parsed = (ctx["args"].season, ctx["args"].episode)
                 else:
-                    raise RuntimeError(f"无法识别集号: {source.name}；请规范为 SxxExx/EPxx 或显式传 --season/--episode")
+                    raise RuntimeError(f"无法识别集号: {source.name}；请规范为 SxxExx/EPxx/行首数字+分隔符，或显式传 --season/--episode")
             season, episode = parsed
             if season < 0 or episode < 1:
                 raise RuntimeError(f"季集号无效: S{season:02d}E{episode:02d}")
